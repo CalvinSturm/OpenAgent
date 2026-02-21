@@ -1,4 +1,5 @@
 # LocalAgent
+<img width="858" height="445" alt="Screenshot 2026-02-21 052058" src="https://github.com/user-attachments/assets/b2dbe95b-90bd-4bb3-821a-4bb019834c49" />
 
 LocalAgent is a local-runtime agent CLI with tool calling, trust controls, and replayable artifacts.
 
