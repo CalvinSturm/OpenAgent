@@ -42,7 +42,7 @@ localagent --provider lmstudio --model <model-id> --prompt "Say hi." run
 TUI:
 
 ```bash
-localagent --provider lmstudio --model <model-id> chat --tui true
+localagent --provider lmstudio --model <model-id> chat --tui
 ```
 
 ## 2) Ollama Setup
@@ -80,7 +80,7 @@ localagent --provider ollama --model qwen3:8b --prompt "Say hi." run
 TUI:
 
 ```bash
-localagent --provider ollama --model qwen3:8b chat --tui true
+localagent --provider ollama --model qwen3:8b chat --tui
 ```
 
 ## 3) llama.cpp Server Setup
@@ -141,7 +141,7 @@ localagent \
 For speed-oriented local testing:
 
 ```bash
-localagent --provider lmstudio --model <model-id> --caps off --trust off --hooks off --no-session --max-steps 8 chat --tui true
+localagent --provider lmstudio --model <model-id> --caps off --trust off --hooks off --no-session --max-steps 8 chat --tui
 ```
 
 ## 6) Troubleshooting
@@ -180,6 +180,12 @@ localagent doctor --provider ollama
 localagent doctor --provider llamacpp
 ```
 
+For slow CPUs / first-token delays, increase timeouts and disable retries while testing:
+
+```bash
+localagent --provider llamacpp --base-url http://localhost:5001/v1 --model default --http-timeout-ms 300000 --http-stream-idle-timeout-ms 120000 --http-max-retries 0 --prompt "..." run
+```
+
 ### Wrong model name
 
 Make sure `--model` exactly matches provider model identifier.
@@ -204,7 +210,7 @@ localagent mcp doctor playwright
 Use in run/chat:
 
 ```bash
-localagent --provider lmstudio --model <model> --mcp playwright chat --tui true
+localagent --provider lmstudio --model <model> --mcp playwright chat --tui
 ```
 
 ## 8) Recommended First Validation Flow
@@ -213,5 +219,5 @@ localagent --provider lmstudio --model <model> --mcp playwright chat --tui true
 localagent init
 localagent doctor --provider lmstudio
 localagent --provider lmstudio --model <model> --prompt "Say hi in one sentence." run
-localagent --provider lmstudio --model <model> chat --tui true
+localagent --provider lmstudio --model <model> chat --tui
 ```

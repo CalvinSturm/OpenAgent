@@ -14,7 +14,7 @@ Global options are parsed before subcommands.
 
 ```bash
 localagent --provider lmstudio --model <model> --prompt "hello" run
-localagent --provider lmstudio --model <model> chat --tui true
+localagent --provider lmstudio --model <model> chat --tui
 ```
 
 ## Top-Level Commands
@@ -302,7 +302,7 @@ localagent --provider lmstudio --model <model> --allow-shell --enable-write-tool
 TUI chat:
 
 ```bash
-localagent --provider lmstudio --model <model> chat --tui true
+localagent --provider lmstudio --model <model> chat --tui
 ```
 
 ---

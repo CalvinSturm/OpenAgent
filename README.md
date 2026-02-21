@@ -64,7 +64,7 @@ Global flags come before subcommands.
 
 ```bash
 localagent --provider lmstudio --model essentialai/rnj-1 --prompt "hello" run
-localagent --provider lmstudio --model essentialai/rnj-1 chat --tui true
+localagent --provider lmstudio --model essentialai/rnj-1 chat --tui
 ```
 
 ## Quickstart Examples
@@ -84,7 +84,7 @@ localagent --provider ollama --model llama3.2 --prompt "Summarize src/main.rs" e
 ### Interactive chat (TUI)
 
 ```bash
-localagent --provider lmstudio --model essentialai/rnj-1 chat --tui true
+localagent --provider lmstudio --model essentialai/rnj-1 chat --tui
 ```
 
 ### Auto-discovery mode
@@ -104,7 +104,7 @@ Defaults:
 Set explicitly when needed:
 
 ```bash
-localagent --provider lmstudio --base-url http://localhost:1234/v1 --model <model> run --prompt "..."
+localagent --provider lmstudio --base-url http://localhost:1234/v1 --model <model> --prompt "..." run
 ```
 
 ## Safety Model
@@ -237,7 +237,7 @@ localagent mcp doctor playwright
 Use a server in run/chat:
 
 ```bash
-localagent --mcp playwright --provider lmstudio --model <model> chat --tui true
+localagent --mcp playwright --provider lmstudio --model <model> chat --tui
 ```
 
 ## Task Graph Execution
