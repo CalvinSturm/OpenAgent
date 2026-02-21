@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::agent::AgentOutcome;
+use crate::compaction::{CompactionReport, CompactionSettings};
 use crate::gate::TrustMode;
 use crate::types::{Message, ToolCall};
 
@@ -37,6 +38,10 @@ pub struct RunRecord {
     pub config_hash_hex: String,
     pub transcript: Vec<Message>,
     pub tool_calls: Vec<ToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<RunCompactionRecord>,
+    #[serde(default)]
+    pub hook_report: Vec<crate::hooks::protocol::HookInvocationReport>,
     pub final_output: String,
     pub error: Option<String>,
 }
@@ -68,6 +73,15 @@ pub struct RunCliConfig {
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub events_path: Option<String>,
+    pub max_context_chars: usize,
+    pub compaction_mode: String,
+    pub compaction_keep_last: usize,
+    pub tool_result_persist: String,
+    pub hooks_mode: String,
+    pub hooks_config_path: String,
+    pub hooks_strict: bool,
+    pub hooks_timeout_ms: u64,
+    pub hooks_max_stdout_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +119,23 @@ pub struct ConfigFingerprintV1 {
     pub unsafe_bypass_allow_flags: bool,
     pub stream: bool,
     pub events_path: String,
+    pub max_context_chars: usize,
+    pub compaction_mode: String,
+    pub compaction_keep_last: usize,
+    pub tool_result_persist: String,
+    pub hooks_mode: String,
+    pub hooks_config_path: String,
+    pub hooks_strict: bool,
+    pub hooks_timeout_ms: u64,
+    pub hooks_max_stdout_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunCompactionRecord {
+    pub settings: CompactionSettings,
+    pub final_prompt_size_chars: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<CompactionReport>,
 }
 
 pub fn resolve_state_paths(
@@ -209,6 +240,12 @@ pub fn write_run_record(
         config_hash_hex,
         transcript: outcome.messages.clone(),
         tool_calls: outcome.tool_calls.clone(),
+        compaction: Some(RunCompactionRecord {
+            settings: outcome.compaction_settings.clone(),
+            final_prompt_size_chars: outcome.final_prompt_size_chars,
+            report: outcome.compaction_report.clone(),
+        }),
+        hook_report: outcome.hook_invocations.clone(),
         final_output: outcome.final_output.clone(),
         error: outcome.error.clone(),
     };
@@ -277,8 +314,19 @@ pub fn cli_trust_mode(mode: TrustMode) -> String {
 pub fn extract_session_messages(messages: &[Message]) -> Vec<Message> {
     messages
         .iter()
-        .filter(|m| !matches!(m.role, crate::types::Role::System))
-        .cloned()
+        .enumerate()
+        .filter_map(|(idx, m)| {
+            if idx == 0
+                && matches!(m.role, crate::types::Role::System)
+                && m.content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("You are an agent that may call tools")
+            {
+                return None;
+            }
+            Some(m.clone())
+        })
         .collect()
 }
 
@@ -311,6 +359,8 @@ pub fn config_hash_hex(fingerprint: &ConfigFingerprintV1) -> anyhow::Result<Stri
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
+
+    use crate::compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
 
     use super::{
         config_hash_hex, load_run_record, load_session, reset_session, resolve_state_dir,
@@ -382,6 +432,23 @@ mod tests {
             error: None,
             messages: Vec::new(),
             tool_calls: Vec::new(),
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            final_prompt_size_chars: 321,
+            compaction_report: Some(crate::compaction::CompactionReport {
+                before_chars: 1000,
+                after_chars: 321,
+                before_messages: 10,
+                after_messages: 4,
+                compacted_messages: 6,
+                summary_digest_sha256: "abc".to_string(),
+                summary_text: "COMPACTED SUMMARY (v1)".to_string(),
+            }),
+            hook_invocations: Vec::new(),
         };
         write_run_record(
             &paths,
@@ -402,6 +469,15 @@ mod tests {
                 unsafe_bypass_allow_flags: false,
                 stream: false,
                 events_path: None,
+                max_context_chars: 0,
+                compaction_mode: "off".to_string(),
+                compaction_keep_last: 20,
+                tool_result_persist: "digest".to_string(),
+                hooks_mode: "off".to_string(),
+                hooks_config_path: String::new(),
+                hooks_strict: false,
+                hooks_timeout_ms: 2000,
+                hooks_max_stdout_bytes: 200_000,
             },
             "none".to_string(),
             None,
@@ -413,6 +489,16 @@ mod tests {
         assert_eq!(loaded.metadata.run_id, "run_1");
         assert_eq!(loaded.metadata.exit_reason, "ok");
         assert_eq!(loaded.config_hash_hex, "cfg_hash");
+        let compaction = loaded.compaction.expect("compaction");
+        assert_eq!(compaction.final_prompt_size_chars, 321);
+        assert_eq!(
+            compaction
+                .report
+                .as_ref()
+                .expect("report")
+                .summary_digest_sha256,
+            "abc"
+        );
     }
 
     #[test]
@@ -451,6 +537,15 @@ mod tests {
             unsafe_bypass_allow_flags: false,
             stream: false,
             events_path: String::new(),
+            max_context_chars: 0,
+            compaction_mode: "off".to_string(),
+            compaction_keep_last: 20,
+            tool_result_persist: "digest".to_string(),
+            hooks_mode: "off".to_string(),
+            hooks_config_path: String::new(),
+            hooks_strict: false,
+            hooks_timeout_ms: 2000,
+            hooks_max_stdout_bytes: 200_000,
         };
         let b = a.clone();
         let ha = config_hash_hex(&a).expect("hash a");

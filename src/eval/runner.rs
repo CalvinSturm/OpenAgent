@@ -7,12 +7,15 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent::{Agent, AgentExitReason, AgentOutcome};
+use crate::compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
 use crate::eval::assert::evaluate_assertions;
 use crate::eval::tasks::{tasks_for_pack, EvalPack, EvalTask, Fixture};
 use crate::gate::{
     compute_policy_hash_hex, ApprovalMode, AutoApproveScope, GateContext, NoGate, ProviderKind,
     ToolGate, TrustGate, TrustMode,
 };
+use crate::hooks::config::HooksMode;
+use crate::hooks::runner::{HookManager, HookRuntimeConfig};
 use crate::mcp::registry::{list_servers, McpRegistry};
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::openai_compat::OpenAiCompatProvider;
@@ -51,6 +54,15 @@ pub struct EvalConfig {
     pub session: String,
     pub no_session: bool,
     pub max_session_messages: usize,
+    pub max_context_chars: usize,
+    pub compaction_mode: CompactionMode,
+    pub compaction_keep_last: usize,
+    pub tool_result_persist: ToolResultPersist,
+    pub hooks_mode: HooksMode,
+    pub hooks_config: Option<PathBuf>,
+    pub hooks_strict: bool,
+    pub hooks_timeout_ms: u64,
+    pub hooks_max_stdout_bytes: usize,
     pub state_dir_override: Option<PathBuf>,
     pub policy_override: Option<PathBuf>,
     pub approvals_override: Option<PathBuf>,
@@ -90,6 +102,15 @@ pub struct EvalResultsConfig {
     pub mcp: Vec<String>,
     pub no_session: bool,
     pub session: String,
+    pub max_context_chars: usize,
+    pub compaction_mode: String,
+    pub compaction_keep_last: usize,
+    pub tool_result_persist: String,
+    pub hooks_mode: String,
+    pub hooks_config_path: String,
+    pub hooks_strict: bool,
+    pub hooks_timeout_ms: u64,
+    pub hooks_max_stdout_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -207,6 +228,25 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
             mcp: enabled_mcp.clone(),
             no_session: config.no_session,
             session: config.session.clone(),
+            max_context_chars: config.max_context_chars,
+            compaction_mode: format!("{:?}", config.compaction_mode).to_lowercase(),
+            compaction_keep_last: config.compaction_keep_last,
+            tool_result_persist: format!("{:?}", config.tool_result_persist).to_lowercase(),
+            hooks_mode: format!("{:?}", config.hooks_mode).to_lowercase(),
+            hooks_config_path: config
+                .hooks_config
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| {
+                    state_paths
+                        .state_dir
+                        .join("hooks.yaml")
+                        .display()
+                        .to_string()
+                }),
+            hooks_strict: config.hooks_strict,
+            hooks_timeout_ms: config.hooks_timeout_ms,
+            hooks_max_stdout_bytes: config.hooks_max_stdout_bytes,
         },
         summary: EvalSummary::default(),
         by_model: BTreeMap::new(),
@@ -352,6 +392,15 @@ fn write_synthetic_error_artifact(
         error: Some(error),
         messages: Vec::new(),
         tool_calls: Vec::new(),
+        compaction_settings: CompactionSettings {
+            max_context_chars: config.max_context_chars,
+            mode: config.compaction_mode,
+            keep_last: config.compaction_keep_last,
+            tool_result_persist: config.tool_result_persist,
+        },
+        final_prompt_size_chars: 0,
+        compaction_report: None,
+        hook_invocations: Vec::new(),
     };
     let _ = write_run_artifact_for_eval(
         config,
@@ -526,6 +575,22 @@ async fn run_single(
         mcp_registry,
         stream: false,
         event_sink: None,
+        compaction_settings: CompactionSettings {
+            max_context_chars: config.max_context_chars,
+            mode: config.compaction_mode,
+            keep_last: config.compaction_keep_last,
+            tool_result_persist: config.tool_result_persist,
+        },
+        hooks: HookManager::build(HookRuntimeConfig {
+            mode: config.hooks_mode,
+            config_path: config
+                .hooks_config
+                .clone()
+                .unwrap_or_else(|| state_paths.state_dir.join("hooks.yaml")),
+            strict: config.hooks_strict,
+            timeout_ms: config.hooks_timeout_ms,
+            max_stdout_bytes: config.hooks_max_stdout_bytes,
+        })?,
     };
     let session_messages = Vec::new();
     let outcome = agent.run(&task.prompt, session_messages).await;
@@ -586,6 +651,25 @@ fn write_run_artifact_for_eval(
         unsafe_bypass_allow_flags: config.unsafe_bypass_allow_flags,
         stream: false,
         events_path: None,
+        max_context_chars: config.max_context_chars,
+        compaction_mode: format!("{:?}", config.compaction_mode).to_lowercase(),
+        compaction_keep_last: config.compaction_keep_last,
+        tool_result_persist: format!("{:?}", config.tool_result_persist).to_lowercase(),
+        hooks_mode: format!("{:?}", config.hooks_mode).to_lowercase(),
+        hooks_config_path: config
+            .hooks_config
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| {
+                state_paths
+                    .state_dir
+                    .join("hooks.yaml")
+                    .display()
+                    .to_string()
+            }),
+        hooks_strict: config.hooks_strict,
+        hooks_timeout_ms: config.hooks_timeout_ms,
+        hooks_max_stdout_bytes: config.hooks_max_stdout_bytes,
     };
     let fingerprint = ConfigFingerprintV1 {
         schema_version: "openagent.confighash.v1".to_string(),
@@ -617,6 +701,19 @@ fn write_run_artifact_for_eval(
         unsafe_bypass_allow_flags: config.unsafe_bypass_allow_flags,
         stream: false,
         events_path: String::new(),
+        max_context_chars: config.max_context_chars,
+        compaction_mode: format!("{:?}", config.compaction_mode).to_lowercase(),
+        compaction_keep_last: config.compaction_keep_last,
+        tool_result_persist: format!("{:?}", config.tool_result_persist).to_lowercase(),
+        hooks_mode: format!("{:?}", config.hooks_mode).to_lowercase(),
+        hooks_config_path: config
+            .hooks_config
+            .as_ref()
+            .map(|p| stable_path_string(p))
+            .unwrap_or_else(|| stable_path_string(&state_paths.state_dir.join("hooks.yaml"))),
+        hooks_strict: config.hooks_strict,
+        hooks_timeout_ms: config.hooks_timeout_ms,
+        hooks_max_stdout_bytes: config.hooks_max_stdout_bytes,
     };
     let cfg_hash = config_hash_hex(&fingerprint)?;
     let _ = crate::store::write_run_record(
@@ -766,6 +863,15 @@ mod tests {
                 mcp: vec![],
                 no_session: true,
                 session: "default".to_string(),
+                max_context_chars: 0,
+                compaction_mode: "off".to_string(),
+                compaction_keep_last: 20,
+                tool_result_persist: "digest".to_string(),
+                hooks_mode: "off".to_string(),
+                hooks_config_path: String::new(),
+                hooks_strict: false,
+                hooks_timeout_ms: 2000,
+                hooks_max_stdout_bytes: 200_000,
             },
             summary: Default::default(),
             by_model: BTreeMap::new(),

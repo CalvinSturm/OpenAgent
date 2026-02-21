@@ -88,6 +88,10 @@ pub struct GateEvent {
     pub auto_approve_scope: Option<String>,
     pub result_ok: bool,
     pub result_content: String,
+    pub result_input_digest: Option<String>,
+    pub result_output_digest: Option<String>,
+    pub result_input_len: Option<usize>,
+    pub result_output_len: Option<usize>,
 }
 
 pub trait ToolGate: Send {
@@ -285,6 +289,10 @@ impl ToolGate for TrustGate {
             result: AuditResult {
                 ok: event.result_ok,
                 content: event.result_content,
+                input_digest: event.result_input_digest,
+                output_digest: event.result_output_digest,
+                input_len: event.result_input_len,
+                output_len: event.result_output_len,
             },
         };
         if let Err(e) = self.audit.append(&audit) {

@@ -1,7 +1,12 @@
 use uuid::Uuid;
 
+use crate::compaction::{context_size_chars, maybe_compact, CompactionReport, CompactionSettings};
 use crate::events::{Event, EventKind, EventSink};
 use crate::gate::{ApprovalMode, AutoApproveScope, GateContext, GateDecision, GateEvent, ToolGate};
+use crate::hooks::protocol::{
+    HookInvocationReport, PreModelCompactionPayload, PreModelPayload, ToolResultPayload,
+};
+use crate::hooks::runner::{make_pre_model_input, make_tool_result_input, HookManager};
 use crate::mcp::registry::McpRegistry;
 use crate::providers::{ModelProvider, StreamDelta};
 use crate::tools::{execute_tool, ToolRuntime};
@@ -13,6 +18,7 @@ pub enum AgentExitReason {
     ProviderError,
     Denied,
     ApprovalRequired,
+    HookAborted,
     MaxSteps,
     Cancelled,
 }
@@ -24,6 +30,7 @@ impl AgentExitReason {
             AgentExitReason::ProviderError => "provider_error",
             AgentExitReason::Denied => "denied",
             AgentExitReason::ApprovalRequired => "approval_required",
+            AgentExitReason::HookAborted => "hook_aborted",
             AgentExitReason::MaxSteps => "max_steps",
             AgentExitReason::Cancelled => "cancelled",
         }
@@ -40,6 +47,10 @@ pub struct AgentOutcome {
     pub error: Option<String>,
     pub messages: Vec<Message>,
     pub tool_calls: Vec<ToolCall>,
+    pub compaction_settings: CompactionSettings,
+    pub final_prompt_size_chars: usize,
+    pub compaction_report: Option<CompactionReport>,
+    pub hook_invocations: Vec<HookInvocationReport>,
 }
 
 pub struct Agent<P: ModelProvider> {
@@ -53,6 +64,8 @@ pub struct Agent<P: ModelProvider> {
     pub mcp_registry: Option<McpRegistry>,
     pub stream: bool,
     pub event_sink: Option<Box<dyn EventSink>>,
+    pub compaction_settings: CompactionSettings,
+    pub hooks: HookManager,
 }
 
 impl<P: ModelProvider> Agent<P> {
@@ -96,15 +109,250 @@ impl<P: ModelProvider> Agent<P> {
         });
 
         let mut observed_tool_calls = Vec::new();
+        let mut last_compaction_report: Option<CompactionReport> = None;
+        let mut hook_invocations: Vec<HookInvocationReport> = Vec::new();
         for step in 0..self.max_steps {
+            let compacted = match maybe_compact(&messages, &self.compaction_settings) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.emit_event(
+                        &run_id,
+                        step as u32,
+                        EventKind::Error,
+                        serde_json::json!({"error": format!("compaction failed: {e}")}),
+                    );
+                    self.emit_event(
+                        &run_id,
+                        step as u32,
+                        EventKind::RunEnd,
+                        serde_json::json!({"exit_reason":"provider_error"}),
+                    );
+                    return AgentOutcome {
+                        run_id,
+                        started_at,
+                        finished_at: crate::trust::now_rfc3339(),
+                        exit_reason: AgentExitReason::ProviderError,
+                        final_output: String::new(),
+                        error: Some(format!("compaction failed: {e}")),
+                        messages,
+                        tool_calls: observed_tool_calls,
+                        compaction_settings: self.compaction_settings.clone(),
+                        final_prompt_size_chars: 0,
+                        compaction_report: last_compaction_report,
+                        hook_invocations,
+                    };
+                }
+            };
+            if let Some(report) = compacted.report.clone() {
+                self.emit_event(
+                    &run_id,
+                    step as u32,
+                    EventKind::CompactionPerformed,
+                    serde_json::json!({
+                        "before_chars": report.before_chars,
+                        "after_chars": report.after_chars,
+                        "before_messages": report.before_messages,
+                        "after_messages": report.after_messages,
+                        "compacted_messages": report.compacted_messages,
+                        "summary_digest_sha256": report.summary_digest_sha256
+                    }),
+                );
+                last_compaction_report = Some(report);
+            }
+            messages = compacted.messages;
+
             let mut tools_sorted = self.tools.clone();
             tools_sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+            if self.hooks.enabled() {
+                let pre_payload = PreModelPayload {
+                    messages: messages.clone(),
+                    tools: tools_sorted.clone(),
+                    stream: self.stream,
+                    compaction: PreModelCompactionPayload::from(&self.compaction_settings),
+                };
+                let hook_input = make_pre_model_input(
+                    &run_id,
+                    step as u32,
+                    provider_name(self.gate_ctx.provider),
+                    &self.model,
+                    &self.gate_ctx.workdir,
+                    match serde_json::to_value(pre_payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return AgentOutcome {
+                                run_id,
+                                started_at,
+                                finished_at: crate::trust::now_rfc3339(),
+                                exit_reason: AgentExitReason::ProviderError,
+                                final_output: String::new(),
+                                error: Some(format!(
+                                    "failed to encode pre_model hook payload: {e}"
+                                )),
+                                messages,
+                                tool_calls: observed_tool_calls,
+                                compaction_settings: self.compaction_settings.clone(),
+                                final_prompt_size_chars: 0,
+                                compaction_report: last_compaction_report,
+                                hook_invocations,
+                            };
+                        }
+                    },
+                );
+                match self.hooks.run_pre_model_hooks(hook_input).await {
+                    Ok(result) => {
+                        for inv in &result.invocations {
+                            self.emit_event(
+                                &run_id,
+                                step as u32,
+                                EventKind::HookStart,
+                                serde_json::json!({
+                                    "hook_name": inv.hook_name,
+                                    "stage": inv.stage
+                                }),
+                            );
+                            self.emit_event(
+                                &run_id,
+                                step as u32,
+                                EventKind::HookEnd,
+                                serde_json::json!({
+                                    "hook_name": inv.hook_name,
+                                    "stage": inv.stage,
+                                    "action": inv.action,
+                                    "modified": inv.modified,
+                                    "duration_ms": inv.duration_ms
+                                }),
+                            );
+                        }
+                        hook_invocations.extend(result.invocations);
+                        if let Some(reason) = result.abort_reason {
+                            self.emit_event(
+                                &run_id,
+                                step as u32,
+                                EventKind::RunEnd,
+                                serde_json::json!({"exit_reason":"hook_aborted"}),
+                            );
+                            let prompt_chars = context_size_chars(&messages);
+                            return AgentOutcome {
+                                run_id,
+                                started_at,
+                                finished_at: crate::trust::now_rfc3339(),
+                                exit_reason: AgentExitReason::HookAborted,
+                                final_output: reason.clone(),
+                                error: Some(reason),
+                                messages,
+                                tool_calls: observed_tool_calls,
+                                compaction_settings: self.compaction_settings.clone(),
+                                final_prompt_size_chars: prompt_chars,
+                                compaction_report: last_compaction_report,
+                                hook_invocations,
+                            };
+                        }
+                        if !result.append_messages.is_empty() {
+                            messages.extend(result.append_messages);
+                            if self.compaction_settings.max_context_chars > 0 {
+                                let compacted_again =
+                                    maybe_compact(&messages, &self.compaction_settings)
+                                        .map_err(|e| format!("compaction failed after hooks: {e}"));
+                                match compacted_again {
+                                    Ok(out) => {
+                                        if let Some(report) = out.report.clone() {
+                                            self.emit_event(
+                                                &run_id,
+                                                step as u32,
+                                                EventKind::CompactionPerformed,
+                                                serde_json::json!({
+                                                    "before_chars": report.before_chars,
+                                                    "after_chars": report.after_chars,
+                                                    "before_messages": report.before_messages,
+                                                    "after_messages": report.after_messages,
+                                                    "compacted_messages": report.compacted_messages,
+                                                    "summary_digest_sha256": report.summary_digest_sha256,
+                                                    "phase": "post_pre_model_hooks"
+                                                }),
+                                            );
+                                            last_compaction_report = Some(report);
+                                        }
+                                        messages = out.messages;
+                                        if self.compaction_settings.max_context_chars > 0
+                                            && context_size_chars(&messages)
+                                                > self.compaction_settings.max_context_chars
+                                        {
+                                            let prompt_chars = context_size_chars(&messages);
+                                            return AgentOutcome {
+                                                run_id,
+                                                started_at,
+                                                finished_at: crate::trust::now_rfc3339(),
+                                                exit_reason: AgentExitReason::ProviderError,
+                                                final_output: String::new(),
+                                                error: Some(
+                                                    "hooks caused prompt to exceed budget"
+                                                        .to_string(),
+                                                ),
+                                                messages,
+                                                tool_calls: observed_tool_calls,
+                                                compaction_settings: self
+                                                    .compaction_settings
+                                                    .clone(),
+                                                final_prompt_size_chars: prompt_chars,
+                                                compaction_report: last_compaction_report,
+                                                hook_invocations,
+                                            };
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let prompt_chars = context_size_chars(&messages);
+                                        return AgentOutcome {
+                                            run_id,
+                                            started_at,
+                                            finished_at: crate::trust::now_rfc3339(),
+                                            exit_reason: AgentExitReason::ProviderError,
+                                            final_output: String::new(),
+                                            error: Some(e),
+                                            messages,
+                                            tool_calls: observed_tool_calls,
+                                            compaction_settings: self.compaction_settings.clone(),
+                                            final_prompt_size_chars: prompt_chars,
+                                            compaction_report: last_compaction_report,
+                                            hook_invocations,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::HookError,
+                            serde_json::json!({"stage":"pre_model","error": e.message}),
+                        );
+                        let prompt_chars = context_size_chars(&messages);
+                        return AgentOutcome {
+                            run_id,
+                            started_at,
+                            finished_at: crate::trust::now_rfc3339(),
+                            exit_reason: AgentExitReason::HookAborted,
+                            final_output: String::new(),
+                            error: Some(e.message),
+                            messages,
+                            tool_calls: observed_tool_calls,
+                            compaction_settings: self.compaction_settings.clone(),
+                            final_prompt_size_chars: prompt_chars,
+                            compaction_report: last_compaction_report,
+                            hook_invocations,
+                        };
+                    }
+                }
+            }
 
             let req = GenerateRequest {
                 model: self.model.clone(),
                 messages: messages.clone(),
                 tools: tools_sorted,
             };
+            let request_context_chars = context_size_chars(&req.messages);
 
             self.emit_event(
                 &run_id,
@@ -183,6 +431,10 @@ impl<P: ModelProvider> Agent<P> {
                         error: Some(e.to_string()),
                         messages,
                         tool_calls: observed_tool_calls,
+                        compaction_settings: self.compaction_settings.clone(),
+                        final_prompt_size_chars: request_context_chars,
+                        compaction_report: last_compaction_report,
+                        hook_invocations,
                     };
                 }
             };
@@ -210,6 +462,10 @@ impl<P: ModelProvider> Agent<P> {
                     error: None,
                     messages,
                     tool_calls: observed_tool_calls,
+                    compaction_settings: self.compaction_settings.clone(),
+                    final_prompt_size_chars: request_context_chars,
+                    compaction_report: last_compaction_report,
+                    hook_invocations,
                 };
             }
 
@@ -261,7 +517,7 @@ impl<P: ModelProvider> Agent<P> {
                             EventKind::ToolExecStart,
                             serde_json::json!({"tool_call_id": tc.id, "name": tc.name}),
                         );
-                        let tool_msg = if tc.name.starts_with("mcp.") {
+                        let mut tool_msg = if tc.name.starts_with("mcp.") {
                             match &self.mcp_registry {
                                 Some(reg) => match reg.call_namespaced_tool(tc).await {
                                     Ok(msg) => msg,
@@ -289,6 +545,140 @@ impl<P: ModelProvider> Agent<P> {
                         } else {
                             execute_tool(&self.tool_rt, tc).await
                         };
+                        let original_content = tool_msg.content.clone().unwrap_or_default();
+                        let mut input_digest = sha256_hex(original_content.as_bytes());
+                        let mut output_digest = input_digest.clone();
+                        let mut input_len = original_content.chars().count();
+                        let mut output_len = input_len;
+                        let mut final_truncated = infer_truncated_flag(&original_content);
+
+                        if self.hooks.enabled() {
+                            let payload = ToolResultPayload {
+                                tool_call_id: tc.id.clone(),
+                                tool_name: tc.name.clone(),
+                                ok: !tool_result_has_error(&original_content),
+                                content: original_content.clone(),
+                                truncated: final_truncated,
+                            };
+                            let hook_input = make_tool_result_input(
+                                &run_id,
+                                step as u32,
+                                provider_name(self.gate_ctx.provider),
+                                &self.model,
+                                &self.gate_ctx.workdir,
+                                match serde_json::to_value(payload) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        self.emit_event(
+                                            &run_id,
+                                            step as u32,
+                                            EventKind::HookError,
+                                            serde_json::json!({"stage":"tool_result","error": e.to_string()}),
+                                        );
+                                        return AgentOutcome {
+                                            run_id,
+                                            started_at,
+                                            finished_at: crate::trust::now_rfc3339(),
+                                            exit_reason: AgentExitReason::HookAborted,
+                                            final_output: String::new(),
+                                            error: Some(format!(
+                                                "failed to encode tool_result hook payload: {e}"
+                                            )),
+                                            messages,
+                                            tool_calls: observed_tool_calls,
+                                            compaction_settings: self.compaction_settings.clone(),
+                                            final_prompt_size_chars: request_context_chars,
+                                            compaction_report: last_compaction_report,
+                                            hook_invocations,
+                                        };
+                                    }
+                                },
+                            );
+                            match self
+                                .hooks
+                                .run_tool_result_hooks(
+                                    hook_input,
+                                    &tc.name,
+                                    &original_content,
+                                    final_truncated,
+                                )
+                                .await
+                            {
+                                Ok(hook_out) => {
+                                    for inv in &hook_out.invocations {
+                                        self.emit_event(
+                                            &run_id,
+                                            step as u32,
+                                            EventKind::HookStart,
+                                            serde_json::json!({
+                                                "hook_name": inv.hook_name,
+                                                "stage": inv.stage
+                                            }),
+                                        );
+                                        self.emit_event(
+                                            &run_id,
+                                            step as u32,
+                                            EventKind::HookEnd,
+                                            serde_json::json!({
+                                                "hook_name": inv.hook_name,
+                                                "stage": inv.stage,
+                                                "action": inv.action,
+                                                "modified": inv.modified,
+                                                "duration_ms": inv.duration_ms,
+                                                "input_digest": inv.input_digest,
+                                                "output_digest": inv.output_digest
+                                            }),
+                                        );
+                                    }
+                                    hook_invocations.extend(hook_out.invocations);
+                                    if let Some(reason) = hook_out.abort_reason {
+                                        return AgentOutcome {
+                                            run_id,
+                                            started_at,
+                                            finished_at: crate::trust::now_rfc3339(),
+                                            exit_reason: AgentExitReason::HookAborted,
+                                            final_output: String::new(),
+                                            error: Some(reason),
+                                            messages,
+                                            tool_calls: observed_tool_calls,
+                                            compaction_settings: self.compaction_settings.clone(),
+                                            final_prompt_size_chars: request_context_chars,
+                                            compaction_report: last_compaction_report,
+                                            hook_invocations,
+                                        };
+                                    }
+                                    tool_msg.content = Some(hook_out.content.clone());
+                                    final_truncated = hook_out.truncated;
+                                    input_digest = hook_out.input_digest;
+                                    output_digest = hook_out.output_digest;
+                                    input_len = hook_out.input_len;
+                                    output_len = hook_out.output_len;
+                                }
+                                Err(e) => {
+                                    self.emit_event(
+                                        &run_id,
+                                        step as u32,
+                                        EventKind::HookError,
+                                        serde_json::json!({"stage":"tool_result","error": e.message}),
+                                    );
+                                    return AgentOutcome {
+                                        run_id,
+                                        started_at,
+                                        finished_at: crate::trust::now_rfc3339(),
+                                        exit_reason: AgentExitReason::HookAborted,
+                                        final_output: String::new(),
+                                        error: Some(e.message),
+                                        messages,
+                                        tool_calls: observed_tool_calls,
+                                        compaction_settings: self.compaction_settings.clone(),
+                                        final_prompt_size_chars: request_context_chars,
+                                        compaction_report: last_compaction_report,
+                                        hook_invocations,
+                                    };
+                                }
+                            }
+                        }
+
                         let content = tool_msg.content.clone().unwrap_or_default();
                         self.gate.record(GateEvent {
                             run_id: run_id.clone(),
@@ -303,6 +693,10 @@ impl<P: ModelProvider> Agent<P> {
                             auto_approve_scope: auto_scope_meta.clone(),
                             result_ok: !tool_result_has_error(&content),
                             result_content: content,
+                            result_input_digest: Some(input_digest),
+                            result_output_digest: Some(output_digest),
+                            result_input_len: Some(input_len),
+                            result_output_len: Some(output_len),
                         });
                         self.emit_event(
                             &run_id,
@@ -311,7 +705,8 @@ impl<P: ModelProvider> Agent<P> {
                             serde_json::json!({
                                 "tool_call_id": tc.id,
                                 "name": tc.name,
-                                "ok": !tool_result_has_error(&tool_msg.content.clone().unwrap_or_default())
+                                "ok": !tool_result_has_error(&tool_msg.content.clone().unwrap_or_default()),
+                                "truncated": final_truncated
                             }),
                         );
                         messages.push(tool_msg);
@@ -345,6 +740,10 @@ impl<P: ModelProvider> Agent<P> {
                             auto_approve_scope: auto_scope_meta.clone(),
                             result_ok: false,
                             result_content: reason.clone(),
+                            result_input_digest: None,
+                            result_output_digest: None,
+                            result_input_len: None,
+                            result_output_len: None,
                         });
                         self.emit_event(
                             &run_id,
@@ -361,6 +760,10 @@ impl<P: ModelProvider> Agent<P> {
                             error: None,
                             messages,
                             tool_calls: observed_tool_calls,
+                            compaction_settings: self.compaction_settings.clone(),
+                            final_prompt_size_chars: request_context_chars,
+                            compaction_report: last_compaction_report,
+                            hook_invocations,
                         };
                     }
                     GateDecision::RequireApproval {
@@ -394,6 +797,10 @@ impl<P: ModelProvider> Agent<P> {
                             auto_approve_scope: auto_scope_meta.clone(),
                             result_ok: false,
                             result_content: reason,
+                            result_input_digest: None,
+                            result_output_digest: None,
+                            result_input_len: None,
+                            result_output_len: None,
                         });
                         self.emit_event(
                             &run_id,
@@ -413,6 +820,10 @@ impl<P: ModelProvider> Agent<P> {
                             error: None,
                             messages,
                             tool_calls: observed_tool_calls,
+                            compaction_settings: self.compaction_settings.clone(),
+                            final_prompt_size_chars: request_context_chars,
+                            compaction_report: last_compaction_report,
+                            hook_invocations,
                         };
                     }
                 }
@@ -425,6 +836,7 @@ impl<P: ModelProvider> Agent<P> {
             EventKind::RunEnd,
             serde_json::json!({"exit_reason":"max_steps"}),
         );
+        let final_prompt_size_chars = context_size_chars(&messages);
         AgentOutcome {
             run_id,
             started_at,
@@ -434,6 +846,10 @@ impl<P: ModelProvider> Agent<P> {
             error: None,
             messages,
             tool_calls: observed_tool_calls,
+            compaction_settings: self.compaction_settings.clone(),
+            final_prompt_size_chars,
+            compaction_report: last_compaction_report,
+            hook_invocations,
         }
     }
 }
@@ -442,6 +858,38 @@ fn tool_result_has_error(content: &str) -> bool {
         Ok(v) => v.get("error").is_some(),
         Err(_) => false,
     }
+}
+
+fn infer_truncated_flag(content: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(v) => {
+            v.get("truncated")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false)
+                || v.get("stdout_truncated")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false)
+                || v.get("stderr_truncated")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+fn provider_name(provider: crate::gate::ProviderKind) -> &'static str {
+    match provider {
+        crate::gate::ProviderKind::Lmstudio => "lmstudio",
+        crate::gate::ProviderKind::Llamacpp => "llamacpp",
+        crate::gate::ProviderKind::Ollama => "ollama",
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -453,7 +901,10 @@ mod tests {
     use serde_json::json;
 
     use super::Agent;
+    use crate::compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
     use crate::gate::{ApprovalMode, AutoApproveScope, GateContext, NoGate, ProviderKind};
+    use crate::hooks::config::HooksMode;
+    use crate::hooks::runner::{HookManager, HookRuntimeConfig};
     use crate::providers::{ModelProvider, StreamDelta};
     use crate::tools::ToolRuntime;
     use crate::types::{GenerateRequest, GenerateResponse, Message, Role};
@@ -533,6 +984,20 @@ mod tests {
             mcp_registry: None,
             stream: false,
             event_sink: None,
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
         };
         let out = agent.run("hi", vec![]).await;
         assert_eq!(out.final_output, "done");

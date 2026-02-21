@@ -1,7 +1,9 @@
 pub mod agent;
+pub mod compaction;
 pub mod eval;
 pub mod events;
 pub mod gate;
+pub mod hooks;
 pub mod mcp;
 pub mod providers;
 pub mod store;

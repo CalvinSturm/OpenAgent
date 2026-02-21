@@ -84,6 +84,7 @@ mod tests {
 
     use super::{evaluate_assertions, Assertion};
     use crate::agent::{AgentExitReason, AgentOutcome};
+    use crate::compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
     use crate::types::Message;
 
     #[test]
@@ -101,6 +102,15 @@ mod tests {
             error: None,
             messages: Vec::<Message>::new(),
             tool_calls: Vec::new(),
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            final_prompt_size_chars: 0,
+            compaction_report: None,
+            hook_invocations: Vec::new(),
         };
         let failures = evaluate_assertions(
             &[

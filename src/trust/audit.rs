@@ -8,6 +8,10 @@ use serde_json::Value;
 pub struct AuditResult {
     pub ok: bool,
     pub content: String,
+    pub input_digest: Option<String>,
+    pub output_digest: Option<String>,
+    pub input_len: Option<usize>,
+    pub output_len: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Clone)]

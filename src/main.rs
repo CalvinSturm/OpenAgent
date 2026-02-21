@@ -1,7 +1,9 @@
 mod agent;
+mod compaction;
 mod eval;
 mod events;
 mod gate;
+mod hooks;
 mod mcp;
 mod providers;
 mod store;
@@ -18,6 +20,7 @@ use crate::mcp::registry::{
 use agent::{Agent, AgentExitReason};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
+use compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
 use eval::runner::{run_eval, EvalConfig};
 use eval::tasks::EvalPack;
 use events::{Event, EventKind, EventSink, JsonlFileSink, MultiSink, StdoutSink};
@@ -25,6 +28,9 @@ use gate::{
     compute_policy_hash_hex, ApprovalMode, AutoApproveScope, GateContext, NoGate, ProviderKind,
     ToolGate, TrustGate, TrustMode,
 };
+use hooks::config::HooksMode;
+use hooks::protocol::{PreModelCompactionPayload, PreModelPayload, ToolResultPayload};
+use hooks::runner::{make_pre_model_input, make_tool_result_input, HookManager, HookRuntimeConfig};
 use providers::ollama::OllamaProvider;
 use providers::openai_compat::OpenAiCompatProvider;
 use providers::ModelProvider;
@@ -42,6 +48,7 @@ use trust::policy::Policy;
 enum Commands {
     Doctor(DoctorArgs),
     Mcp(McpArgs),
+    Hooks(HooksArgs),
     Approvals(ApprovalsArgs),
     Approve(ApproveArgs),
     Deny(DenyArgs),
@@ -59,6 +66,18 @@ enum McpSubcommand {
 struct McpArgs {
     #[command(subcommand)]
     command: McpSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum HooksSubcommand {
+    List,
+    Doctor,
+}
+
+#[derive(Debug, Parser)]
+struct HooksArgs {
+    #[command(subcommand)]
+    command: HooksSubcommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +157,24 @@ struct EvalArgs {
     no_session: bool,
     #[arg(long, default_value_t = 40)]
     max_session_messages: usize,
+    #[arg(long, default_value_t = 0)]
+    max_context_chars: usize,
+    #[arg(long, value_enum, default_value_t = CompactionMode::Off)]
+    compaction_mode: CompactionMode,
+    #[arg(long, default_value_t = 20)]
+    compaction_keep_last: usize,
+    #[arg(long, value_enum, default_value_t = ToolResultPersist::Digest)]
+    tool_result_persist: ToolResultPersist,
+    #[arg(long, value_enum, default_value_t = HooksMode::Off)]
+    hooks: HooksMode,
+    #[arg(long)]
+    hooks_config: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    hooks_strict: bool,
+    #[arg(long, default_value_t = 2000)]
+    hooks_timeout_ms: u64,
+    #[arg(long, default_value_t = 200_000)]
+    hooks_max_stdout_bytes: usize,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     #[arg(long)]
@@ -222,6 +259,24 @@ struct RunArgs {
     reset_session: bool,
     #[arg(long, default_value_t = 40)]
     max_session_messages: usize,
+    #[arg(long, default_value_t = 0)]
+    max_context_chars: usize,
+    #[arg(long, value_enum, default_value_t = CompactionMode::Off)]
+    compaction_mode: CompactionMode,
+    #[arg(long, default_value_t = 20)]
+    compaction_keep_last: usize,
+    #[arg(long, value_enum, default_value_t = ToolResultPersist::Digest)]
+    tool_result_persist: ToolResultPersist,
+    #[arg(long, value_enum, default_value_t = HooksMode::Off)]
+    hooks: HooksMode,
+    #[arg(long)]
+    hooks_config: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    hooks_strict: bool,
+    #[arg(long, default_value_t = 2000)]
+    hooks_timeout_ms: u64,
+    #[arg(long, default_value_t = 200_000)]
+    hooks_max_stdout_bytes: usize,
     #[arg(long, default_value_t = false)]
     stream: bool,
     #[arg(long)]
@@ -295,6 +350,29 @@ async fn main() -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
                     }
+                }
+            }
+        }
+        Some(Commands::Hooks(args)) => {
+            let hooks_path = resolved_hooks_config_path(&cli.run, &paths.state_dir);
+            match &args.command {
+                HooksSubcommand::List => {
+                    handle_hooks_list(&hooks_path)?;
+                    return Ok(());
+                }
+                HooksSubcommand::Doctor => {
+                    if let Err(e) = handle_hooks_doctor(
+                        &hooks_path,
+                        &cli.run,
+                        provider_to_string(ProviderKind::Ollama),
+                    )
+                    .await
+                    {
+                        println!("FAIL: {e}");
+                        std::process::exit(1);
+                    }
+                    println!("OK: hooks doctor");
+                    return Ok(());
                 }
             }
         }
@@ -378,6 +456,15 @@ async fn main() -> anyhow::Result<()> {
                 session: args.session.clone(),
                 no_session: args.no_session,
                 max_session_messages: args.max_session_messages,
+                max_context_chars: args.max_context_chars,
+                compaction_mode: args.compaction_mode,
+                compaction_keep_last: args.compaction_keep_last,
+                tool_result_persist: args.tool_result_persist,
+                hooks_mode: args.hooks,
+                hooks_config: args.hooks_config.clone(),
+                hooks_strict: args.hooks_strict,
+                hooks_timeout_ms: args.hooks_timeout_ms,
+                hooks_max_stdout_bytes: args.hooks_max_stdout_bytes,
                 state_dir_override: args.state_dir.clone(),
                 policy_override: args.policy.clone(),
                 approvals_override: args.approvals.clone(),
@@ -540,6 +627,14 @@ async fn run_agent<P: ModelProvider>(
     if let Some(reg) = &mcp_registry {
         all_tools.extend(reg.tool_defs());
     }
+    let hooks_config_path = resolved_hooks_config_path(args, &paths.state_dir);
+    let hook_manager = HookManager::build(HookRuntimeConfig {
+        mode: args.hooks,
+        config_path: hooks_config_path.clone(),
+        strict: args.hooks_strict,
+        timeout_ms: args.hooks_timeout_ms,
+        max_stdout_bytes: args.hooks_max_stdout_bytes,
+    })?;
 
     let mut agent = Agent {
         provider,
@@ -567,6 +662,13 @@ async fn run_agent<P: ModelProvider>(
         mcp_registry,
         stream: args.stream,
         event_sink: build_event_sink(args.stream, args.events.as_deref())?,
+        compaction_settings: CompactionSettings {
+            max_context_chars: args.max_context_chars,
+            mode: args.compaction_mode,
+            keep_last: args.compaction_keep_last,
+            tool_result_persist: args.tool_result_persist,
+        },
+        hooks: hook_manager,
     };
 
     let outcome = tokio::select! {
@@ -581,6 +683,15 @@ async fn run_agent<P: ModelProvider>(
                 error: Some("cancelled".to_string()),
                 messages: Vec::new(),
                 tool_calls: Vec::new(),
+                compaction_settings: CompactionSettings {
+                    max_context_chars: args.max_context_chars,
+                    mode: args.compaction_mode,
+                    keep_last: args.compaction_keep_last,
+                    tool_result_persist: args.tool_result_persist,
+                },
+                final_prompt_size_chars: 0,
+                compaction_report: None,
+                hook_invocations: Vec::new(),
             }
         }
     };
@@ -622,6 +733,15 @@ async fn run_agent<P: ModelProvider>(
         unsafe_bypass_allow_flags: args.unsafe_bypass_allow_flags,
         stream: args.stream,
         events_path: args.events.as_ref().map(|p| p.display().to_string()),
+        max_context_chars: args.max_context_chars,
+        compaction_mode: format!("{:?}", args.compaction_mode).to_lowercase(),
+        compaction_keep_last: args.compaction_keep_last,
+        tool_result_persist: format!("{:?}", args.tool_result_persist).to_lowercase(),
+        hooks_mode: format!("{:?}", args.hooks).to_lowercase(),
+        hooks_config_path: stable_path_string(&hooks_config_path),
+        hooks_strict: args.hooks_strict,
+        hooks_timeout_ms: args.hooks_timeout_ms,
+        hooks_max_stdout_bytes: args.hooks_max_stdout_bytes,
     };
     let config_fingerprint = ConfigFingerprintV1 {
         schema_version: "openagent.confighash.v1".to_string(),
@@ -657,6 +777,15 @@ async fn run_agent<P: ModelProvider>(
             .as_ref()
             .map(|p| stable_path_string(p))
             .unwrap_or_default(),
+        max_context_chars: args.max_context_chars,
+        compaction_mode: format!("{:?}", args.compaction_mode).to_lowercase(),
+        compaction_keep_last: args.compaction_keep_last,
+        tool_result_persist: format!("{:?}", args.tool_result_persist).to_lowercase(),
+        hooks_mode: format!("{:?}", args.hooks).to_lowercase(),
+        hooks_config_path: stable_path_string(&hooks_config_path),
+        hooks_strict: args.hooks_strict,
+        hooks_timeout_ms: args.hooks_timeout_ms,
+        hooks_max_stdout_bytes: args.hooks_max_stdout_bytes,
     };
     let config_hash_hex = config_hash_hex(&config_fingerprint)?;
     if let Err(e) = store::write_run_record(
@@ -695,6 +824,123 @@ fn resolved_mcp_config_path(args: &RunArgs, state_dir: &std::path::Path) -> Path
     args.mcp_config
         .clone()
         .unwrap_or_else(|| state_dir.join("mcp_servers.json"))
+}
+
+fn resolved_hooks_config_path(args: &RunArgs, state_dir: &std::path::Path) -> PathBuf {
+    args.hooks_config
+        .clone()
+        .unwrap_or_else(|| state_dir.join("hooks.yaml"))
+}
+
+fn handle_hooks_list(path: &std::path::Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        println!("no hooks config at {}", path.display());
+        return Ok(());
+    }
+    let loaded = hooks::config::LoadedHooks::load(path)?;
+    if loaded.hooks.is_empty() {
+        println!("no hooks configured");
+        return Ok(());
+    }
+    for hook in loaded.hooks {
+        let stages = hook
+            .cfg
+            .stages
+            .iter()
+            .map(|s| format!("{:?}", s).to_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
+        let cmd = if hook.cfg.args.is_empty() {
+            hook.cfg.command.clone()
+        } else {
+            format!("{} {}", hook.cfg.command, hook.cfg.args.join(" "))
+        };
+        println!("{}\t{}\t{}", hook.cfg.name, stages, cmd);
+    }
+    Ok(())
+}
+
+async fn handle_hooks_doctor(
+    path: &std::path::Path,
+    run: &RunArgs,
+    provider: String,
+) -> anyhow::Result<()> {
+    let manager = HookManager::build(HookRuntimeConfig {
+        mode: HooksMode::On,
+        config_path: path.to_path_buf(),
+        strict: true,
+        timeout_ms: run.hooks_timeout_ms,
+        max_stdout_bytes: run.hooks_max_stdout_bytes,
+    })?;
+    if manager.list().is_empty() {
+        println!("no hooks configured");
+        return Ok(());
+    }
+    let run_id = uuid::Uuid::new_v4().to_string();
+    for hook in manager.list() {
+        if hook.has_stage(hooks::config::HookStage::PreModel) {
+            let payload = PreModelPayload {
+                messages: vec![],
+                tools: vec![],
+                stream: false,
+                compaction: PreModelCompactionPayload::from(&CompactionSettings {
+                    max_context_chars: run.max_context_chars,
+                    mode: run.compaction_mode,
+                    keep_last: run.compaction_keep_last,
+                    tool_result_persist: run.tool_result_persist,
+                }),
+            };
+            let input = make_pre_model_input(
+                &run_id,
+                0,
+                &provider,
+                run.model.as_deref().unwrap_or("doctor"),
+                &run.workdir,
+                serde_json::to_value(payload)?,
+            );
+            let one = HookManager {
+                mode: manager.mode,
+                strict: true,
+                timeout_ms: manager.timeout_ms,
+                max_stdout_bytes: manager.max_stdout_bytes,
+                config_path: manager.config_path.clone(),
+                hooks: vec![hook.clone()],
+            };
+            one.run_pre_model_hooks(input)
+                .await
+                .map_err(|e| anyhow!(e.message))?;
+        }
+        if hook.has_stage(hooks::config::HookStage::ToolResult) {
+            let payload = ToolResultPayload {
+                tool_call_id: "doctor_tc".to_string(),
+                tool_name: "read_file".to_string(),
+                ok: true,
+                content: "sample".to_string(),
+                truncated: false,
+            };
+            let input = make_tool_result_input(
+                &run_id,
+                0,
+                &provider,
+                run.model.as_deref().unwrap_or("doctor"),
+                &run.workdir,
+                serde_json::to_value(payload)?,
+            );
+            let one = HookManager {
+                mode: manager.mode,
+                strict: true,
+                timeout_ms: manager.timeout_ms,
+                max_stdout_bytes: manager.max_stdout_bytes,
+                config_path: manager.config_path.clone(),
+                hooks: vec![hook.clone()],
+            };
+            one.run_tool_result_hooks(input, "read_file", "sample", false)
+                .await
+                .map_err(|e| anyhow!(e.message))?;
+        }
+        println!("OK: hook {}", hook.cfg.name);
+    }
+    Ok(())
 }
 
 fn build_event_sink(
