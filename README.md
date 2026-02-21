@@ -304,6 +304,8 @@ localagent doctor --provider ollama
 - Contributing: `CONTRIBUTING.md`
 - Release notes: `docs/RELEASE_NOTES_v0.1.0.md`
 - Changelog: `CHANGELOG.md`
+- Security policy: `SECURITY.md`
+- Code of conduct: `CODE_OF_CONDUCT.md`
 
 ## License
 
