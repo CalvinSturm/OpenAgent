@@ -43,6 +43,10 @@ pub struct RunRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_allowlist: Option<McpAllowSummary>,
     pub config_hash_hex: String,
+    #[serde(default)]
+    pub tool_schema_hash_hex_map: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_config_hash_hex: Option<String>,
     pub transcript: Vec<Message>,
     pub tool_calls: Vec<ToolCall>,
     #[serde(default)]
@@ -113,10 +117,20 @@ pub struct RunCliConfig {
     pub allow_shell: bool,
     pub allow_write: bool,
     pub enable_write_tools: bool,
+    pub exec_target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_workdir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_network: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_user: Option<String>,
     pub max_tool_output_bytes: usize,
     pub max_read_bytes: usize,
     pub approval_mode: String,
     pub auto_approve_scope: String,
+    pub approval_key: String,
     pub unsafe_mode: bool,
     pub no_limits: bool,
     pub unsafe_bypass_allow_flags: bool,
@@ -183,6 +197,11 @@ pub struct ConfigFingerprintV1 {
     pub allow_shell: bool,
     pub allow_write: bool,
     pub enable_write_tools: bool,
+    pub exec_target: String,
+    pub docker_image: String,
+    pub docker_workdir: String,
+    pub docker_network: String,
+    pub docker_user: String,
     pub max_steps: usize,
     pub max_tool_output_bytes: usize,
     pub max_read_bytes: usize,
@@ -191,6 +210,7 @@ pub struct ConfigFingerprintV1 {
     pub max_session_messages: usize,
     pub approval_mode: String,
     pub auto_approve_scope: String,
+    pub approval_key: String,
     pub unsafe_mode: bool,
     pub no_limits: bool,
     pub unsafe_bypass_allow_flags: bool,
@@ -294,6 +314,8 @@ pub fn write_run_record(
     mode: RunMode,
     planner: Option<PlannerRunRecord>,
     worker: Option<WorkerRunRecord>,
+    tool_schema_hash_hex_map: BTreeMap<String, String>,
+    hooks_config_hash_hex: Option<String>,
 ) -> anyhow::Result<PathBuf> {
     ensure_dir(&paths.runs_dir)?;
     let run_path = paths.runs_dir.join(format!("{}.json", outcome.run_id));
@@ -321,6 +343,8 @@ pub fn write_run_record(
         includes_resolved: policy.includes_resolved,
         mcp_allowlist: policy.mcp_allowlist,
         config_hash_hex,
+        tool_schema_hash_hex_map,
+        hooks_config_hash_hex,
         transcript: outcome.messages.clone(),
         tool_calls: outcome.tool_calls.clone(),
         tool_decisions: outcome.tool_decisions.clone(),
@@ -362,6 +386,7 @@ pub fn render_replay(record: &RunRecord) -> String {
         record.cli.no_limits,
         record.cli.unsafe_bypass_allow_flags
     ));
+    out.push_str(&format!("exec_target: {}\n", record.cli.exec_target));
     out.push_str(&format!("tui_enabled: {}\n", record.cli.tui_enabled));
     if let Some(planner) = &record.planner {
         let steps_count = planner
@@ -474,6 +499,20 @@ pub fn stable_path_string(path: &Path) -> String {
 pub fn config_hash_hex(fingerprint: &ConfigFingerprintV1) -> anyhow::Result<String> {
     let bytes = serde_json::to_vec(fingerprint)?;
     Ok(sha256_hex(&bytes))
+}
+
+pub fn tool_schema_hash_hex_map(tools: &[crate::types::ToolDef]) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for tool in tools {
+        out.insert(tool.name.clone(), hash_tool_schema(&tool.parameters));
+    }
+    out
+}
+
+pub fn hash_tool_schema(schema: &Value) -> String {
+    let canonical = crate::trust::approvals::canonical_json(schema)
+        .unwrap_or_else(|_| serde_json::to_string(schema).unwrap_or_else(|_| "null".to_string()));
+    sha256_hex(canonical.as_bytes())
 }
 
 #[cfg(test)]
@@ -658,10 +697,16 @@ mod tests {
                 allow_shell: false,
                 allow_write: false,
                 enable_write_tools: false,
+                exec_target: "host".to_string(),
+                docker_image: None,
+                docker_workdir: None,
+                docker_network: None,
+                docker_user: None,
                 max_tool_output_bytes: 200_000,
                 max_read_bytes: 200_000,
                 approval_mode: "interrupt".to_string(),
                 auto_approve_scope: "run".to_string(),
+                approval_key: "v1".to_string(),
                 unsafe_mode: false,
                 no_limits: false,
                 unsafe_bypass_allow_flags: false,
@@ -709,6 +754,8 @@ mod tests {
                 model: "m".to_string(),
                 injected_planner_hash_hex: None,
             }),
+            BTreeMap::new(),
+            None,
         )
         .expect("write run");
         let loaded = load_run_record(&paths.state_dir, "run_1").expect("load run");
@@ -716,6 +763,7 @@ mod tests {
         assert_eq!(loaded.metadata.exit_reason, "ok");
         assert_eq!(loaded.mode, "single");
         assert_eq!(loaded.config_hash_hex, "cfg_hash");
+        assert_eq!(loaded.cli.exec_target, "host");
         let compaction = loaded.compaction.expect("compaction");
         assert_eq!(compaction.final_prompt_size_chars, 321);
         assert_eq!(
@@ -774,10 +822,16 @@ mod tests {
                 allow_shell: false,
                 allow_write: false,
                 enable_write_tools: false,
+                exec_target: "host".to_string(),
+                docker_image: None,
+                docker_workdir: None,
+                docker_network: None,
+                docker_user: None,
                 max_tool_output_bytes: 200_000,
                 max_read_bytes: 200_000,
                 approval_mode: "interrupt".to_string(),
                 auto_approve_scope: "run".to_string(),
+                approval_key: "v1".to_string(),
                 unsafe_mode: false,
                 no_limits: false,
                 unsafe_bypass_allow_flags: false,
@@ -822,6 +876,8 @@ mod tests {
             includes_resolved: Vec::new(),
             mcp_allowlist: None,
             config_hash_hex: "cfg".to_string(),
+            tool_schema_hash_hex_map: BTreeMap::new(),
+            hooks_config_hash_hex: None,
             transcript: vec![Message {
                 role: Role::Developer,
                 content: Some("PLANNER HANDOFF (openagent.plan.v1)\n{}".to_string()),
@@ -872,6 +928,11 @@ mod tests {
             allow_shell: false,
             allow_write: false,
             enable_write_tools: false,
+            exec_target: "host".to_string(),
+            docker_image: String::new(),
+            docker_workdir: String::new(),
+            docker_network: String::new(),
+            docker_user: String::new(),
             max_steps: 20,
             max_tool_output_bytes: 200_000,
             max_read_bytes: 200_000,
@@ -880,6 +941,7 @@ mod tests {
             max_session_messages: 40,
             approval_mode: "interrupt".to_string(),
             auto_approve_scope: "run".to_string(),
+            approval_key: "v1".to_string(),
             unsafe_mode: false,
             no_limits: false,
             unsafe_bypass_allow_flags: false,
@@ -920,5 +982,17 @@ mod tests {
         a.max_read_bytes = 100;
         let hc = config_hash_hex(&a).expect("hash c");
         assert_ne!(ha, hc);
+
+        let mut d = b.clone();
+        d.exec_target = "docker".to_string();
+        let hd = config_hash_hex(&d).expect("hash d");
+        assert_ne!(hb, hd);
+    }
+
+    #[test]
+    fn tool_schema_hash_is_deterministic_for_key_order() {
+        let a = serde_json::json!({"type":"object","properties":{"b":{"type":"string"},"a":{"type":"number"}}});
+        let b = serde_json::json!({"properties":{"a":{"type":"number"},"b":{"type":"string"}},"type":"object"});
+        assert_eq!(super::hash_tool_schema(&a), super::hash_tool_schema(&b));
     }
 }

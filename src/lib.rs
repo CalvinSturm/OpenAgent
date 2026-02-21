@@ -9,6 +9,8 @@ pub mod planner;
 pub mod providers;
 pub mod session;
 pub mod store;
+pub mod target;
+pub mod taskgraph;
 pub mod tools;
 pub mod trust;
 pub mod tui;

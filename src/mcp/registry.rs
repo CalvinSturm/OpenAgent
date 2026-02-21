@@ -106,6 +106,8 @@ impl McpRegistry {
                     stderr_truncated: None,
                     stdout_truncated: None,
                     source: "mcp".to_string(),
+                    execution_target: "host".to_string(),
+                    docker: None,
                 },
             )));
         }
@@ -134,6 +136,8 @@ impl McpRegistry {
                 stderr_truncated: None,
                 stdout_truncated: None,
                 source: "mcp".to_string(),
+                execution_target: "host".to_string(),
+                docker: None,
             },
         )))
     }

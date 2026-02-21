@@ -1,10 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::process::Command;
 
+use crate::target::{
+    DockerMeta, ExecTarget, ExecTargetKind, ListReq, PatchReq, ReadReq, ShellReq, WriteReq,
+};
 use crate::types::{Message, Role, SideEffects, ToolCall, ToolDef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -19,7 +22,7 @@ impl ToolArgsStrict {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolRuntime {
     pub workdir: PathBuf,
     pub allow_shell: bool,
@@ -28,6 +31,8 @@ pub struct ToolRuntime {
     pub max_read_bytes: usize,
     pub unsafe_bypass_allow_flags: bool,
     pub tool_args_strict: ToolArgsStrict,
+    pub exec_target_kind: ExecTargetKind,
+    pub exec_target: Arc<dyn ExecTarget>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +47,9 @@ pub struct ToolResultMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdout_truncated: Option<bool>,
     pub source: String,
+    pub execution_target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker: Option<DockerMeta>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,7 +148,8 @@ pub fn builtin_tools_enabled(enable_write_tools: bool) -> Vec<ToolDef> {
     tools
 }
 
-pub fn resolve_path(workdir: &Path, input: &str) -> PathBuf {
+#[cfg(test)]
+pub fn resolve_path(workdir: &std::path::Path, input: &str) -> PathBuf {
     let p = PathBuf::from(input);
     if p.is_absolute() {
         p
@@ -337,6 +346,11 @@ pub async fn execute_tool(rt: &ToolRuntime, tc: &ToolCall) -> Message {
                 stderr_truncated: None,
                 stdout_truncated: None,
                 source: "builtin".to_string(),
+                execution_target: match rt.exec_target_kind {
+                    ExecTargetKind::Host => "host".to_string(),
+                    ExecTargetKind::Docker => "docker".to_string(),
+                },
+                docker: None,
             },
         ));
     }
@@ -357,6 +371,11 @@ pub async fn execute_tool(rt: &ToolRuntime, tc: &ToolCall) -> Message {
                 stderr_truncated: None,
                 stdout_truncated: None,
                 source: "builtin".to_string(),
+                execution_target: match rt.exec_target_kind {
+                    ExecTargetKind::Host => "host".to_string(),
+                    ExecTargetKind::Docker => "docker".to_string(),
+                },
+                docker: None,
             },
         },
     };
@@ -372,118 +391,67 @@ pub async fn execute_tool(rt: &ToolRuntime, tc: &ToolCall) -> Message {
 
 async fn run_list_dir(rt: &ToolRuntime, args: &Value) -> ToolExecution {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-    let full_path = resolve_path(&rt.workdir, path);
-    let mut entries_out = Vec::new();
-    match tokio::fs::read_dir(&full_path).await {
-        Ok(mut rd) => loop {
-            match rd.next_entry().await {
-                Ok(Some(entry)) => {
-                    let file_name = entry.file_name().to_string_lossy().to_string();
-                    match entry.metadata().await {
-                        Ok(meta) => entries_out.push(
-                            json!({"name":file_name,"is_dir":meta.is_dir(),"len":meta.len()}),
-                        ),
-                        Err(e) => entries_out.push(json!({"name":file_name,"error":e.to_string()})),
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    return failed_exec(
-                        SideEffects::FilesystemRead,
-                        format!("list_dir failed for {}: {e}", full_path.display()),
-                    )
-                }
-            }
-        },
-        Err(e) => {
-            return failed_exec(
-                SideEffects::FilesystemRead,
-                format!("list_dir failed for {}: {e}", full_path.display()),
-            )
-        }
-    }
-    ToolExecution {
-        ok: true,
-        content: json!({"path":full_path.display().to_string(),"entries":entries_out}).to_string(),
-        truncated: false,
-        meta: base_meta(SideEffects::FilesystemRead),
-    }
+    let out = rt
+        .exec_target
+        .list_dir(ListReq {
+            workdir: rt.workdir.clone(),
+            path: path.to_string(),
+        })
+        .await;
+    target_to_exec(SideEffects::FilesystemRead, out)
 }
 
 async fn run_read_file(rt: &ToolRuntime, args: &Value) -> ToolExecution {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let full_path = resolve_path(&rt.workdir, path);
-    match tokio::fs::read(&full_path).await {
-        Ok(bytes) => {
-            let content_raw = String::from_utf8_lossy(&bytes).to_string();
-            let (content, truncated) = truncate_utf8_to_bytes(&content_raw, rt.max_read_bytes);
-            let mut meta = base_meta(SideEffects::FilesystemRead);
-            meta.bytes = Some(bytes.len() as u64);
-            ToolExecution {
-                ok: true,
-                content: json!({"path":full_path.display().to_string(),"content":content,"truncated":truncated,"max_read_bytes":rt.max_read_bytes,"read_bytes":bytes.len()}).to_string(),
-                truncated,
-                meta,
-            }
-        }
-        Err(e) => failed_exec(
-            SideEffects::FilesystemRead,
-            format!("read_file failed for {}: {e}", full_path.display()),
-        ),
-    }
+    let out = rt
+        .exec_target
+        .read_file(ReadReq {
+            workdir: rt.workdir.clone(),
+            path: path.to_string(),
+            max_read_bytes: rt.max_read_bytes,
+        })
+        .await;
+    target_to_exec(SideEffects::FilesystemRead, out)
 }
 
 async fn run_shell(rt: &ToolRuntime, args: &Value) -> ToolExecution {
     if !rt.allow_shell && !rt.unsafe_bypass_allow_flags {
         return failed_exec(
+            rt,
             SideEffects::ShellExec,
             "shell tool is disabled. Re-run with --allow-shell".to_string(),
         );
     }
     let cmd = args.get("cmd").and_then(|v| v.as_str()).unwrap_or_default();
-    let mut command = Command::new(cmd);
-    if let Some(raw_args) = args.get("args").and_then(|v| v.as_array()) {
-        for arg in raw_args {
-            if let Some(s) = arg.as_str() {
-                command.arg(s);
-            }
-        }
-    }
-    if let Some(cwd) = args.get("cwd").and_then(|v| v.as_str()) {
-        command.current_dir(resolve_path(&rt.workdir, cwd));
-    } else {
-        command.current_dir(&rt.workdir);
-    }
-    match command.output().await {
-        Ok(output) => {
-            let stdout_raw = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr_raw = String::from_utf8_lossy(&output.stderr).to_string();
-            let (stdout, stdout_truncated) =
-                truncate_utf8_to_bytes(&stdout_raw, rt.max_tool_output_bytes);
-            let (stderr, stderr_truncated) =
-                truncate_utf8_to_bytes(&stderr_raw, rt.max_tool_output_bytes);
-            let mut meta = base_meta(SideEffects::ShellExec);
-            meta.exit_code = output.status.code();
-            meta.bytes = Some((output.stdout.len() + output.stderr.len()) as u64);
-            meta.stdout_truncated = Some(stdout_truncated);
-            meta.stderr_truncated = Some(stderr_truncated);
-            ToolExecution {
-                ok: output.status.success(),
-                content: json!({"status":output.status.code(),"stdout":stdout,"stderr":stderr,"stdout_truncated":stdout_truncated,"stderr_truncated":stderr_truncated,"max_tool_output_bytes":rt.max_tool_output_bytes}).to_string(),
-                truncated: stdout_truncated || stderr_truncated,
-                meta,
-            }
-        }
-        Err(e) => failed_exec(
-            SideEffects::ShellExec,
-            format!("shell execution failed: {e}"),
-        ),
-    }
+    let arg_list = args
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let out = rt
+        .exec_target
+        .exec_shell(ShellReq {
+            workdir: rt.workdir.clone(),
+            cmd: cmd.to_string(),
+            args: arg_list,
+            cwd: args
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            max_tool_output_bytes: rt.max_tool_output_bytes,
+        })
+        .await;
+    target_to_exec(SideEffects::ShellExec, out)
 }
 
 async fn run_write_file(rt: &ToolRuntime, args: &Value) -> ToolExecution {
     if !rt.allow_write && !rt.unsafe_bypass_allow_flags {
         return failed_exec(
+            rt,
             SideEffects::FilesystemWrite,
             "writes require --allow-write".to_string(),
         );
@@ -500,40 +468,22 @@ async fn run_write_file(rt: &ToolRuntime, args: &Value) -> ToolExecution {
         .get("create_parents")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let full_path = resolve_path(&rt.workdir, path);
-    if create_parents {
-        if let Some(parent) = full_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return failed_exec(
-                    SideEffects::FilesystemWrite,
-                    format!("write_file failed for {}: {e}", full_path.display()),
-                );
-            }
-        }
-    }
-    match tokio::fs::write(&full_path, content.as_bytes()).await {
-        Ok(()) => {
-            let mut meta = base_meta(SideEffects::FilesystemWrite);
-            meta.bytes = Some(content.len() as u64);
-            ToolExecution {
-                ok: true,
-                content:
-                    json!({"path":full_path.display().to_string(),"bytes_written":content.len()})
-                        .to_string(),
-                truncated: false,
-                meta,
-            }
-        }
-        Err(e) => failed_exec(
-            SideEffects::FilesystemWrite,
-            format!("write_file failed for {}: {e}", full_path.display()),
-        ),
-    }
+    let out = rt
+        .exec_target
+        .write_file(WriteReq {
+            workdir: rt.workdir.clone(),
+            path: path.to_string(),
+            content: content.to_string(),
+            create_parents,
+        })
+        .await;
+    target_to_exec(SideEffects::FilesystemWrite, out)
 }
 
 async fn run_apply_patch(rt: &ToolRuntime, args: &Value) -> ToolExecution {
     if !rt.allow_write && !rt.unsafe_bypass_allow_flags {
         return failed_exec(
+            rt,
             SideEffects::FilesystemWrite,
             "writes require --allow-write".to_string(),
         );
@@ -546,58 +496,39 @@ async fn run_apply_patch(rt: &ToolRuntime, args: &Value) -> ToolExecution {
         .get("patch")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let full_path = resolve_path(&rt.workdir, path);
-    let original_bytes = match tokio::fs::read(&full_path).await {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => {
-            return failed_exec(
-                SideEffects::FilesystemWrite,
-                format!("apply_patch failed for {}: {e}", full_path.display()),
-            )
-        }
-    };
-    let original_text = String::from_utf8_lossy(&original_bytes).to_string();
-    let patch = match diffy::Patch::from_str(patch_text) {
-        Ok(p) => p,
-        Err(e) => return failed_exec(SideEffects::FilesystemWrite, format!("invalid patch: {e}")),
-    };
-    let patched = match diffy::apply(&original_text, &patch) {
-        Ok(p) => p,
-        Err(e) => {
-            return failed_exec(
-                SideEffects::FilesystemWrite,
-                format!("failed to apply patch: {e}"),
-            )
-        }
-    };
-    if let Some(parent) = full_path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return failed_exec(
-                SideEffects::FilesystemWrite,
-                format!("apply_patch failed for {}: {e}", full_path.display()),
-            );
-        }
-    }
-    match tokio::fs::write(&full_path, patched.as_bytes()).await {
-        Ok(()) => {
-            let mut meta = base_meta(SideEffects::FilesystemWrite);
-            meta.bytes = Some(patched.len() as u64);
-            ToolExecution {
-                ok: true,
-                content: json!({"path":full_path.display().to_string(),"changed":patched!=original_text,"bytes_written":patched.len()}).to_string(),
-                truncated: false,
-                meta,
-            }
-        }
-        Err(e) => failed_exec(
-            SideEffects::FilesystemWrite,
-            format!("apply_patch failed for {}: {e}", full_path.display()),
-        ),
+    let out = rt
+        .exec_target
+        .apply_patch(PatchReq {
+            workdir: rt.workdir.clone(),
+            path: path.to_string(),
+            patch: patch_text.to_string(),
+        })
+        .await;
+    target_to_exec(SideEffects::FilesystemWrite, out)
+}
+
+fn target_to_exec(side_effects: SideEffects, out: crate::target::TargetResult) -> ToolExecution {
+    ToolExecution {
+        ok: out.ok,
+        content: out.content,
+        truncated: out.truncated,
+        meta: ToolResultMeta {
+            side_effects,
+            bytes: out.bytes,
+            exit_code: out.exit_code,
+            stderr_truncated: out.stderr_truncated,
+            stdout_truncated: out.stdout_truncated,
+            source: "builtin".to_string(),
+            execution_target: match out.execution_target {
+                ExecTargetKind::Host => "host".to_string(),
+                ExecTargetKind::Docker => "docker".to_string(),
+            },
+            docker: out.docker,
+        },
     }
 }
 
-fn base_meta(side_effects: SideEffects) -> ToolResultMeta {
+fn base_meta(rt: &ToolRuntime, side_effects: SideEffects) -> ToolResultMeta {
     ToolResultMeta {
         side_effects,
         bytes: None,
@@ -605,30 +536,21 @@ fn base_meta(side_effects: SideEffects) -> ToolResultMeta {
         stderr_truncated: None,
         stdout_truncated: None,
         source: "builtin".to_string(),
+        execution_target: match rt.exec_target_kind {
+            ExecTargetKind::Host => "host".to_string(),
+            ExecTargetKind::Docker => "docker".to_string(),
+        },
+        docker: None,
     }
 }
 
-fn failed_exec(side_effects: SideEffects, content: String) -> ToolExecution {
+fn failed_exec(rt: &ToolRuntime, side_effects: SideEffects, content: String) -> ToolExecution {
     ToolExecution {
         ok: false,
         content,
         truncated: false,
-        meta: base_meta(side_effects),
+        meta: base_meta(rt, side_effects),
     }
-}
-
-pub fn truncate_utf8_to_bytes(input: &str, max_bytes: usize) -> (String, bool) {
-    if max_bytes == 0 {
-        return (input.to_string(), false);
-    }
-    if input.len() <= max_bytes {
-        return (input.to_string(), false);
-    }
-    let mut end = max_bytes;
-    while end > 0 && !input.is_char_boundary(end) {
-        end -= 1;
-    }
-    (input[..end].to_string(), true)
 }
 
 #[cfg(test)]
@@ -642,6 +564,7 @@ mod tests {
         builtin_tools_enabled, execute_tool, resolve_path, tool_side_effects,
         validate_builtin_tool_args, ToolArgsStrict, ToolRuntime,
     };
+    use crate::target::{ExecTargetKind, HostTarget};
     use crate::types::{SideEffects, ToolCall};
 
     #[test]
@@ -679,6 +602,8 @@ mod tests {
             max_read_bytes: 200_000,
             unsafe_bypass_allow_flags: false,
             tool_args_strict: ToolArgsStrict::On,
+            exec_target_kind: ExecTargetKind::Host,
+            exec_target: std::sync::Arc::new(HostTarget),
         };
         let tc = ToolCall {
             id: "tc_w".to_string(),
@@ -702,6 +627,8 @@ mod tests {
             max_read_bytes: 200_000,
             unsafe_bypass_allow_flags: false,
             tool_args_strict: ToolArgsStrict::On,
+            exec_target_kind: ExecTargetKind::Host,
+            exec_target: std::sync::Arc::new(HostTarget),
         };
         let tc = ToolCall {
             id: "bad_w".to_string(),
@@ -738,6 +665,8 @@ mod tests {
             max_read_bytes: 200_000,
             unsafe_bypass_allow_flags: false,
             tool_args_strict: ToolArgsStrict::On,
+            exec_target_kind: ExecTargetKind::Host,
+            exec_target: std::sync::Arc::new(HostTarget),
         };
         let tc = ToolCall {
             id: "tc_p".to_string(),
@@ -764,6 +693,8 @@ mod tests {
             max_read_bytes: 5,
             unsafe_bypass_allow_flags: false,
             tool_args_strict: ToolArgsStrict::On,
+            exec_target_kind: ExecTargetKind::Host,
+            exec_target: std::sync::Arc::new(HostTarget),
         };
         let tc = ToolCall {
             id: "tc_t".to_string(),

@@ -376,7 +376,7 @@ mod tests {
         let path = tmp.path().join("approvals.json");
         let store = ApprovalsStore::new(path.clone());
         let id = store
-            .create_pending("shell", &serde_json::json!({"cmd":"echo"}), None)
+            .create_pending("shell", &serde_json::json!({"cmd":"echo"}), None, None)
             .expect("pending");
         let mut s = UiState::new(10);
         s.refresh_approvals(&path).expect("refresh");

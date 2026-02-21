@@ -717,6 +717,18 @@ impl<P: ModelProvider> Agent<P> {
                 } else {
                     None
                 };
+                let approval_key_version_meta =
+                    Some(self.gate_ctx.approval_key_version.as_str().to_string());
+                let tool_schema_hash_hex = self.gate_ctx.tool_schema_hashes.get(&tc.name).cloned();
+                let hooks_config_hash_hex = self.gate_ctx.hooks_config_hash_hex.clone();
+                let planner_hash_hex = self.gate_ctx.planner_hash_hex.clone();
+                let decision_exec_target = Some(
+                    match self.gate_ctx.exec_target {
+                        crate::target::ExecTargetKind::Host => "host",
+                        crate::target::ExecTargetKind::Docker => "docker",
+                    }
+                    .to_string(),
+                );
                 match self.gate.decide(&self.gate_ctx, tc) {
                     GateDecision::Allow {
                         approval_id,
@@ -736,8 +748,28 @@ impl<P: ModelProvider> Agent<P> {
                                 "approval_key": approval_key.clone(),
                                 "reason": reason.clone(),
                                 "source": source.clone(),
+                                "approval_key_version": approval_key_version_meta.clone(),
+                                "tool_schema_hash_hex": tool_schema_hash_hex.clone(),
+                                "hooks_config_hash_hex": hooks_config_hash_hex.clone(),
+                                "planner_hash_hex": planner_hash_hex.clone(),
+                                "exec_target": decision_exec_target.clone(),
                                 "side_effects": tool_side_effects(&tc.name),
                                 "tool_args_strict": if self.tool_rt.tool_args_strict.is_enabled() { "on" } else { "off" }
+                            }),
+                        );
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::ToolExecTarget,
+                            serde_json::json!({
+                                "tool_call_id": tc.id,
+                                "name": tc.name,
+                                "exec_target": if tc.name.starts_with("mcp.") { "host" } else {
+                                    match self.tool_rt.exec_target_kind {
+                                        crate::target::ExecTargetKind::Host => "host",
+                                        crate::target::ExecTargetKind::Docker => "docker",
+                                    }
+                                }
                             }),
                         );
                         self.emit_event(
@@ -747,7 +779,7 @@ impl<P: ModelProvider> Agent<P> {
                             serde_json::json!({"tool_call_id": tc.id, "name": tc.name, "side_effects": tool_side_effects(&tc.name)}),
                         );
                         let mut tool_msg = if let Some(err) = &invalid_args_error {
-                            make_invalid_args_tool_message(tc, err)
+                            make_invalid_args_tool_message(tc, err, self.tool_rt.exec_target_kind)
                         } else if tc.name.starts_with("mcp.") {
                             match &self.mcp_registry {
                                 Some(reg) => match reg
@@ -768,6 +800,8 @@ impl<P: ModelProvider> Agent<P> {
                                             stderr_truncated: None,
                                             stdout_truncated: None,
                                             source: "mcp".to_string(),
+                                            execution_target: "host".to_string(),
+                                            docker: None,
                                         },
                                     )),
                                 },
@@ -784,6 +818,8 @@ impl<P: ModelProvider> Agent<P> {
                                         stderr_truncated: None,
                                         stdout_truncated: None,
                                         source: "mcp".to_string(),
+                                        execution_target: "host".to_string(),
+                                        docker: None,
                                     },
                                 )),
                             }
@@ -962,6 +998,11 @@ impl<P: ModelProvider> Agent<P> {
                             approval_key,
                             approval_mode: approval_mode_meta.clone(),
                             auto_approve_scope: auto_scope_meta.clone(),
+                            approval_key_version: approval_key_version_meta.clone(),
+                            tool_schema_hash_hex: tool_schema_hash_hex.clone(),
+                            hooks_config_hash_hex: hooks_config_hash_hex.clone(),
+                            planner_hash_hex: planner_hash_hex.clone(),
+                            exec_target: decision_exec_target.clone(),
                             result_ok: !tool_result_has_error(&content),
                             result_content: content,
                             result_input_digest: Some(input_digest),
@@ -1006,6 +1047,11 @@ impl<P: ModelProvider> Agent<P> {
                                 "reason": reason.clone(),
                                 "approval_key": approval_key.clone(),
                                 "source": source.clone(),
+                                "approval_key_version": approval_key_version_meta.clone(),
+                                "tool_schema_hash_hex": tool_schema_hash_hex.clone(),
+                                "hooks_config_hash_hex": hooks_config_hash_hex.clone(),
+                                "planner_hash_hex": planner_hash_hex.clone(),
+                                "exec_target": decision_exec_target.clone(),
                                 "side_effects": tool_side_effects(&tc.name),
                                 "tool_args_strict": if self.tool_rt.tool_args_strict.is_enabled() { "on" } else { "off" }
                             }),
@@ -1023,6 +1069,11 @@ impl<P: ModelProvider> Agent<P> {
                             approval_key,
                             approval_mode: approval_mode_meta.clone(),
                             auto_approve_scope: auto_scope_meta.clone(),
+                            approval_key_version: approval_key_version_meta.clone(),
+                            tool_schema_hash_hex: tool_schema_hash_hex.clone(),
+                            hooks_config_hash_hex: hooks_config_hash_hex.clone(),
+                            planner_hash_hex: planner_hash_hex.clone(),
+                            exec_target: decision_exec_target.clone(),
                             result_ok: false,
                             result_content: reason.clone(),
                             result_input_digest: None,
@@ -1090,9 +1141,29 @@ impl<P: ModelProvider> Agent<P> {
                                     "tool_call_id": tc.id,
                                     "name": tc.name,
                                     "decision": "allow",
-                                    "reason": format!("invalid args bypassed approval: {err}"),
-                                    "side_effects": tool_side_effects(&tc.name),
-                                    "tool_args_strict": if self.tool_rt.tool_args_strict.is_enabled() { "on" } else { "off" }
+                                "reason": format!("invalid args bypassed approval: {err}"),
+                                "approval_key_version": approval_key_version_meta.clone(),
+                                "tool_schema_hash_hex": tool_schema_hash_hex.clone(),
+                                "hooks_config_hash_hex": hooks_config_hash_hex.clone(),
+                                "planner_hash_hex": planner_hash_hex.clone(),
+                                "exec_target": decision_exec_target.clone(),
+                                "side_effects": tool_side_effects(&tc.name),
+                                "tool_args_strict": if self.tool_rt.tool_args_strict.is_enabled() { "on" } else { "off" }
+                            }),
+                            );
+                            self.emit_event(
+                                &run_id,
+                                step as u32,
+                                EventKind::ToolExecTarget,
+                                serde_json::json!({
+                                    "tool_call_id": tc.id,
+                                    "name": tc.name,
+                                    "exec_target": if tc.name.starts_with("mcp.") { "host" } else {
+                                        match self.tool_rt.exec_target_kind {
+                                            crate::target::ExecTargetKind::Host => "host",
+                                            crate::target::ExecTargetKind::Docker => "docker",
+                                        }
+                                    }
                                 }),
                             );
                             self.emit_event(
@@ -1101,7 +1172,11 @@ impl<P: ModelProvider> Agent<P> {
                                 EventKind::ToolExecStart,
                                 serde_json::json!({"tool_call_id": tc.id, "name": tc.name, "side_effects": tool_side_effects(&tc.name)}),
                             );
-                            let tool_msg = make_invalid_args_tool_message(tc, err);
+                            let tool_msg = make_invalid_args_tool_message(
+                                tc,
+                                err,
+                                self.tool_rt.exec_target_kind,
+                            );
                             let content = tool_msg.content.clone().unwrap_or_default();
                             self.gate.record(GateEvent {
                                 run_id: run_id.clone(),
@@ -1118,6 +1193,11 @@ impl<P: ModelProvider> Agent<P> {
                                 approval_key: None,
                                 approval_mode: approval_mode_meta.clone(),
                                 auto_approve_scope: auto_scope_meta.clone(),
+                                approval_key_version: approval_key_version_meta.clone(),
+                                tool_schema_hash_hex: tool_schema_hash_hex.clone(),
+                                hooks_config_hash_hex: hooks_config_hash_hex.clone(),
+                                planner_hash_hex: planner_hash_hex.clone(),
+                                exec_target: decision_exec_target.clone(),
                                 result_ok: false,
                                 result_content: content.clone(),
                                 result_input_digest: None,
@@ -1159,6 +1239,11 @@ impl<P: ModelProvider> Agent<P> {
                                 "approval_id": approval_id.clone(),
                                 "approval_key": approval_key.clone(),
                                 "source": source.clone(),
+                                "approval_key_version": approval_key_version_meta.clone(),
+                                "tool_schema_hash_hex": tool_schema_hash_hex.clone(),
+                                "hooks_config_hash_hex": hooks_config_hash_hex.clone(),
+                                "planner_hash_hex": planner_hash_hex.clone(),
+                                "exec_target": decision_exec_target.clone(),
                                 "side_effects": tool_side_effects(&tc.name),
                                 "tool_args_strict": if self.tool_rt.tool_args_strict.is_enabled() { "on" } else { "off" }
                             }),
@@ -1176,6 +1261,11 @@ impl<P: ModelProvider> Agent<P> {
                             approval_key,
                             approval_mode: approval_mode_meta.clone(),
                             auto_approve_scope: auto_scope_meta.clone(),
+                            approval_key_version: approval_key_version_meta.clone(),
+                            tool_schema_hash_hex,
+                            hooks_config_hash_hex,
+                            planner_hash_hex,
+                            exec_target: decision_exec_target,
                             result_ok: false,
                             result_content: reason.clone(),
                             result_input_digest: None,
@@ -1287,7 +1377,11 @@ fn infer_truncated_flag(content: &str) -> bool {
     }
 }
 
-fn make_invalid_args_tool_message(tc: &ToolCall, err: &str) -> Message {
+fn make_invalid_args_tool_message(
+    tc: &ToolCall,
+    err: &str,
+    exec_target_kind: crate::target::ExecTargetKind,
+) -> Message {
     let source = if tc.name.starts_with("mcp.") {
         "mcp"
     } else {
@@ -1306,6 +1400,15 @@ fn make_invalid_args_tool_message(tc: &ToolCall, err: &str) -> Message {
             stderr_truncated: None,
             stdout_truncated: None,
             source: source.to_string(),
+            execution_target: if source == "mcp" {
+                "host".to_string()
+            } else {
+                match exec_target_kind {
+                    crate::target::ExecTargetKind::Host => "host".to_string(),
+                    crate::target::ExecTargetKind::Docker => "docker".to_string(),
+                }
+            },
+            docker: None,
         },
     ))
 }
@@ -1348,6 +1451,7 @@ mod tests {
     use crate::hooks::config::HooksMode;
     use crate::hooks::runner::{HookManager, HookRuntimeConfig};
     use crate::providers::{ModelProvider, StreamDelta};
+    use crate::target::{ExecTargetKind, HostTarget};
     use crate::tools::{ToolArgsStrict, ToolRuntime};
     use crate::types::{GenerateRequest, GenerateResponse, Message, Role};
 
@@ -1411,6 +1515,8 @@ mod tests {
                 max_read_bytes: 200_000,
                 unsafe_bypass_allow_flags: false,
                 tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
             },
             gate: Box::new(NoGate::new()),
             gate_ctx: GateContext {
@@ -1427,6 +1533,11 @@ mod tests {
                 max_read_bytes: 200_000,
                 provider: ProviderKind::Ollama,
                 model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: None,
             },
             mcp_registry: None,
             stream: false,
@@ -1476,6 +1587,8 @@ mod tests {
                 max_read_bytes: 200_000,
                 unsafe_bypass_allow_flags: false,
                 tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
             },
             gate: Box::new(NoGate::new()),
             gate_ctx: GateContext {
@@ -1492,6 +1605,11 @@ mod tests {
                 max_read_bytes: 200_000,
                 provider: ProviderKind::Ollama,
                 model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: None,
             },
             mcp_registry: None,
             stream: false,
@@ -1542,5 +1660,145 @@ mod tests {
         assert!(!super::tool_result_has_error(
             &json!({"ok":true}).to_string()
         ));
+    }
+
+    struct EventCaptureSink {
+        events: Arc<Mutex<Vec<crate::events::Event>>>,
+    }
+
+    impl crate::events::EventSink for EventCaptureSink {
+        fn emit(&mut self, event: crate::events::Event) -> anyhow::Result<()> {
+            self.events.lock().expect("lock").push(event);
+            Ok(())
+        }
+    }
+
+    struct ToolCallProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolCallProvider {
+        async fn generate(&self, _req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(GenerateResponse {
+                    assistant: Message {
+                        role: Role::Assistant,
+                        content: Some(String::new()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    },
+                    tool_calls: vec![crate::types::ToolCall {
+                        id: "tc1".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({"path":"a.txt"}),
+                    }],
+                    usage: None,
+                })
+            } else {
+                Ok(GenerateResponse {
+                    assistant: Message {
+                        role: Role::Assistant,
+                        content: Some("done".to_string()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    },
+                    tool_calls: Vec::new(),
+                    usage: None,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn emits_tool_exec_target_before_exec_start() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        tokio::fs::write(tmp.path().join("a.txt"), "x")
+            .await
+            .expect("write");
+        let events = Arc::new(Mutex::new(Vec::<crate::events::Event>::new()));
+        let provider = ToolCallProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut agent = Agent {
+            provider,
+            model: "m".to_string(),
+            tools: vec![crate::types::ToolDef {
+                name: "read_file".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+                side_effects: crate::types::SideEffects::FilesystemRead,
+            }],
+            max_steps: 3,
+            tool_rt: ToolRuntime {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: None,
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: Some(Box::new(EventCaptureSink {
+                events: events.clone(),
+            })),
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+        };
+        let out = agent.run("hi", vec![], Vec::new()).await;
+        assert_eq!(out.final_output, "done");
+        let evs = events.lock().expect("lock");
+        let target_idx = evs
+            .iter()
+            .position(|e| matches!(e.kind, crate::events::EventKind::ToolExecTarget))
+            .expect("target event");
+        let start_idx = evs
+            .iter()
+            .position(|e| matches!(e.kind, crate::events::EventKind::ToolExecStart))
+            .expect("start event");
+        assert!(target_idx < start_idx);
     }
 }

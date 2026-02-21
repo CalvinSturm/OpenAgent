@@ -45,6 +45,16 @@ pub struct ApprovalRequest {
     pub max_uses: Option<u32>,
     #[serde(default)]
     pub uses: Option<u32>,
+    #[serde(default)]
+    pub approval_key_version: Option<String>,
+    #[serde(default)]
+    pub tool_schema_hash_hex: Option<String>,
+    #[serde(default)]
+    pub hooks_config_hash_hex: Option<String>,
+    #[serde(default)]
+    pub exec_target: Option<String>,
+    #[serde(default)]
+    pub planner_hash_hex: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +68,15 @@ pub enum StoredStatus {
 #[derive(Debug, Clone)]
 pub struct ApprovalsStore {
     path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalProvenance {
+    pub approval_key_version: String,
+    pub tool_schema_hash_hex: Option<String>,
+    pub hooks_config_hash_hex: Option<String>,
+    pub exec_target: Option<String>,
+    pub planner_hash_hex: Option<String>,
 }
 
 impl ApprovalsStore {
@@ -123,11 +142,15 @@ impl ApprovalsStore {
     pub fn find_matching_decision(
         &self,
         approval_key: &str,
+        approval_key_version: &str,
     ) -> anyhow::Result<Option<ApprovalDecisionMatch>> {
         let data = self.load_data()?;
         let mut found_denied = None;
         for (id, req) in data.requests {
             if req.approval_key.as_deref() != Some(approval_key) {
+                continue;
+            }
+            if !key_version_matches(req.approval_key_version.as_deref(), approval_key_version) {
                 continue;
             }
             match req.status {
@@ -154,12 +177,16 @@ impl ApprovalsStore {
     pub fn consume_matching_approved(
         &self,
         approval_key: &str,
+        approval_key_version: &str,
     ) -> anyhow::Result<Option<ApprovedUsage>> {
         let mut data = self.load_data()?;
         let now = OffsetDateTime::now_utc();
         let mut selected_id: Option<String> = None;
         for (id, req) in &data.requests {
             if req.approval_key.as_deref() != Some(approval_key) {
+                continue;
+            }
+            if !key_version_matches(req.approval_key_version.as_deref(), approval_key_version) {
                 continue;
             }
             if req.status != StoredStatus::Approved {
@@ -192,9 +219,17 @@ impl ApprovalsStore {
         tool: &str,
         arguments: &Value,
         approval_key: Option<String>,
+        provenance: Option<ApprovalProvenance>,
     ) -> anyhow::Result<String> {
         let mut data = self.load_data()?;
         let id = Uuid::new_v4().to_string();
+        let prov = provenance.unwrap_or(ApprovalProvenance {
+            approval_key_version: "v1".to_string(),
+            tool_schema_hash_hex: None,
+            hooks_config_hash_hex: None,
+            exec_target: None,
+            planner_hash_hex: None,
+        });
         data.requests.insert(
             id.clone(),
             ApprovalRequest {
@@ -206,6 +241,11 @@ impl ApprovalsStore {
                 expires_at: None,
                 max_uses: None,
                 uses: Some(0),
+                approval_key_version: Some(prov.approval_key_version),
+                tool_schema_hash_hex: prov.tool_schema_hash_hex,
+                hooks_config_hash_hex: prov.hooks_config_hash_hex,
+                exec_target: prov.exec_target,
+                planner_hash_hex: prov.planner_hash_hex,
             },
         );
         self.save_data(&data)?;
@@ -217,12 +257,20 @@ impl ApprovalsStore {
         tool: &str,
         arguments: &Value,
         approval_key: &str,
+        provenance: Option<ApprovalProvenance>,
     ) -> anyhow::Result<String> {
         let mut data = self.load_data()?;
+        let target_version = provenance
+            .as_ref()
+            .map(|p| p.approval_key_version.as_str())
+            .unwrap_or("v1");
         let existing_id = data
             .requests
             .iter()
-            .find(|(_, req)| req.approval_key.as_deref() == Some(approval_key))
+            .find(|(_, req)| {
+                req.approval_key.as_deref() == Some(approval_key)
+                    && key_version_matches(req.approval_key_version.as_deref(), target_version)
+            })
             .map(|(id, _)| id.clone());
         if let Some(id) = existing_id {
             if let Some(req) = data.requests.get_mut(&id) {
@@ -235,6 +283,13 @@ impl ApprovalsStore {
             return Ok(id);
         }
 
+        let prov = provenance.unwrap_or(ApprovalProvenance {
+            approval_key_version: "v1".to_string(),
+            tool_schema_hash_hex: None,
+            hooks_config_hash_hex: None,
+            exec_target: None,
+            planner_hash_hex: None,
+        });
         let id = Uuid::new_v4().to_string();
         data.requests.insert(
             id.clone(),
@@ -247,6 +302,11 @@ impl ApprovalsStore {
                 expires_at: None,
                 max_uses: None,
                 uses: Some(0),
+                approval_key_version: Some(prov.approval_key_version),
+                tool_schema_hash_hex: prov.tool_schema_hash_hex,
+                hooks_config_hash_hex: prov.hooks_config_hash_hex,
+                exec_target: prov.exec_target,
+                planner_hash_hex: prov.planner_hash_hex,
             },
         );
         self.save_data(&data)?;
@@ -333,12 +393,20 @@ fn empty_data() -> ApprovalsData {
     }
 }
 
+fn key_version_matches(entry: Option<&str>, target: &str) -> bool {
+    match target {
+        "v1" => matches!(entry, None | Some("v1")),
+        "v2" => matches!(entry, Some("v2")),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{canonical_json, ApprovalStatus, ApprovalsStore, StoredStatus};
+    use super::{canonical_json, ApprovalProvenance, ApprovalStatus, ApprovalsStore, StoredStatus};
 
     #[test]
     fn canonical_json_sorts_object_keys() {
@@ -359,11 +427,12 @@ mod tests {
                 "shell",
                 &json!({"cmd":"echo","args":["hi"]}),
                 Some("k".to_string()),
+                None,
             )
             .expect("create pending");
 
         let before = store
-            .find_matching_decision("k")
+            .find_matching_decision("k", "v1")
             .expect("find matching")
             .expect("must exist");
         assert_eq!(before.id, id);
@@ -386,16 +455,51 @@ mod tests {
         let path = dir.path().join("approvals.json");
         let store = ApprovalsStore::new(path);
         let id = store
-            .create_pending("shell", &json!({"cmd":"echo"}), Some("key1".to_string()))
+            .create_pending(
+                "shell",
+                &json!({"cmd":"echo"}),
+                Some("key1".to_string()),
+                None,
+            )
             .expect("create pending");
         store.approve(&id, None, Some(1)).expect("approve");
         let first = store
-            .consume_matching_approved("key1")
+            .consume_matching_approved("key1", "v1")
             .expect("consume first");
         assert!(first.is_some());
         let second = store
-            .consume_matching_approved("key1")
+            .consume_matching_approved("key1", "v1")
             .expect("consume second");
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn version_matching_isolated_between_v1_v2() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("approvals.json");
+        let store = ApprovalsStore::new(path);
+        let id_v2 = store
+            .create_pending(
+                "shell",
+                &json!({"cmd":"echo"}),
+                Some("k2".to_string()),
+                Some(ApprovalProvenance {
+                    approval_key_version: "v2".to_string(),
+                    tool_schema_hash_hex: None,
+                    hooks_config_hash_hex: None,
+                    exec_target: Some("host".to_string()),
+                    planner_hash_hex: None,
+                }),
+            )
+            .expect("create");
+        store.approve(&id_v2, None, None).expect("approve");
+        assert!(store
+            .consume_matching_approved("k2", "v1")
+            .expect("consume v1")
+            .is_none());
+        assert!(store
+            .consume_matching_approved("k2", "v2")
+            .expect("consume v2")
+            .is_some());
     }
 }

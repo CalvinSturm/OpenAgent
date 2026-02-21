@@ -29,6 +29,11 @@ pub struct AuditEvent {
     pub approval_key: Option<String>,
     pub approval_mode: Option<String>,
     pub auto_approve_scope: Option<String>,
+    pub approval_key_version: Option<String>,
+    pub tool_schema_hash_hex: Option<String>,
+    pub hooks_config_hash_hex: Option<String>,
+    pub planner_hash_hex: Option<String>,
+    pub exec_target: Option<String>,
     pub result: AuditResult,
 }
 

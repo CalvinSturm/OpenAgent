@@ -9,6 +9,8 @@ mod planner;
 mod providers;
 mod session;
 mod store;
+mod target;
+mod taskgraph;
 mod tools;
 mod trust;
 mod tui;
@@ -23,7 +25,7 @@ use crate::mcp::registry::{
 };
 use agent::{Agent, AgentExitReason, PolicyLoadedInfo};
 use anyhow::{anyhow, Context};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
 use eval::baseline::{
     baseline_path, compare_results, create_baseline_from_results, delete_baseline, list_baselines,
@@ -36,8 +38,8 @@ use eval::runner::{run_eval, EvalConfig};
 use eval::tasks::EvalPack;
 use events::{Event, EventKind, EventSink, JsonlFileSink, MultiSink, StdoutSink};
 use gate::{
-    compute_policy_hash_hex, ApprovalMode, AutoApproveScope, GateContext, NoGate, ProviderKind,
-    ToolGate, TrustGate, TrustMode,
+    compute_policy_hash_hex, ApprovalKeyVersion, ApprovalMode, AutoApproveScope, GateContext,
+    NoGate, ProviderKind, ToolGate, TrustGate, TrustMode,
 };
 use hooks::config::HooksMode;
 use hooks::protocol::{PreModelCompactionPayload, PreModelPayload, ToolResultPayload};
@@ -54,6 +56,8 @@ use store::{
     config_hash_hex, extract_session_messages, provider_to_string, resolve_state_paths,
     stable_path_string, ConfigFingerprintV1, PlannerRunRecord, RunCliConfig, WorkerRunRecord,
 };
+use target::{DockerTarget, ExecTarget, ExecTargetKind, HostTarget};
+use taskgraph::{PropagateSummaries, TaskDefaults, TaskFile, TaskNodeSettings};
 use tokio::sync::watch;
 use tools::{builtin_tools_enabled, ToolArgsStrict, ToolRuntime};
 use trust::approvals::ApprovalsStore;
@@ -74,6 +78,48 @@ enum Commands {
     Session(SessionArgs),
     Eval(Box<EvalCmd>),
     Tui(TuiArgs),
+    Tasks(TasksArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum TasksSubcommand {
+    Run(TasksRunArgs),
+    Status(TasksStatusArgs),
+    Reset(TasksResetArgs),
+}
+
+#[derive(Debug, Parser)]
+struct TasksArgs {
+    #[command(subcommand)]
+    command: TasksSubcommand,
+}
+
+#[derive(Debug, Clone, Parser)]
+struct TasksRunArgs {
+    #[arg(long)]
+    taskfile: PathBuf,
+    #[arg(long, default_value_t = false)]
+    resume: bool,
+    #[arg(long)]
+    checkpoint: Option<PathBuf>,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    fail_fast: bool,
+    #[arg(long, default_value_t = 0)]
+    max_nodes: u32,
+    #[arg(long, value_enum, default_value_t = PropagateSummaries::On)]
+    propagate_summaries: PropagateSummaries,
+}
+
+#[derive(Debug, Clone, Parser)]
+struct TasksStatusArgs {
+    #[arg(long)]
+    checkpoint: PathBuf,
+}
+
+#[derive(Debug, Clone, Parser)]
+struct TasksResetArgs {
+    #[arg(long)]
+    checkpoint: PathBuf,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -249,6 +295,14 @@ enum PolicySubcommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Test {
+        #[arg(long)]
+        cases: PathBuf,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long)]
+        policy: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -324,6 +378,8 @@ struct EvalArgs {
     approval_mode: ApprovalMode,
     #[arg(long, value_enum, default_value_t = AutoApproveScope::Run)]
     auto_approve_scope: AutoApproveScope,
+    #[arg(long, value_enum, default_value_t = ApprovalKeyVersion::V1)]
+    approval_key: ApprovalKeyVersion,
     #[arg(
         long,
         default_value_t = false,
@@ -443,7 +499,7 @@ struct Cli {
     run: RunArgs,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 struct RunArgs {
     #[arg(long, value_enum)]
     provider: Option<ProviderKind>,
@@ -471,6 +527,16 @@ struct RunArgs {
     allow_write: bool,
     #[arg(long, default_value_t = false)]
     enable_write_tools: bool,
+    #[arg(long, value_enum, default_value_t = ExecTargetKind::Host)]
+    exec_target: ExecTargetKind,
+    #[arg(long, default_value = "ubuntu:24.04")]
+    docker_image: String,
+    #[arg(long, default_value = "/work")]
+    docker_workdir: String,
+    #[arg(long, value_enum, default_value_t = DockerNetwork::None)]
+    docker_network: DockerNetwork,
+    #[arg(long)]
+    docker_user: Option<String>,
     #[arg(long, default_value_t = 200_000)]
     max_tool_output_bytes: usize,
     #[arg(long, default_value_t = 200_000)]
@@ -481,6 +547,8 @@ struct RunArgs {
     approval_mode: ApprovalMode,
     #[arg(long, value_enum, default_value_t = AutoApproveScope::Run)]
     auto_approve_scope: AutoApproveScope,
+    #[arg(long, value_enum, default_value_t = ApprovalKeyVersion::V1)]
+    approval_key: ApprovalKeyVersion,
     #[arg(long = "unsafe", default_value_t = false)]
     unsafe_mode: bool,
     #[arg(long, default_value_t = false)]
@@ -561,6 +629,12 @@ struct RunArgs {
     planner_strict: bool,
     #[arg(long, default_value_t = false)]
     no_planner_strict: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DockerNetwork {
+    None,
+    Bridge,
 }
 
 #[derive(Debug, Parser)]
@@ -673,6 +747,34 @@ async fn main() -> anyhow::Result<()> {
             PolicySubcommand::PrintEffective { policy, json } => {
                 let policy_path = policy.clone().unwrap_or_else(|| paths.policy_path.clone());
                 println!("{}", policy_effective_output(&policy_path, *json)?);
+                return Ok(());
+            }
+            PolicySubcommand::Test {
+                cases,
+                json,
+                policy,
+            } => {
+                let policy_path = policy.clone().unwrap_or_else(|| paths.policy_path.clone());
+                let report = trust::policy_test::run_policy_tests(&policy_path, cases)?;
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    for case in &report.cases {
+                        println!(
+                            "{}\t{}\texpected={}\tgot={}\treason={}\tsource={}",
+                            if case.pass { "PASS" } else { "FAIL" },
+                            case.name,
+                            case.expected,
+                            case.got,
+                            case.reason.as_deref().unwrap_or("-"),
+                            case.source.as_deref().unwrap_or("-")
+                        );
+                    }
+                    println!("summary: passed={} failed={}", report.passed, report.failed);
+                }
+                if report.failed > 0 {
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
         },
@@ -865,6 +967,7 @@ async fn main() -> anyhow::Result<()> {
                 trust: args.trust,
                 approval_mode: args.approval_mode,
                 auto_approve_scope: args.auto_approve_scope,
+                approval_key: args.approval_key,
                 enable_write_tools,
                 allow_write: args.allow_write,
                 allow_shell: args.allow_shell,
@@ -1011,6 +1114,33 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
         },
+        Some(Commands::Tasks(args)) => {
+            match &args.command {
+                TasksSubcommand::Status(s) => {
+                    let raw = std::fs::read_to_string(&s.checkpoint).with_context(|| {
+                        format!("failed reading checkpoint {}", s.checkpoint.display())
+                    })?;
+                    let cp: taskgraph::TasksCheckpoint =
+                        serde_json::from_str(&raw).context("failed parsing checkpoint JSON")?;
+                    println!("{}", serde_json::to_string_pretty(&cp)?);
+                }
+                TasksSubcommand::Reset(s) => {
+                    if s.checkpoint.exists() {
+                        std::fs::remove_file(&s.checkpoint).with_context(|| {
+                            format!("failed deleting checkpoint {}", s.checkpoint.display())
+                        })?;
+                    }
+                    println!("checkpoint reset: {}", s.checkpoint.display());
+                }
+                TasksSubcommand::Run(s) => {
+                    let exit = run_tasks_graph(s, &cli.run, &paths).await?;
+                    if exit != 0 {
+                        std::process::exit(exit);
+                    }
+                }
+            }
+            return Ok(());
+        }
         None => {}
     }
 
@@ -1041,7 +1171,7 @@ async fn main() -> anyhow::Result<()> {
                 cli.run.api_key.clone(),
                 http_config_from_run_args(&cli.run),
             )?;
-            run_agent(
+            let res = run_agent(
                 provider,
                 provider_kind,
                 &base_url,
@@ -1051,11 +1181,25 @@ async fn main() -> anyhow::Result<()> {
                 &paths,
             )
             .await?;
+            if matches!(res.outcome.exit_reason, AgentExitReason::ProviderError) {
+                let err = res
+                    .outcome
+                    .error
+                    .unwrap_or_else(|| "provider error".to_string());
+                return Err(anyhow!(
+                    "{}\nHint: run `openagent doctor --provider {} --base-url {}`\nDefault base URL for {} is {}",
+                    err,
+                    provider_cli_name(provider_kind),
+                    base_url,
+                    provider_cli_name(provider_kind),
+                    default_base_url(provider_kind)
+                ));
+            }
         }
         ProviderKind::Ollama => {
             let provider =
                 OllamaProvider::new(base_url.clone(), http_config_from_run_args(&cli.run))?;
-            run_agent(
+            let res = run_agent(
                 provider,
                 provider_kind,
                 &base_url,
@@ -1065,6 +1209,20 @@ async fn main() -> anyhow::Result<()> {
                 &paths,
             )
             .await?;
+            if matches!(res.outcome.exit_reason, AgentExitReason::ProviderError) {
+                let err = res
+                    .outcome
+                    .error
+                    .unwrap_or_else(|| "provider error".to_string());
+                return Err(anyhow!(
+                    "{}\nHint: run `openagent doctor --provider {} --base-url {}`\nDefault base URL for {} is {}",
+                    err,
+                    provider_cli_name(provider_kind),
+                    base_url,
+                    provider_cli_name(provider_kind),
+                    default_base_url(provider_kind)
+                ));
+            }
         }
     }
 
@@ -1090,9 +1248,24 @@ fn handle_approvals_command(
                     Some(max) => format!("{uses}/{max}"),
                     None => "-".to_string(),
                 };
+                let key_version = req
+                    .approval_key_version
+                    .clone()
+                    .unwrap_or_else(|| "v1".to_string());
+                let key_prefix = req
+                    .approval_key
+                    .as_deref()
+                    .map(|k| k.chars().take(8).collect::<String>())
+                    .unwrap_or_else(|| "-".to_string());
                 println!(
-                    "{id}\t{:?}\t{}\t{}\t{}\t{}",
-                    req.status, req.tool, req.created_at, expires_at, uses_info
+                    "{id}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    req.status,
+                    req.tool,
+                    req.created_at,
+                    expires_at,
+                    uses_info,
+                    key_version,
+                    key_prefix
                 );
             }
         }
@@ -1112,9 +1285,29 @@ async fn run_agent<P: ModelProvider>(
     prompt: &str,
     args: &RunArgs,
     paths: &store::StatePaths,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RunExecutionResult> {
     let workdir = std::fs::canonicalize(&args.workdir)
         .with_context(|| format!("failed to resolve workdir: {}", args.workdir.display()))?;
+    let exec_target: std::sync::Arc<dyn ExecTarget> = match args.exec_target {
+        ExecTargetKind::Host => std::sync::Arc::new(HostTarget),
+        ExecTargetKind::Docker => {
+            DockerTarget::validate_available().with_context(|| {
+                "docker execution target requested. Install/start Docker or re-run with --exec-target host"
+            })?;
+            std::sync::Arc::new(DockerTarget::new(
+                args.docker_image.clone(),
+                args.docker_workdir.clone(),
+                match args.docker_network {
+                    DockerNetwork::None => "none",
+                    DockerNetwork::Bridge => "bridge",
+                }
+                .to_string(),
+                args.docker_user.clone(),
+            ))
+        }
+    };
+    let resolved_target_kind = exec_target.kind();
+    let _target_desc = exec_target.describe();
     let mut gate_ctx = GateContext {
         workdir: workdir.clone(),
         allow_shell: args.allow_shell,
@@ -1137,6 +1330,11 @@ async fn run_agent<P: ModelProvider>(
         },
         provider: provider_kind,
         model: default_model.to_string(),
+        exec_target: resolved_target_kind,
+        approval_key_version: args.approval_key,
+        tool_schema_hashes: std::collections::BTreeMap::new(),
+        hooks_config_hash_hex: None,
+        planner_hash_hex: None,
     };
     let gate_build = build_gate(args, paths)?;
     let policy_hash_hex = gate_build.policy_hash_hex.clone();
@@ -1228,6 +1426,11 @@ async fn run_agent<P: ModelProvider>(
         all_tools.extend(mcp_defs);
     }
     let hooks_config_path = resolved_hooks_config_path(args, &paths.state_dir);
+    let tool_schema_hash_hex_map = store::tool_schema_hash_hex_map(&all_tools);
+    gate_ctx.tool_schema_hashes = tool_schema_hash_hex_map.clone();
+    let hooks_config_hash_hex =
+        compute_hooks_config_hash_hex(resolved_settings.hooks_mode, &hooks_config_path);
+    gate_ctx.hooks_config_hash_hex = hooks_config_hash_hex.clone();
     let hook_manager = HookManager::build(HookRuntimeConfig {
         mode: resolved_settings.hooks_mode,
         config_path: hooks_config_path.clone(),
@@ -1377,7 +1580,7 @@ async fn run_agent<P: ModelProvider>(
                     let config_fingerprint =
                         build_config_fingerprint(&cli_config, args, &worker_model, paths);
                     let cfg_hash = config_hash_hex(&config_fingerprint)?;
-                    if let Err(write_err) = store::write_run_record(
+                    let run_artifact_path = match store::write_run_record(
                         paths,
                         cli_config,
                         store::PolicyRecordInfo {
@@ -1392,15 +1595,22 @@ async fn run_agent<P: ModelProvider>(
                         args.mode,
                         planner_record,
                         worker_record,
+                        tool_schema_hash_hex_map.clone(),
+                        hooks_config_hash_hex.clone(),
                     ) {
-                        eprintln!("WARN: failed to write run artifact: {write_err}");
-                    }
+                        Ok(p) => Some(p),
+                        Err(write_err) => {
+                            eprintln!("WARN: failed to write run artifact: {write_err}");
+                            None
+                        }
+                    };
                     if let Some(h) = ui_join {
                         let _ = h.join();
                     }
-                    return Err(anyhow!(outcome
-                        .error
-                        .unwrap_or_else(|| "planner error".to_string())));
+                    return Ok(RunExecutionResult {
+                        outcome,
+                        run_artifact_path,
+                    });
                 }
                 emit_event(
                     &mut event_sink,
@@ -1421,6 +1631,7 @@ async fn run_agent<P: ModelProvider>(
                     tool_name: None,
                     tool_calls: None,
                 });
+                gate_ctx.planner_hash_hex = Some(out.plan_hash_hex.clone());
                 worker_record = Some(WorkerRunRecord {
                     model: worker_model.clone(),
                     injected_planner_hash_hex: Some(out.plan_hash_hex.clone()),
@@ -1510,7 +1721,7 @@ async fn run_agent<P: ModelProvider>(
                 let config_fingerprint =
                     build_config_fingerprint(&cli_config, args, &worker_model, paths);
                 let cfg_hash = config_hash_hex(&config_fingerprint)?;
-                if let Err(write_err) = store::write_run_record(
+                let run_artifact_path = match store::write_run_record(
                     paths,
                     cli_config,
                     store::PolicyRecordInfo {
@@ -1525,15 +1736,22 @@ async fn run_agent<P: ModelProvider>(
                     args.mode,
                     planner_record,
                     worker_record,
+                    tool_schema_hash_hex_map.clone(),
+                    hooks_config_hash_hex.clone(),
                 ) {
-                    eprintln!("WARN: failed to write run artifact: {write_err}");
-                }
+                    Ok(p) => Some(p),
+                    Err(write_err) => {
+                        eprintln!("WARN: failed to write run artifact: {write_err}");
+                        None
+                    }
+                };
                 if let Some(h) = ui_join {
                     let _ = h.join();
                 }
-                return Err(anyhow!(outcome
-                    .error
-                    .unwrap_or_else(|| "planner error".to_string())));
+                return Ok(RunExecutionResult {
+                    outcome,
+                    run_artifact_path,
+                });
             }
         }
     }
@@ -1559,6 +1777,8 @@ async fn run_agent<P: ModelProvider>(
             },
             unsafe_bypass_allow_flags: args.unsafe_bypass_allow_flags,
             tool_args_strict: resolved_settings.tool_args_strict,
+            exec_target_kind: resolved_target_kind,
+            exec_target,
         },
         gate,
         gate_ctx,
@@ -1684,7 +1904,7 @@ async fn run_agent<P: ModelProvider>(
     );
     let config_fingerprint = build_config_fingerprint(&cli_config, args, &worker_model, paths);
     let config_hash_hex = config_hash_hex(&config_fingerprint)?;
-    if let Err(e) = store::write_run_record(
+    let run_artifact_path = match store::write_run_record(
         paths,
         cli_config,
         store::PolicyRecordInfo {
@@ -1699,9 +1919,15 @@ async fn run_agent<P: ModelProvider>(
         args.mode,
         planner_record,
         worker_record,
+        tool_schema_hash_hex_map,
+        hooks_config_hash_hex,
     ) {
-        eprintln!("WARN: failed to write run artifact: {e}");
-    }
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("WARN: failed to write run artifact: {e}");
+            None
+        }
+    };
 
     if args.tui {
         if !outcome.final_output.is_empty() {
@@ -1711,21 +1937,425 @@ async fn run_agent<P: ModelProvider>(
         println!("{}", outcome.final_output);
     }
 
-    if matches!(outcome.exit_reason, AgentExitReason::ProviderError) {
-        let err = outcome
-            .error
-            .unwrap_or_else(|| "provider error".to_string());
+    Ok(RunExecutionResult {
+        outcome,
+        run_artifact_path,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct RunExecutionResult {
+    outcome: agent::AgentOutcome,
+    run_artifact_path: Option<PathBuf>,
+}
+
+async fn run_tasks_graph(
+    args: &TasksRunArgs,
+    base_run: &RunArgs,
+    paths: &store::StatePaths,
+) -> anyhow::Result<i32> {
+    let (taskfile, taskfile_hash_hex, _raw_bytes) = taskgraph::load_taskfile(&args.taskfile)?;
+    let order = taskgraph::topo_order(&taskfile)?;
+    let checkpoint_path = args
+        .checkpoint
+        .clone()
+        .unwrap_or_else(|| taskgraph::checkpoint_default_path(&paths.state_dir));
+    let mut checkpoint =
+        taskgraph::load_or_init_checkpoint(&checkpoint_path, &taskfile, &taskfile_hash_hex)?;
+    taskgraph::ensure_resume_allowed(&checkpoint, args.resume)?;
+    taskgraph::write_checkpoint(&checkpoint_path, &checkpoint)?;
+
+    let graph_run_id = uuid::Uuid::new_v4().to_string();
+    let graph_started = trust::now_rfc3339();
+    let mut sink = build_event_sink(false, base_run.events.as_deref(), false, None)?;
+    emit_event(
+        &mut sink,
+        &graph_run_id,
+        0,
+        EventKind::TaskgraphStart,
+        serde_json::json!({
+            "graph_run_id": graph_run_id,
+            "taskfile_hash_hex": taskfile_hash_hex,
+            "nodes": order.len()
+        }),
+    );
+
+    let mut status = "ok".to_string();
+    let mut node_records: std::collections::BTreeMap<String, taskgraph::TaskGraphNodeRecord> =
+        std::collections::BTreeMap::new();
+    let mut summaries: Vec<String> = Vec::new();
+    let mut executed = 0u32;
+    for (idx, node_id) in order.iter().enumerate() {
+        if args.max_nodes > 0 && executed >= args.max_nodes {
+            break;
+        }
+        let cp_node = checkpoint
+            .nodes
+            .get(node_id)
+            .ok_or_else(|| anyhow!("checkpoint missing node {node_id}"))?
+            .clone();
+        if args.resume && cp_node.status == "done" {
+            emit_event(
+                &mut sink,
+                &graph_run_id,
+                idx as u32,
+                EventKind::TaskgraphNodeEnd,
+                serde_json::json!({
+                    "node_id": node_id,
+                    "status":"skipped",
+                    "run_id": cp_node.run_id.unwrap_or_default(),
+                    "exit_reason":"already_done"
+                }),
+            );
+            continue;
+        }
+
+        emit_event(
+            &mut sink,
+            &graph_run_id,
+            idx as u32,
+            EventKind::TaskgraphNodeStart,
+            serde_json::json!({
+                "node_id": node_id,
+                "index": idx + 1,
+                "total": order.len()
+            }),
+        );
+        let node = taskgraph::node_by_id(&taskfile, node_id)?;
+        let mut node_args = base_run.clone();
+        apply_task_defaults(&mut node_args, &taskfile.defaults)?;
+        apply_node_overrides(&mut node_args, &node.settings)?;
+        node_args.tui = false;
+        node_args.stream = node_args.stream && !base_run.tui;
+        let node_workdir = resolve_node_workdir(&taskfile, node_id, &node_args.workdir)?;
+        node_args.workdir = node_workdir;
+        node_args.prompt = Some(
+            if args.propagate_summaries.enabled() && !summaries.is_empty() {
+                format!(
+                    "NODE SUMMARIES (v1)\n{}\n\nTASK:\n{}",
+                    summaries.join("\n"),
+                    node.prompt
+                )
+            } else {
+                node.prompt.clone()
+            },
+        );
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        if let Some(n) = checkpoint.nodes.get_mut(node_id) {
+            n.status = "running".to_string();
+            n.run_id = Some(run_id.clone());
+            n.started_at = Some(trust::now_rfc3339());
+            n.finished_at = None;
+            n.exit_reason = None;
+            n.error_short = None;
+        }
+        checkpoint.updated_at = trust::now_rfc3339();
+        taskgraph::write_checkpoint(&checkpoint_path, &checkpoint)?;
+
+        let provider_kind = node_args
+            .provider
+            .ok_or_else(|| anyhow!("provider must be set in task defaults or node settings"))?;
+        let model = node_args
+            .model
+            .clone()
+            .ok_or_else(|| anyhow!("model must be set in task defaults or node settings"))?;
+        let base_url = node_args
+            .base_url
+            .clone()
+            .unwrap_or_else(|| default_base_url(provider_kind).to_string());
+        let prompt = node_args
+            .prompt
+            .clone()
+            .ok_or_else(|| anyhow!("node prompt missing"))?;
+
+        let result = match provider_kind {
+            ProviderKind::Lmstudio | ProviderKind::Llamacpp => {
+                let provider = OpenAiCompatProvider::new(
+                    base_url.clone(),
+                    node_args.api_key.clone(),
+                    http_config_from_run_args(&node_args),
+                )?;
+                run_agent(
+                    provider,
+                    provider_kind,
+                    &base_url,
+                    &model,
+                    &prompt,
+                    &node_args,
+                    paths,
+                )
+                .await?
+            }
+            ProviderKind::Ollama => {
+                let provider =
+                    OllamaProvider::new(base_url.clone(), http_config_from_run_args(&node_args))?;
+                run_agent(
+                    provider,
+                    provider_kind,
+                    &base_url,
+                    &model,
+                    &prompt,
+                    &node_args,
+                    paths,
+                )
+                .await?
+            }
+        };
+        executed = executed.saturating_add(1);
+        let exit_reason = result.outcome.exit_reason.as_str().to_string();
+        let node_status = if matches!(result.outcome.exit_reason, AgentExitReason::Ok) {
+            "done".to_string()
+        } else {
+            "failed".to_string()
+        };
+        if matches!(result.outcome.exit_reason, AgentExitReason::Cancelled) {
+            status = "cancelled".to_string();
+        }
+        if let Some(n) = checkpoint.nodes.get_mut(node_id) {
+            n.status = node_status.clone();
+            n.run_id = Some(result.outcome.run_id.clone());
+            n.finished_at = Some(trust::now_rfc3339());
+            n.exit_reason = Some(exit_reason.clone());
+            n.artifact_path = result
+                .run_artifact_path
+                .as_ref()
+                .map(|p| stable_path_string(p));
+            n.error_short = result.outcome.error.as_deref().map(short_error);
+        }
+        checkpoint.updated_at = trust::now_rfc3339();
+        taskgraph::write_checkpoint(&checkpoint_path, &checkpoint)?;
+        node_records.insert(
+            node_id.clone(),
+            taskgraph::TaskGraphNodeRecord {
+                run_id: result.outcome.run_id.clone(),
+                status: node_status.clone(),
+                artifact_path: result
+                    .run_artifact_path
+                    .as_ref()
+                    .map(|p| stable_path_string(p))
+                    .unwrap_or_default(),
+            },
+        );
+
+        emit_event(
+            &mut sink,
+            &graph_run_id,
+            idx as u32,
+            EventKind::TaskgraphNodeEnd,
+            serde_json::json!({
+                "node_id": node_id,
+                "status": node_status,
+                "run_id": result.outcome.run_id,
+                "exit_reason": exit_reason
+            }),
+        );
+
+        if args.propagate_summaries.enabled() {
+            summaries.push(node_summary_line(
+                node_id,
+                result.outcome.exit_reason.as_str(),
+                &result.outcome.final_output,
+            ));
+        }
+        if args.fail_fast && !matches!(result.outcome.exit_reason, AgentExitReason::Ok) {
+            if status != "cancelled" {
+                status = "failed".to_string();
+            }
+            break;
+        }
+    }
+    if status == "ok" {
+        let any_failed = checkpoint.nodes.values().any(|n| n.status == "failed");
+        if any_failed {
+            status = "failed".to_string();
+        }
+    }
+    emit_event(
+        &mut sink,
+        &graph_run_id,
+        order.len() as u32,
+        EventKind::TaskgraphEnd,
+        serde_json::json!({"status": status}),
+    );
+    let graph = taskgraph::TaskGraphRunArtifact {
+        schema_version: "openagent.taskgraph_run.v1".to_string(),
+        graph_run_id: graph_run_id.clone(),
+        taskfile_path: stable_path_string(&args.taskfile),
+        taskfile_hash_hex: taskfile_hash_hex.clone(),
+        started_at: graph_started,
+        finished_at: trust::now_rfc3339(),
+        status: status.clone(),
+        node_order: order.clone(),
+        nodes: node_records,
+        config: serde_json::json!({
+            "defaults": taskfile.defaults,
+            "workdir": taskfile.workdir
+        }),
+        propagate_summaries: args.propagate_summaries.enabled(),
+    };
+    let graph_path = taskgraph::write_graph_run_artifact(&paths.state_dir, &graph)?;
+    println!("task graph artifact: {}", graph_path.display());
+    Ok(if status == "ok" { 0 } else { 1 })
+}
+
+fn short_error(s: &str) -> String {
+    s.chars().take(200).collect()
+}
+
+fn node_summary_line(node_id: &str, exit_reason: &str, final_output: &str) -> String {
+    let digest = store::sha256_hex(final_output.as_bytes());
+    let head = final_output
+        .chars()
+        .take(200)
+        .collect::<String>()
+        .replace('\n', " ");
+    format!(
+        "- [{}] exit_reason={} output_sha256={} head={}",
+        node_id, exit_reason, digest, head
+    )
+}
+
+fn resolve_node_workdir(
+    taskfile: &TaskFile,
+    node_id: &str,
+    run_workdir: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let base = if std::path::Path::new(&taskfile.workdir.path).is_absolute() {
+        PathBuf::from(&taskfile.workdir.path)
+    } else {
+        run_workdir.join(&taskfile.workdir.path)
+    };
+    let mode = taskfile.workdir.mode.to_lowercase();
+    if mode == "shared" {
+        std::fs::create_dir_all(&base)?;
+        return Ok(base);
+    }
+    if mode != "per_node" {
         return Err(anyhow!(
-            "{}\nHint: run `openagent doctor --provider {} --base-url {}`\nDefault base URL for {} is {}",
-            err,
-            provider_cli_name(provider_kind),
-            base_url,
-            provider_cli_name(provider_kind),
-            default_base_url(provider_kind)
+            "unsupported taskfile workdir.mode: {}",
+            taskfile.workdir.mode
         ));
     }
+    let template = if taskfile.workdir.per_node_dirname.is_empty() {
+        "{id}"
+    } else {
+        taskfile.workdir.per_node_dirname.as_str()
+    };
+    let dirname = template.replace("{id}", node_id);
+    let path = base.join(dirname);
+    std::fs::create_dir_all(&path)?;
+    Ok(path)
+}
 
+fn apply_task_defaults(args: &mut RunArgs, d: &TaskDefaults) -> anyhow::Result<()> {
+    apply_task_settings(args, d, None)
+}
+
+fn apply_node_overrides(args: &mut RunArgs, s: &TaskNodeSettings) -> anyhow::Result<()> {
+    apply_task_settings(
+        args,
+        &TaskDefaults {
+            mode: s.mode.clone(),
+            provider: s.provider.clone(),
+            base_url: s.base_url.clone(),
+            model: s.model.clone(),
+            planner_model: s.planner_model.clone(),
+            worker_model: s.worker_model.clone(),
+            trust: s.trust.clone(),
+            approval_mode: s.approval_mode.clone(),
+            auto_approve_scope: s.auto_approve_scope.clone(),
+            caps: s.caps.clone(),
+            hooks: s.hooks.clone(),
+            compaction: s.compaction.clone(),
+            limits: s.limits.clone(),
+            flags: s.flags.clone(),
+            mcp: s.mcp.clone().unwrap_or_default(),
+        },
+        s.mcp.as_ref(),
+    )
+}
+
+fn apply_task_settings(
+    args: &mut RunArgs,
+    s: &TaskDefaults,
+    explicit_mcp: Option<&Vec<String>>,
+) -> anyhow::Result<()> {
+    if let Some(v) = &s.mode {
+        args.mode = parse_enum::<planner::RunMode>(v, "mode")?;
+    }
+    if let Some(v) = &s.provider {
+        args.provider = Some(parse_enum::<ProviderKind>(v, "provider")?);
+    }
+    if let Some(v) = &s.base_url {
+        args.base_url = Some(v.clone());
+    }
+    if let Some(v) = &s.model {
+        args.model = Some(v.clone());
+    }
+    if let Some(v) = &s.planner_model {
+        args.planner_model = Some(v.clone());
+    }
+    if let Some(v) = &s.worker_model {
+        args.worker_model = Some(v.clone());
+    }
+    if let Some(v) = &s.trust {
+        args.trust = parse_enum::<TrustMode>(v, "trust")?;
+    }
+    if let Some(v) = &s.approval_mode {
+        args.approval_mode = parse_enum::<ApprovalMode>(v, "approval_mode")?;
+    }
+    if let Some(v) = &s.auto_approve_scope {
+        args.auto_approve_scope = parse_enum::<AutoApproveScope>(v, "auto_approve_scope")?;
+    }
+    if let Some(v) = &s.caps {
+        args.caps = parse_enum::<CapsMode>(v, "caps")?;
+    }
+    if let Some(v) = &s.hooks {
+        args.hooks = parse_enum::<HooksMode>(v, "hooks")?;
+    }
+    if let Some(v) = s.compaction.max_context_chars {
+        args.max_context_chars = v;
+    }
+    if let Some(v) = &s.compaction.mode {
+        args.compaction_mode = parse_enum::<CompactionMode>(v, "compaction.mode")?;
+    }
+    if let Some(v) = s.compaction.keep_last {
+        args.compaction_keep_last = v;
+    }
+    if let Some(v) = &s.compaction.tool_result_persist {
+        args.tool_result_persist =
+            parse_enum::<ToolResultPersist>(v, "compaction.tool_result_persist")?;
+    }
+    if let Some(v) = s.limits.max_read_bytes {
+        args.max_read_bytes = v;
+    }
+    if let Some(v) = s.limits.max_tool_output_bytes {
+        args.max_tool_output_bytes = v;
+    }
+    if let Some(v) = s.flags.enable_write_tools {
+        args.enable_write_tools = v;
+    }
+    if let Some(v) = s.flags.allow_write {
+        args.allow_write = v;
+    }
+    if let Some(v) = s.flags.allow_shell {
+        args.allow_shell = v;
+    }
+    if let Some(v) = s.flags.stream {
+        args.stream = v;
+    }
+    if let Some(mcp) = explicit_mcp {
+        args.mcp = mcp.clone();
+    } else if !s.mcp.is_empty() {
+        args.mcp = s.mcp.clone();
+    }
     Ok(())
+}
+
+fn parse_enum<T: ValueEnum + Clone>(value: &str, field: &str) -> anyhow::Result<T> {
+    let normalized = value.replace('_', "-");
+    T::from_str(&normalized, true).map_err(|_| anyhow!("invalid value '{}' for {}", value, field))
 }
 
 #[derive(Debug, Clone)]
@@ -1940,10 +2570,32 @@ fn build_run_cli_config(
         allow_shell: args.allow_shell,
         allow_write: args.allow_write,
         enable_write_tools: args.enable_write_tools,
+        exec_target: format!("{:?}", args.exec_target).to_lowercase(),
+        docker_image: if matches!(args.exec_target, ExecTargetKind::Docker) {
+            Some(args.docker_image.clone())
+        } else {
+            None
+        },
+        docker_workdir: if matches!(args.exec_target, ExecTargetKind::Docker) {
+            Some(args.docker_workdir.clone())
+        } else {
+            None
+        },
+        docker_network: if matches!(args.exec_target, ExecTargetKind::Docker) {
+            Some(format!("{:?}", args.docker_network).to_lowercase())
+        } else {
+            None
+        },
+        docker_user: if matches!(args.exec_target, ExecTargetKind::Docker) {
+            args.docker_user.clone()
+        } else {
+            None
+        },
         max_tool_output_bytes: args.max_tool_output_bytes,
         max_read_bytes: args.max_read_bytes,
         approval_mode: format!("{:?}", args.approval_mode).to_lowercase(),
         auto_approve_scope: format!("{:?}", args.auto_approve_scope).to_lowercase(),
+        approval_key: args.approval_key.as_str().to_string(),
         unsafe_mode: args.unsafe_mode,
         no_limits: args.no_limits,
         unsafe_bypass_allow_flags: args.unsafe_bypass_allow_flags,
@@ -2003,6 +2655,27 @@ fn build_config_fingerprint(
         allow_shell: args.allow_shell,
         allow_write: args.allow_write,
         enable_write_tools: args.enable_write_tools,
+        exec_target: format!("{:?}", args.exec_target).to_lowercase(),
+        docker_image: if matches!(args.exec_target, ExecTargetKind::Docker) {
+            args.docker_image.clone()
+        } else {
+            String::new()
+        },
+        docker_workdir: if matches!(args.exec_target, ExecTargetKind::Docker) {
+            args.docker_workdir.clone()
+        } else {
+            String::new()
+        },
+        docker_network: if matches!(args.exec_target, ExecTargetKind::Docker) {
+            format!("{:?}", args.docker_network).to_lowercase()
+        } else {
+            String::new()
+        },
+        docker_user: if matches!(args.exec_target, ExecTargetKind::Docker) {
+            args.docker_user.clone().unwrap_or_default()
+        } else {
+            String::new()
+        },
         max_steps: args.max_steps,
         max_tool_output_bytes: args.max_tool_output_bytes,
         max_read_bytes: args.max_read_bytes,
@@ -2015,6 +2688,7 @@ fn build_config_fingerprint(
         max_session_messages: args.max_session_messages,
         approval_mode: format!("{:?}", args.approval_mode).to_lowercase(),
         auto_approve_scope: format!("{:?}", args.auto_approve_scope).to_lowercase(),
+        approval_key: args.approval_key.as_str().to_string(),
         unsafe_mode: args.unsafe_mode,
         no_limits: args.no_limits,
         unsafe_bypass_allow_flags: args.unsafe_bypass_allow_flags,
@@ -2067,6 +2741,15 @@ fn resolved_hooks_config_path(args: &RunArgs, state_dir: &std::path::Path) -> Pa
     args.hooks_config
         .clone()
         .unwrap_or_else(|| state_dir.join("hooks.yaml"))
+}
+
+fn compute_hooks_config_hash_hex(mode: HooksMode, path: &std::path::Path) -> Option<String> {
+    if matches!(mode, HooksMode::Off) || !path.exists() {
+        return None;
+    }
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| store::sha256_hex(&bytes))
 }
 
 fn handle_hooks_list(path: &std::path::Path) -> anyhow::Result<()> {
@@ -2741,9 +3424,14 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::providers::{ModelProvider, StreamDelta};
+    use crate::target::ExecTargetKind;
+    use crate::taskgraph::{TaskCompaction, TaskFlags, TaskLimits};
     use crate::types::{GenerateRequest, GenerateResponse, Message, Role};
 
-    use super::{doctor_probe_urls, policy_doctor_output, policy_effective_output, ProviderKind};
+    use super::{
+        doctor_probe_urls, policy_doctor_output, policy_effective_output, DockerNetwork,
+        ProviderKind,
+    };
 
     struct CaptureSink {
         events: Arc<Mutex<Vec<crate::events::Event>>>,
@@ -2871,5 +3559,131 @@ rules:
             model_start.data.get("tool_count").and_then(|v| v.as_u64()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn task_settings_merge_defaults_then_overrides() {
+        let mut args = default_run_args();
+        let defaults = crate::taskgraph::TaskDefaults {
+            mode: Some("planner_worker".to_string()),
+            provider: Some("ollama".to_string()),
+            base_url: Some("http://localhost:11434".to_string()),
+            model: Some("m1".to_string()),
+            planner_model: Some("pm".to_string()),
+            worker_model: Some("wm".to_string()),
+            trust: Some("on".to_string()),
+            approval_mode: Some("auto".to_string()),
+            auto_approve_scope: Some("run".to_string()),
+            caps: Some("strict".to_string()),
+            hooks: Some("auto".to_string()),
+            compaction: TaskCompaction {
+                max_context_chars: Some(111),
+                mode: Some("summary".to_string()),
+                keep_last: Some(7),
+                tool_result_persist: Some("digest".to_string()),
+            },
+            limits: TaskLimits {
+                max_read_bytes: Some(123),
+                max_tool_output_bytes: Some(456),
+            },
+            flags: TaskFlags {
+                enable_write_tools: Some(true),
+                allow_write: Some(true),
+                allow_shell: Some(false),
+                stream: Some(false),
+            },
+            mcp: vec!["playwright".to_string()],
+        };
+        super::apply_task_defaults(&mut args, &defaults).expect("defaults");
+        let override_s = crate::taskgraph::TaskNodeSettings {
+            model: Some("m2".to_string()),
+            flags: TaskFlags {
+                allow_shell: Some(true),
+                ..TaskFlags::default()
+            },
+            ..crate::taskgraph::TaskNodeSettings::default()
+        };
+        super::apply_node_overrides(&mut args, &override_s).expect("overrides");
+        assert_eq!(args.model.as_deref(), Some("m2"));
+        assert!(args.allow_shell);
+        assert!(matches!(args.mode, crate::planner::RunMode::PlannerWorker));
+        assert_eq!(args.mcp, vec!["playwright".to_string()]);
+    }
+
+    #[test]
+    fn node_summary_line_is_deterministic() {
+        let a = super::node_summary_line("N1", "ok", "hello\nworld");
+        let b = super::node_summary_line("N1", "ok", "hello\nworld");
+        assert_eq!(a, b);
+        assert!(a.contains("output_sha256="));
+    }
+
+    fn default_run_args() -> super::RunArgs {
+        super::RunArgs {
+            provider: None,
+            model: None,
+            base_url: None,
+            api_key: None,
+            prompt: None,
+            max_steps: 20,
+            workdir: std::path::PathBuf::from("."),
+            state_dir: None,
+            mcp: Vec::new(),
+            mcp_config: None,
+            allow_shell: false,
+            allow_write: false,
+            enable_write_tools: false,
+            exec_target: ExecTargetKind::Host,
+            docker_image: "ubuntu:24.04".to_string(),
+            docker_workdir: "/work".to_string(),
+            docker_network: DockerNetwork::None,
+            docker_user: None,
+            max_tool_output_bytes: 200_000,
+            max_read_bytes: 200_000,
+            trust: crate::gate::TrustMode::Off,
+            approval_mode: crate::gate::ApprovalMode::Interrupt,
+            auto_approve_scope: crate::gate::AutoApproveScope::Run,
+            approval_key: crate::gate::ApprovalKeyVersion::V1,
+            unsafe_mode: false,
+            no_limits: false,
+            unsafe_bypass_allow_flags: false,
+            policy: None,
+            approvals: None,
+            audit: None,
+            session: "default".to_string(),
+            no_session: false,
+            reset_session: false,
+            max_session_messages: 40,
+            use_session_settings: false,
+            max_context_chars: 0,
+            compaction_mode: crate::compaction::CompactionMode::Off,
+            compaction_keep_last: 20,
+            tool_result_persist: crate::compaction::ToolResultPersist::Digest,
+            hooks: crate::hooks::config::HooksMode::Off,
+            hooks_config: None,
+            hooks_strict: false,
+            hooks_timeout_ms: 2000,
+            hooks_max_stdout_bytes: 200_000,
+            tool_args_strict: crate::tools::ToolArgsStrict::On,
+            caps: crate::session::CapsMode::Off,
+            stream: false,
+            events: None,
+            http_max_retries: 2,
+            http_timeout_ms: 60_000,
+            http_connect_timeout_ms: 2_000,
+            http_stream_idle_timeout_ms: 15_000,
+            http_max_response_bytes: 10_000_000,
+            http_max_line_bytes: 200_000,
+            tui: false,
+            tui_refresh_ms: 50,
+            tui_max_log_lines: 200,
+            mode: crate::planner::RunMode::Single,
+            planner_model: None,
+            worker_model: None,
+            planner_max_steps: 2,
+            planner_output: crate::planner::PlannerOutput::Json,
+            planner_strict: true,
+            no_planner_strict: false,
+        }
     }
 }

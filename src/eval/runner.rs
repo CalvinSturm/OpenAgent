@@ -13,8 +13,8 @@ use crate::eval::cost::{estimate_cost_usd, load_cost_model, CostModel};
 use crate::eval::fixtures::FixtureServer;
 use crate::eval::tasks::{tasks_for_pack, EvalPack, EvalTask, Fixture, VerifierSpec};
 use crate::gate::{
-    compute_policy_hash_hex, ApprovalMode, AutoApproveScope, GateContext, NoGate, ProviderKind,
-    ToolGate, TrustGate, TrustMode,
+    compute_policy_hash_hex, ApprovalKeyVersion, ApprovalMode, AutoApproveScope, GateContext,
+    NoGate, ProviderKind, ToolGate, TrustGate, TrustMode,
 };
 use crate::hooks::config::HooksMode;
 use crate::hooks::runner::{HookManager, HookRuntimeConfig};
@@ -28,11 +28,21 @@ use crate::store::{
     config_hash_hex, provider_to_string, resolve_state_paths, stable_path_string,
     ConfigFingerprintV1, RunCliConfig, StatePaths,
 };
+use crate::target::{ExecTargetKind, HostTarget};
 use crate::tools::{builtin_tools_enabled, ToolArgsStrict, ToolRuntime};
 use crate::trust::approvals::ApprovalsStore;
 use crate::trust::audit::AuditLog;
 use crate::trust::policy::{McpAllowSummary, Policy};
 use crate::types::SideEffects;
+
+fn compute_hooks_config_hash_hex(mode: HooksMode, path: &Path) -> Option<String> {
+    if matches!(mode, HooksMode::Off) || !path.exists() {
+        return None;
+    }
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| crate::store::sha256_hex(&bytes))
+}
 
 #[derive(Debug, Clone)]
 pub struct EvalConfig {
@@ -48,6 +58,7 @@ pub struct EvalConfig {
     pub trust: TrustMode,
     pub approval_mode: ApprovalMode,
     pub auto_approve_scope: AutoApproveScope,
+    pub approval_key: ApprovalKeyVersion,
     pub enable_write_tools: bool,
     pub allow_write: bool,
     pub allow_shell: bool,
@@ -121,6 +132,7 @@ pub struct EvalResultsConfig {
     pub trust_mode: String,
     pub approval_mode: String,
     pub auto_approve_scope: String,
+    pub approval_key: String,
     pub allow_shell: bool,
     pub allow_write: bool,
     pub enable_write_tools: bool,
@@ -182,6 +194,7 @@ impl EvalResultsConfig {
             trust_mode: "on".to_string(),
             approval_mode: "auto".to_string(),
             auto_approve_scope: "run".to_string(),
+            approval_key: "v1".to_string(),
             allow_shell: false,
             allow_write: false,
             enable_write_tools: false,
@@ -418,6 +431,7 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
             trust_mode: format!("{:?}", config.trust).to_lowercase(),
             approval_mode: format!("{:?}", config.approval_mode).to_lowercase(),
             auto_approve_scope: format!("{:?}", config.auto_approve_scope).to_lowercase(),
+            approval_key: config.approval_key.as_str().to_string(),
             allow_shell: config.allow_shell,
             allow_write: config.allow_write,
             enable_write_tools: config.enable_write_tools,
@@ -658,6 +672,8 @@ fn write_synthetic_error_artifact(
             includes_resolved: Vec::new(),
             mcp_allowlist: None,
         },
+        BTreeMap::new(),
+        None,
     );
 }
 
@@ -901,6 +917,10 @@ async fn run_single(
         allow_write: config.allow_write,
         approval_mode: config.approval_mode,
         auto_approve_scope: config.auto_approve_scope,
+        approval_key_version: config.approval_key,
+        tool_schema_hashes: std::collections::BTreeMap::new(),
+        hooks_config_hash_hex: None,
+        planner_hash_hex: None,
         unsafe_mode: config.unsafe_mode,
         unsafe_bypass_allow_flags: config.unsafe_bypass_allow_flags,
         run_id: None,
@@ -909,6 +929,7 @@ async fn run_single(
         max_read_bytes: if config.no_limits { 0 } else { 200_000 },
         provider: config.provider,
         model: model.to_string(),
+        exec_target: ExecTargetKind::Host,
     };
     let gate_build = build_gate(config.trust, state_paths)?;
     let policy_hash_hex = gate_build.policy_hash_hex.clone();
@@ -957,6 +978,13 @@ async fn run_single(
             side_effects: t.side_effects,
         })
         .collect::<Vec<_>>();
+    let tool_schema_hash_hex_map = crate::store::tool_schema_hash_hex_map(&tools);
+    let resolved_hooks_config_path = config
+        .hooks_config
+        .clone()
+        .unwrap_or_else(|| state_paths.state_dir.join("hooks.yaml"));
+    let hooks_config_hash_hex =
+        compute_hooks_config_hash_hex(config.hooks_mode, &resolved_hooks_config_path);
 
     let provider = make_provider(
         config.provider,
@@ -977,9 +1005,15 @@ async fn run_single(
             max_read_bytes: if config.no_limits { 0 } else { 200_000 },
             unsafe_bypass_allow_flags: config.unsafe_bypass_allow_flags,
             tool_args_strict: config.tool_args_strict,
+            exec_target_kind: ExecTargetKind::Host,
+            exec_target: std::sync::Arc::new(HostTarget),
         },
         gate: gate_build.gate,
-        gate_ctx,
+        gate_ctx: GateContext {
+            tool_schema_hashes: tool_schema_hash_hex_map.clone(),
+            hooks_config_hash_hex: hooks_config_hash_hex.clone(),
+            ..gate_ctx
+        },
         mcp_registry,
         stream: false,
         event_sink: None,
@@ -991,10 +1025,7 @@ async fn run_single(
         },
         hooks: HookManager::build(HookRuntimeConfig {
             mode: config.hooks_mode,
-            config_path: config
-                .hooks_config
-                .clone()
-                .unwrap_or_else(|| state_paths.state_dir.join("hooks.yaml")),
+            config_path: resolved_hooks_config_path,
             strict: config.hooks_strict,
             timeout_ms: config.hooks_timeout_ms,
             max_stdout_bytes: config.hooks_max_stdout_bytes,
@@ -1067,6 +1098,8 @@ async fn run_single(
             includes_resolved,
             mcp_allowlist,
         },
+        tool_schema_hash_hex_map,
+        hooks_config_hash_hex,
     )?;
 
     Ok(EvalRunRow {
@@ -1093,6 +1126,7 @@ async fn run_single(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_run_artifact_for_eval(
     config: &EvalConfig,
     state_paths: &StatePaths,
@@ -1100,6 +1134,8 @@ fn write_run_artifact_for_eval(
     outcome: &AgentOutcome,
     tool_catalog: Vec<crate::store::ToolCatalogEntry>,
     policy: EvalPolicyMeta,
+    tool_schema_hash_hex_map: BTreeMap<String, String>,
+    hooks_config_hash_hex: Option<String>,
 ) -> anyhow::Result<()> {
     let cli_config = RunCliConfig {
         mode: format!("{:?}", config.mode).to_lowercase(),
@@ -1115,10 +1151,16 @@ fn write_run_artifact_for_eval(
         allow_shell: config.allow_shell,
         allow_write: config.allow_write,
         enable_write_tools: config.enable_write_tools,
+        exec_target: "host".to_string(),
+        docker_image: None,
+        docker_workdir: None,
+        docker_network: None,
+        docker_user: None,
         max_tool_output_bytes: if config.no_limits { 0 } else { 200_000 },
         max_read_bytes: if config.no_limits { 0 } else { 200_000 },
         approval_mode: format!("{:?}", config.approval_mode).to_lowercase(),
         auto_approve_scope: format!("{:?}", config.auto_approve_scope).to_lowercase(),
+        approval_key: config.approval_key.as_str().to_string(),
         unsafe_mode: config.unsafe_mode,
         no_limits: config.no_limits,
         unsafe_bypass_allow_flags: config.unsafe_bypass_allow_flags,
@@ -1180,6 +1222,11 @@ fn write_run_artifact_for_eval(
         allow_shell: config.allow_shell,
         allow_write: config.allow_write,
         enable_write_tools: config.enable_write_tools,
+        exec_target: "host".to_string(),
+        docker_image: String::new(),
+        docker_workdir: String::new(),
+        docker_network: String::new(),
+        docker_user: String::new(),
         max_steps: config.max_steps,
         max_tool_output_bytes: if config.no_limits { 0 } else { 200_000 },
         max_read_bytes: if config.no_limits { 0 } else { 200_000 },
@@ -1192,6 +1239,7 @@ fn write_run_artifact_for_eval(
         max_session_messages: config.max_session_messages,
         approval_mode: format!("{:?}", config.approval_mode).to_lowercase(),
         auto_approve_scope: format!("{:?}", config.auto_approve_scope).to_lowercase(),
+        approval_key: config.approval_key.as_str().to_string(),
         unsafe_mode: config.unsafe_mode,
         no_limits: config.no_limits,
         unsafe_bypass_allow_flags: config.unsafe_bypass_allow_flags,
@@ -1251,6 +1299,8 @@ fn write_run_artifact_for_eval(
             model: model.to_string(),
             injected_planner_hash_hex: None,
         }),
+        tool_schema_hash_hex_map,
+        hooks_config_hash_hex,
     )?;
     Ok(())
 }
@@ -1641,7 +1691,7 @@ mod tests {
     };
     use crate::compaction::{CompactionMode, ToolResultPersist};
     use crate::eval::tasks::{EvalTask, Fixture, RequiredCapabilities, VerifierSpec};
-    use crate::gate::{ApprovalMode, AutoApproveScope, ProviderKind, TrustMode};
+    use crate::gate::{ApprovalKeyVersion, ApprovalMode, AutoApproveScope, ProviderKind, TrustMode};
     use crate::hooks::config::HooksMode;
     use crate::planner::RunMode;
     use crate::providers::http::HttpConfig;
@@ -1821,6 +1871,7 @@ mod tests {
             trust: TrustMode::Off,
             approval_mode: ApprovalMode::Interrupt,
             auto_approve_scope: AutoApproveScope::Run,
+            approval_key: ApprovalKeyVersion::V1,
             enable_write_tools: false,
             allow_write: false,
             allow_shell: false,
@@ -1900,6 +1951,7 @@ mod tests {
             trust: TrustMode::Off,
             approval_mode: ApprovalMode::Interrupt,
             auto_approve_scope: AutoApproveScope::Run,
+            approval_key: ApprovalKeyVersion::V1,
             enable_write_tools: false,
             allow_write: false,
             allow_shell: false,

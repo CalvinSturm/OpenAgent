@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::ValueEnum;
@@ -5,8 +6,9 @@ use hex::encode as hex_encode;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::target::ExecTargetKind;
 use crate::trust::approvals::{
-    canonical_json, ApprovalDecisionMatch, ApprovalStatus, ApprovalsStore,
+    canonical_json, ApprovalDecisionMatch, ApprovalProvenance, ApprovalStatus, ApprovalsStore,
 };
 use crate::trust::audit::{AuditEvent, AuditLog, AuditResult};
 use crate::trust::policy::{Policy, PolicyDecision};
@@ -37,6 +39,21 @@ pub enum ApprovalMode {
 pub enum AutoApproveScope {
     Run,
     Session,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ApprovalKeyVersion {
+    V1,
+    V2,
+}
+
+impl ApprovalKeyVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +93,11 @@ pub struct GateContext {
     pub max_read_bytes: usize,
     pub provider: ProviderKind,
     pub model: String,
+    pub exec_target: ExecTargetKind,
+    pub approval_key_version: ApprovalKeyVersion,
+    pub tool_schema_hashes: BTreeMap<String, String>,
+    pub hooks_config_hash_hex: Option<String>,
+    pub planner_hash_hex: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +114,11 @@ pub struct GateEvent {
     pub approval_key: Option<String>,
     pub approval_mode: Option<String>,
     pub auto_approve_scope: Option<String>,
+    pub approval_key_version: Option<String>,
+    pub tool_schema_hash_hex: Option<String>,
+    pub hooks_config_hash_hex: Option<String>,
+    pub planner_hash_hex: Option<String>,
+    pub exec_target: Option<String>,
     pub result_ok: bool,
     pub result_content: String,
     pub result_input_digest: Option<String>,
@@ -163,12 +190,32 @@ impl TrustGate {
 
 impl ToolGate for TrustGate {
     fn decide(&mut self, ctx: &GateContext, call: &ToolCall) -> GateDecision {
-        let approval_key = compute_approval_key(
+        let tool_schema_hash_hex = ctx.tool_schema_hashes.get(&call.name).cloned();
+        let approval_key = compute_approval_key_with_version(
+            ctx.approval_key_version,
             &call.name,
             &call.arguments,
             &ctx.workdir,
             &self.policy_hash_hex,
+            tool_schema_hash_hex.as_deref(),
+            ctx.hooks_config_hash_hex.as_deref(),
+            ctx.exec_target,
+            ctx.planner_hash_hex.as_deref(),
         );
+        let approval_provenance = ApprovalProvenance {
+            approval_key_version: ctx.approval_key_version.as_str().to_string(),
+            tool_schema_hash_hex,
+            hooks_config_hash_hex: ctx.hooks_config_hash_hex.clone(),
+            exec_target: Some(
+                match ctx.exec_target {
+                    ExecTargetKind::Host => "host",
+                    ExecTargetKind::Docker => "docker",
+                }
+                .to_string(),
+            ),
+            planner_hash_hex: ctx.planner_hash_hex.clone(),
+        };
+        let args_with_target = with_exec_target_arg(&call.arguments, ctx.exec_target);
 
         if call.name == "shell" && !ctx.allow_shell && !ctx.unsafe_bypass_allow_flags {
             return GateDecision::Deny {
@@ -196,7 +243,7 @@ impl ToolGate for TrustGate {
             };
         }
 
-        let eval = self.policy.evaluate(&call.name, &call.arguments);
+        let eval = self.policy.evaluate(&call.name, &args_with_target);
         match eval.decision {
             PolicyDecision::Allow => GateDecision::Allow {
                 approval_id: None,
@@ -229,6 +276,7 @@ impl ToolGate for TrustGate {
                                 &call.name,
                                 &call.arguments,
                                 &approval_key,
+                                Some(approval_provenance.clone()),
                             ) {
                                 Ok(id) => GateDecision::Allow {
                                     approval_id: Some(id),
@@ -246,14 +294,20 @@ impl ToolGate for TrustGate {
                     };
                 }
 
-                match self.approvals.consume_matching_approved(&approval_key) {
+                match self
+                    .approvals
+                    .consume_matching_approved(&approval_key, ctx.approval_key_version.as_str())
+                {
                     Ok(Some(usage)) => GateDecision::Allow {
                         approval_id: Some(usage.id),
                         approval_key: Some(usage.approval_key),
                         reason: eval.reason.clone(),
                         source: eval.source.clone(),
                     },
-                    Ok(None) => match self.approvals.find_matching_decision(&approval_key) {
+                    Ok(None) => match self
+                        .approvals
+                        .find_matching_decision(&approval_key, ctx.approval_key_version.as_str())
+                    {
                         Ok(Some(ApprovalDecisionMatch {
                             id,
                             status: ApprovalStatus::Denied,
@@ -279,6 +333,7 @@ impl ToolGate for TrustGate {
                                 &call.name,
                                 &call.arguments,
                                 Some(approval_key.clone()),
+                                Some(approval_provenance.clone()),
                             ) {
                                 Ok(id) => GateDecision::RequireApproval {
                                     reason: eval.reason.clone().unwrap_or_else(|| {
@@ -330,6 +385,11 @@ impl ToolGate for TrustGate {
             approval_key: event.approval_key,
             approval_mode: event.approval_mode,
             auto_approve_scope: event.auto_approve_scope,
+            approval_key_version: event.approval_key_version,
+            tool_schema_hash_hex: event.tool_schema_hash_hex,
+            hooks_config_hash_hex: event.hooks_config_hash_hex,
+            planner_hash_hex: event.planner_hash_hex,
+            exec_target: event.exec_target,
             result: AuditResult {
                 ok: event.result_ok,
                 content: event.result_content,
@@ -343,6 +403,26 @@ impl ToolGate for TrustGate {
             eprintln!("WARN: failed to append audit log: {e}");
         }
     }
+}
+
+fn with_exec_target_arg(args: &Value, exec_target: ExecTargetKind) -> Value {
+    let mut out = match args {
+        Value::Object(map) => Value::Object(map.clone()),
+        _ => Value::Object(serde_json::Map::new()),
+    };
+    if let Value::Object(ref mut map) = out {
+        map.insert(
+            "__exec_target".to_string(),
+            Value::String(
+                match exec_target {
+                    ExecTargetKind::Host => "host",
+                    ExecTargetKind::Docker => "docker",
+                }
+                .to_string(),
+            ),
+        );
+    }
+    out
 }
 
 pub fn compute_policy_hash_hex(bytes: &[u8]) -> String {
@@ -366,6 +446,44 @@ pub fn compute_approval_key(
     compute_policy_hash_hex(payload.as_bytes())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn compute_approval_key_with_version(
+    version: ApprovalKeyVersion,
+    tool_name: &str,
+    arguments: &Value,
+    workdir: &std::path::Path,
+    policy_hash_hex: &str,
+    tool_schema_hash_hex: Option<&str>,
+    hooks_config_hash_hex: Option<&str>,
+    exec_target: ExecTargetKind,
+    planner_hash_hex: Option<&str>,
+) -> String {
+    match version {
+        ApprovalKeyVersion::V1 => {
+            compute_approval_key(tool_name, arguments, workdir, policy_hash_hex)
+        }
+        ApprovalKeyVersion::V2 => {
+            let canonical_args = canonical_json(arguments).unwrap_or_else(|_| "null".to_string());
+            let normalized_workdir = normalize_workdir(workdir);
+            let payload = format!(
+                "v2|tool={}|args={}|workdir={}|policy={}|schema={}|hooks={}|exec_target={}|planner={}",
+                tool_name,
+                canonical_args,
+                normalized_workdir,
+                policy_hash_hex,
+                tool_schema_hash_hex.unwrap_or("none"),
+                hooks_config_hash_hex.unwrap_or("none"),
+                match exec_target {
+                    ExecTargetKind::Host => "host",
+                    ExecTargetKind::Docker => "docker",
+                },
+                planner_hash_hex.unwrap_or("none"),
+            );
+            compute_policy_hash_hex(payload.as_bytes())
+        }
+    }
+}
+
 fn normalize_workdir(path: &std::path::Path) -> String {
     match std::fs::canonicalize(path) {
         Ok(p) => p.display().to_string(),
@@ -375,16 +493,18 @@ fn normalize_workdir(path: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
-        compute_approval_key, compute_policy_hash_hex, ApprovalMode, AutoApproveScope, GateContext,
-        GateDecision, NoGate, ProviderKind, ToolGate, TrustGate, TrustMode,
+        compute_approval_key, compute_policy_hash_hex, ApprovalKeyVersion, ApprovalMode,
+        AutoApproveScope, ExecTargetKind, GateContext, GateDecision, NoGate, ProviderKind,
+        ToolGate, TrustGate, TrustMode,
     };
-    use crate::trust::approvals::ApprovalsStore;
+    use crate::trust::approvals::{ApprovalProvenance, ApprovalsStore};
     use crate::trust::audit::AuditLog;
     use crate::trust::policy::Policy;
     use crate::types::ToolCall;
@@ -406,6 +526,11 @@ mod tests {
             max_read_bytes: 200_000,
             provider: ProviderKind::Lmstudio,
             model: "test-model".to_string(),
+            exec_target: ExecTargetKind::Host,
+            approval_key_version: ApprovalKeyVersion::V1,
+            tool_schema_hashes: BTreeMap::new(),
+            hooks_config_hash_hex: None,
+            planner_hash_hex: None,
         };
         let call = ToolCall {
             id: "tc_0".to_string(),
@@ -438,6 +563,11 @@ mod tests {
             max_read_bytes: 200_000,
             provider: ProviderKind::Lmstudio,
             model: "m".to_string(),
+            exec_target: ExecTargetKind::Host,
+            approval_key_version: ApprovalKeyVersion::V1,
+            tool_schema_hashes: BTreeMap::new(),
+            hooks_config_hash_hex: None,
+            planner_hash_hex: None,
         };
         let call = ToolCall {
             id: "tc_1".to_string(),
@@ -446,7 +576,7 @@ mod tests {
         };
         let key = compute_approval_key(&call.name, &call.arguments, &ctx.workdir, &policy_hash);
         let id = store
-            .create_pending(&call.name, &call.arguments, Some(key.clone()))
+            .create_pending(&call.name, &call.arguments, Some(key.clone()), None)
             .expect("create pending");
         store.approve(&id, None, None).expect("approve");
         let mut gate = TrustGate::new(
@@ -482,6 +612,11 @@ mod tests {
             max_read_bytes: 200_000,
             provider: ProviderKind::Lmstudio,
             model: "m".to_string(),
+            exec_target: ExecTargetKind::Host,
+            approval_key_version: ApprovalKeyVersion::V1,
+            tool_schema_hashes: BTreeMap::new(),
+            hooks_config_hash_hex: None,
+            planner_hash_hex: None,
         };
         let call = ToolCall {
             id: "tc_1".to_string(),
@@ -490,7 +625,7 @@ mod tests {
         };
         let key = compute_approval_key(&call.name, &call.arguments, &ctx.workdir, &policy_hash);
         let id = store
-            .create_pending(&call.name, &call.arguments, Some(key))
+            .create_pending(&call.name, &call.arguments, Some(key), None)
             .expect("create pending");
         store.approve(&id, Some(0), None).expect("approve expired");
         let mut gate = TrustGate::new(
@@ -526,6 +661,11 @@ mod tests {
             max_read_bytes: 200_000,
             provider: ProviderKind::Lmstudio,
             model: "m".to_string(),
+            exec_target: ExecTargetKind::Host,
+            approval_key_version: ApprovalKeyVersion::V1,
+            tool_schema_hashes: BTreeMap::new(),
+            hooks_config_hash_hex: None,
+            planner_hash_hex: None,
         };
         let call = ToolCall {
             id: "tc_1".to_string(),
@@ -534,7 +674,7 @@ mod tests {
         };
         let key = compute_approval_key(&call.name, &call.arguments, &ctx.workdir, &policy_hash);
         let id = store
-            .create_pending(&call.name, &call.arguments, Some(key))
+            .create_pending(&call.name, &call.arguments, Some(key), None)
             .expect("create pending");
         store.approve(&id, None, Some(1)).expect("approve");
         let mut gate = TrustGate::new(
@@ -576,6 +716,11 @@ mod tests {
             max_read_bytes: 200_000,
             provider: ProviderKind::Lmstudio,
             model: "m".to_string(),
+            exec_target: ExecTargetKind::Host,
+            approval_key_version: ApprovalKeyVersion::V1,
+            tool_schema_hashes: BTreeMap::new(),
+            hooks_config_hash_hex: None,
+            planner_hash_hex: None,
         };
         let call = ToolCall {
             id: "tc_1".to_string(),
@@ -617,6 +762,11 @@ mod tests {
             max_read_bytes: 200_000,
             provider: ProviderKind::Lmstudio,
             model: "m".to_string(),
+            exec_target: ExecTargetKind::Host,
+            approval_key_version: ApprovalKeyVersion::V1,
+            tool_schema_hashes: BTreeMap::new(),
+            hooks_config_hash_hex: None,
+            planner_hash_hex: None,
         };
         let call = ToolCall {
             id: "tc_abc".to_string(),
@@ -637,5 +787,167 @@ mod tests {
             }
             _ => panic!("expected allow"),
         }
+    }
+
+    #[test]
+    fn policy_can_match_exec_target_condition() {
+        let tmp = tempdir().expect("tempdir");
+        let approvals = tmp.path().join("approvals.json");
+        let audit = tmp.path().join("audit.jsonl");
+        let store = ApprovalsStore::new(approvals);
+        let policy = Policy::from_yaml(
+            r#"
+version: 2
+default: allow
+rules:
+  - tool: "read_file"
+    decision: deny
+    when:
+      - arg: "__exec_target"
+        op: equals
+        value: "docker"
+"#,
+        )
+        .expect("policy");
+        let policy_hash = compute_policy_hash_hex(b"custom");
+        let mut gate = TrustGate::new(
+            policy,
+            store,
+            AuditLog::new(audit),
+            TrustMode::On,
+            policy_hash,
+        );
+        let call = ToolCall {
+            id: "tc_x".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path":"a.txt"}),
+        };
+
+        let mut ctx = GateContext {
+            workdir: tmp.path().to_path_buf(),
+            allow_shell: false,
+            allow_write: false,
+            approval_mode: ApprovalMode::Interrupt,
+            auto_approve_scope: AutoApproveScope::Run,
+            unsafe_mode: false,
+            unsafe_bypass_allow_flags: false,
+            run_id: Some("r".to_string()),
+            enable_write_tools: false,
+            max_tool_output_bytes: 200_000,
+            max_read_bytes: 200_000,
+            provider: ProviderKind::Lmstudio,
+            model: "m".to_string(),
+            exec_target: ExecTargetKind::Host,
+            approval_key_version: ApprovalKeyVersion::V1,
+            tool_schema_hashes: BTreeMap::new(),
+            hooks_config_hash_hex: None,
+            planner_hash_hex: None,
+        };
+        assert!(matches!(
+            gate.decide(&ctx, &call),
+            GateDecision::Allow { .. }
+        ));
+        ctx.exec_target = ExecTargetKind::Docker;
+        assert!(matches!(
+            gate.decide(&ctx, &call),
+            GateDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn approval_key_v2_deterministic_known_hash() {
+        let got = super::compute_approval_key_with_version(
+            ApprovalKeyVersion::V2,
+            "read_file",
+            &json!({"path":"a.txt"}),
+            std::path::Path::new("/tmp/w"),
+            "abc",
+            Some("def"),
+            None,
+            ExecTargetKind::Host,
+            None,
+        );
+        assert_eq!(
+            got,
+            "6cec1a4c99be252db98654e874d29f1aa0306692181b4ae494ef42bfbca5aba1"
+        );
+    }
+
+    #[test]
+    fn gate_key_version_matching_v1_vs_v2() {
+        let tmp = tempdir().expect("tmp");
+        let approvals = tmp.path().join("approvals.json");
+        let audit = tmp.path().join("audit.jsonl");
+        let store = ApprovalsStore::new(approvals);
+        let policy = Policy::safe_default();
+        let policy_hash = compute_policy_hash_hex(b"default");
+        let call = ToolCall {
+            id: "tc_1".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({"cmd":"echo","args":["hi"]}),
+        };
+        let key_v2 = super::compute_approval_key_with_version(
+            ApprovalKeyVersion::V2,
+            &call.name,
+            &call.arguments,
+            tmp.path(),
+            &policy_hash,
+            None,
+            None,
+            ExecTargetKind::Host,
+            None,
+        );
+        let id = store
+            .create_pending(
+                &call.name,
+                &call.arguments,
+                Some(key_v2),
+                Some(ApprovalProvenance {
+                    approval_key_version: "v2".to_string(),
+                    tool_schema_hash_hex: None,
+                    hooks_config_hash_hex: None,
+                    exec_target: Some("host".to_string()),
+                    planner_hash_hex: None,
+                }),
+            )
+            .expect("pending");
+        store.approve(&id, None, None).expect("approve");
+
+        let mut gate = TrustGate::new(
+            policy,
+            store,
+            AuditLog::new(audit),
+            TrustMode::On,
+            policy_hash,
+        );
+        let mut ctx = GateContext {
+            workdir: tmp.path().to_path_buf(),
+            allow_shell: true,
+            allow_write: false,
+            approval_mode: ApprovalMode::Interrupt,
+            auto_approve_scope: AutoApproveScope::Run,
+            unsafe_mode: false,
+            unsafe_bypass_allow_flags: false,
+            run_id: Some("r".to_string()),
+            enable_write_tools: false,
+            max_tool_output_bytes: 200_000,
+            max_read_bytes: 200_000,
+            provider: ProviderKind::Lmstudio,
+            model: "m".to_string(),
+            exec_target: ExecTargetKind::Host,
+            approval_key_version: ApprovalKeyVersion::V1,
+            tool_schema_hashes: BTreeMap::new(),
+            hooks_config_hash_hex: None,
+            planner_hash_hex: None,
+        };
+        assert!(matches!(
+            gate.decide(&ctx, &call),
+            GateDecision::RequireApproval { .. }
+        ));
+        ctx.approval_key_version = ApprovalKeyVersion::V2;
+        assert!(matches!(
+            gate.decide(&ctx, &call),
+            GateDecision::Allow { .. }
+        ));
     }
 }
