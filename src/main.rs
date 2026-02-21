@@ -6,6 +6,7 @@ mod gate;
 mod hooks;
 mod mcp;
 mod providers;
+mod session;
 mod store;
 mod tools;
 mod trust;
@@ -38,6 +39,9 @@ use providers::ollama::OllamaProvider;
 use providers::openai_compat::OpenAiCompatProvider;
 use providers::ModelProvider;
 use reqwest::Client;
+use session::{
+    settings_from_run, task_memory_message, CapsMode, ExplicitFlags, RunSettingInputs, SessionStore,
+};
 use store::{
     config_hash_hex, extract_session_messages, provider_to_string, resolve_state_paths,
     stable_path_string, ConfigFingerprintV1, RunCliConfig,
@@ -58,8 +62,59 @@ enum Commands {
     Approve(ApproveArgs),
     Deny(DenyArgs),
     Replay(ReplayArgs),
+    Session(SessionArgs),
     Eval(Box<EvalArgs>),
     Tui(TuiArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionMemorySubcommand {
+    Add {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        content: String,
+    },
+    List,
+    Show {
+        id: String,
+    },
+    Update {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        content: Option<String>,
+    },
+    Delete {
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionSubcommand {
+    Info,
+    Show {
+        #[arg(long, default_value_t = 20)]
+        last: usize,
+    },
+    Drop {
+        #[arg(long)]
+        from: Option<usize>,
+        #[arg(long)]
+        last: Option<usize>,
+    },
+    Reset,
+    Memory {
+        #[command(subcommand)]
+        command: SessionMemorySubcommand,
+    },
+}
+
+#[derive(Debug, Parser)]
+struct SessionArgs {
+    #[command(subcommand)]
+    command: SessionSubcommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -199,6 +254,8 @@ struct EvalArgs {
     no_session: bool,
     #[arg(long, default_value_t = 40)]
     max_session_messages: usize,
+    #[arg(long, default_value_t = false)]
+    use_session_settings: bool,
     #[arg(long, default_value_t = 0)]
     max_context_chars: usize,
     #[arg(long, value_enum, default_value_t = CompactionMode::Off)]
@@ -219,6 +276,8 @@ struct EvalArgs {
     hooks_max_stdout_bytes: usize,
     #[arg(long, value_enum, default_value_t = ToolArgsStrict::On)]
     tool_args_strict: ToolArgsStrict,
+    #[arg(long, value_enum, default_value_t = CapsMode::Off)]
+    caps: CapsMode,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     #[arg(long)]
@@ -315,6 +374,8 @@ struct RunArgs {
     reset_session: bool,
     #[arg(long, default_value_t = 40)]
     max_session_messages: usize,
+    #[arg(long, default_value_t = false)]
+    use_session_settings: bool,
     #[arg(long, default_value_t = 0)]
     max_context_chars: usize,
     #[arg(long, value_enum, default_value_t = CompactionMode::Off)]
@@ -335,6 +396,8 @@ struct RunArgs {
     hooks_max_stdout_bytes: usize,
     #[arg(long, value_enum, default_value_t = ToolArgsStrict::On)]
     tool_args_strict: ToolArgsStrict,
+    #[arg(long, value_enum, default_value_t = CapsMode::Off)]
+    caps: CapsMode,
     #[arg(long, default_value_t = false)]
     stream: bool,
     #[arg(long)]
@@ -503,6 +566,17 @@ async fn main() -> anyhow::Result<()> {
                     ));
                 }
             }
+        }
+        Some(Commands::Session(args)) => {
+            if cli.run.no_session {
+                return Err(anyhow!(
+                    "session commands require sessions enabled (remove --no-session)"
+                ));
+            }
+            let session_path = paths.sessions_dir.join(format!("{}.json", cli.run.session));
+            let store = SessionStore::new(session_path, cli.run.session.clone());
+            handle_session_command(&store, &args.command)?;
+            return Ok(());
         }
         Some(Commands::Eval(args)) => {
             if args.no_limits && !args.unsafe_mode {
@@ -733,13 +807,40 @@ async fn run_agent<P: ModelProvider>(
     let gate = gate_build.gate;
 
     let session_path = paths.sessions_dir.join(format!("{}.json", args.session));
+    let session_store = SessionStore::new(session_path.clone(), args.session.clone());
     if !args.no_session && args.reset_session {
-        store::reset_session(&session_path)?;
+        session_store.reset()?;
     }
+    let mut session_data = if args.no_session {
+        session::SessionData::empty(&args.session)
+    } else {
+        session_store.load()?
+    };
+    let explicit_flags = parse_explicit_flags();
+    let resolved_settings = session::resolve_run_settings(
+        args.use_session_settings,
+        !args.no_session,
+        &session_data,
+        &explicit_flags,
+        RunSettingInputs {
+            max_context_chars: args.max_context_chars,
+            compaction_mode: args.compaction_mode,
+            compaction_keep_last: args.compaction_keep_last,
+            tool_result_persist: args.tool_result_persist,
+            tool_args_strict: args.tool_args_strict,
+            caps_mode: args.caps,
+            hooks_mode: args.hooks,
+        },
+    );
     let session_messages = if args.no_session {
         Vec::new()
     } else {
-        store::load_session(&session_path)?
+        session_data.messages.clone()
+    };
+    let task_memory = if args.no_session {
+        None
+    } else {
+        task_memory_message(&session_data.task_memory)
     };
 
     let mcp_config_path = resolved_mcp_config_path(args, &paths.state_dir);
@@ -762,7 +863,7 @@ async fn run_agent<P: ModelProvider>(
     }
     let hooks_config_path = resolved_hooks_config_path(args, &paths.state_dir);
     let hook_manager = HookManager::build(HookRuntimeConfig {
-        mode: args.hooks,
+        mode: resolved_settings.hooks_mode,
         config_path: hooks_config_path.clone(),
         strict: args.hooks_strict,
         timeout_ms: args.hooks_timeout_ms,
@@ -797,7 +898,7 @@ async fn run_agent<P: ModelProvider>(
                 args.max_read_bytes
             },
             unsafe_bypass_allow_flags: args.unsafe_bypass_allow_flags,
-            tool_args_strict: args.tool_args_strict,
+            tool_args_strict: resolved_settings.tool_args_strict,
         },
         gate,
         gate_ctx,
@@ -805,10 +906,10 @@ async fn run_agent<P: ModelProvider>(
         stream: args.stream,
         event_sink: None,
         compaction_settings: CompactionSettings {
-            max_context_chars: args.max_context_chars,
-            mode: args.compaction_mode,
-            keep_last: args.compaction_keep_last,
-            tool_result_persist: args.tool_result_persist,
+            max_context_chars: resolved_settings.max_context_chars,
+            mode: resolved_settings.compaction_mode,
+            keep_last: resolved_settings.compaction_keep_last,
+            tool_result_persist: resolved_settings.tool_result_persist,
         },
         hooks: hook_manager,
         policy_loaded: policy_loaded_info,
@@ -828,7 +929,7 @@ async fn run_agent<P: ModelProvider>(
             max_log_lines: args.tui_max_log_lines,
             provider: provider_to_string(provider_kind),
             model: model.to_string(),
-            caps_source: "off".to_string(),
+            caps_source: format!("{:?}", resolved_settings.caps_mode).to_lowercase(),
             policy_hash: policy_hash_hex.clone().unwrap_or_default(),
         };
         Some(std::thread::spawn(move || {
@@ -840,7 +941,7 @@ async fn run_agent<P: ModelProvider>(
     agent.event_sink = build_event_sink(args.stream, args.events.as_deref(), args.tui, ui_tx)?;
 
     let outcome = tokio::select! {
-        out = agent.run(prompt, session_messages) => out,
+        out = agent.run(prompt, session_messages, task_memory) => out,
         _ = tokio::signal::ctrl_c() => {
             agent::AgentOutcome {
                 run_id: uuid::Uuid::new_v4().to_string(),
@@ -853,10 +954,10 @@ async fn run_agent<P: ModelProvider>(
                 tool_calls: Vec::new(),
                 tool_decisions: Vec::new(),
                 compaction_settings: CompactionSettings {
-                    max_context_chars: args.max_context_chars,
-                    mode: args.compaction_mode,
-                    keep_last: args.compaction_keep_last,
-                    tool_result_persist: args.tool_result_persist,
+                    max_context_chars: resolved_settings.max_context_chars,
+                    mode: resolved_settings.compaction_mode,
+                    keep_last: resolved_settings.compaction_keep_last,
+                    tool_result_persist: resolved_settings.tool_result_persist,
                 },
                 final_prompt_size_chars: 0,
                 compaction_report: None,
@@ -877,10 +978,10 @@ async fn run_agent<P: ModelProvider>(
                 tool_calls: Vec::new(),
                 tool_decisions: Vec::new(),
                 compaction_settings: CompactionSettings {
-                    max_context_chars: args.max_context_chars,
-                    mode: args.compaction_mode,
-                    keep_last: args.compaction_keep_last,
-                    tool_result_persist: args.tool_result_persist,
+                    max_context_chars: resolved_settings.max_context_chars,
+                    mode: resolved_settings.compaction_mode,
+                    keep_last: resolved_settings.compaction_keep_last,
+                    tool_result_persist: resolved_settings.tool_result_persist,
                 },
                 final_prompt_size_chars: 0,
                 compaction_report: None,
@@ -907,10 +1008,9 @@ async fn run_agent<P: ModelProvider>(
         }
     }
     if !args.no_session {
-        let session_messages = extract_session_messages(&outcome.messages);
-        if let Err(e) =
-            store::save_session(&session_path, &session_messages, args.max_session_messages)
-        {
+        session_data.messages = extract_session_messages(&outcome.messages);
+        session_data.settings = settings_from_run(&resolved_settings);
+        if let Err(e) = session_store.save(&session_data, args.max_session_messages) {
             eprintln!("WARN: failed to save session: {e}");
         }
     }
@@ -932,16 +1032,19 @@ async fn run_agent<P: ModelProvider>(
         unsafe_bypass_allow_flags: args.unsafe_bypass_allow_flags,
         stream: args.stream,
         events_path: args.events.as_ref().map(|p| p.display().to_string()),
-        max_context_chars: args.max_context_chars,
-        compaction_mode: format!("{:?}", args.compaction_mode).to_lowercase(),
-        compaction_keep_last: args.compaction_keep_last,
-        tool_result_persist: format!("{:?}", args.tool_result_persist).to_lowercase(),
-        hooks_mode: format!("{:?}", args.hooks).to_lowercase(),
+        max_context_chars: resolved_settings.max_context_chars,
+        compaction_mode: format!("{:?}", resolved_settings.compaction_mode).to_lowercase(),
+        compaction_keep_last: resolved_settings.compaction_keep_last,
+        tool_result_persist: format!("{:?}", resolved_settings.tool_result_persist).to_lowercase(),
+        hooks_mode: format!("{:?}", resolved_settings.hooks_mode).to_lowercase(),
+        caps_mode: format!("{:?}", resolved_settings.caps_mode).to_lowercase(),
         hooks_config_path: stable_path_string(&hooks_config_path),
         hooks_strict: args.hooks_strict,
         hooks_timeout_ms: args.hooks_timeout_ms,
         hooks_max_stdout_bytes: args.hooks_max_stdout_bytes,
-        tool_args_strict: format!("{:?}", args.tool_args_strict).to_lowercase(),
+        tool_args_strict: format!("{:?}", resolved_settings.tool_args_strict).to_lowercase(),
+        use_session_settings: args.use_session_settings,
+        resolved_settings_source: resolved_settings.sources.clone(),
         http_max_retries: args.http_max_retries,
         http_timeout_ms: args.http_timeout_ms,
         http_connect_timeout_ms: args.http_connect_timeout_ms,
@@ -990,16 +1093,19 @@ async fn run_agent<P: ModelProvider>(
             .as_ref()
             .map(|p| stable_path_string(p))
             .unwrap_or_default(),
-        max_context_chars: args.max_context_chars,
-        compaction_mode: format!("{:?}", args.compaction_mode).to_lowercase(),
-        compaction_keep_last: args.compaction_keep_last,
-        tool_result_persist: format!("{:?}", args.tool_result_persist).to_lowercase(),
-        hooks_mode: format!("{:?}", args.hooks).to_lowercase(),
+        max_context_chars: resolved_settings.max_context_chars,
+        compaction_mode: format!("{:?}", resolved_settings.compaction_mode).to_lowercase(),
+        compaction_keep_last: resolved_settings.compaction_keep_last,
+        tool_result_persist: format!("{:?}", resolved_settings.tool_result_persist).to_lowercase(),
+        hooks_mode: format!("{:?}", resolved_settings.hooks_mode).to_lowercase(),
+        caps_mode: format!("{:?}", resolved_settings.caps_mode).to_lowercase(),
         hooks_config_path: stable_path_string(&hooks_config_path),
         hooks_strict: args.hooks_strict,
         hooks_timeout_ms: args.hooks_timeout_ms,
         hooks_max_stdout_bytes: args.hooks_max_stdout_bytes,
-        tool_args_strict: format!("{:?}", args.tool_args_strict).to_lowercase(),
+        tool_args_strict: format!("{:?}", resolved_settings.tool_args_strict).to_lowercase(),
+        use_session_settings: args.use_session_settings,
+        resolved_settings_source: resolved_settings.sources.clone(),
         http_max_retries: args.http_max_retries,
         http_timeout_ms: args.http_timeout_ms,
         http_connect_timeout_ms: args.http_connect_timeout_ms,
@@ -1499,6 +1605,105 @@ fn doctor_probe_urls(provider: ProviderKind, base_url: &str) -> Vec<String> {
         }
         ProviderKind::Ollama => vec![format!("{trimmed}/api/tags")],
     }
+}
+
+fn parse_explicit_flags() -> ExplicitFlags {
+    let mut out = ExplicitFlags::default();
+    for arg in std::env::args() {
+        if arg == "--max-context-chars" || arg.starts_with("--max-context-chars=") {
+            out.max_context_chars = true;
+        } else if arg == "--compaction-mode" || arg.starts_with("--compaction-mode=") {
+            out.compaction_mode = true;
+        } else if arg == "--compaction-keep-last" || arg.starts_with("--compaction-keep-last=") {
+            out.compaction_keep_last = true;
+        } else if arg == "--tool-result-persist" || arg.starts_with("--tool-result-persist=") {
+            out.tool_result_persist = true;
+        } else if arg == "--tool-args-strict" || arg.starts_with("--tool-args-strict=") {
+            out.tool_args_strict = true;
+        } else if arg == "--caps" || arg.starts_with("--caps=") {
+            out.caps_mode = true;
+        } else if arg == "--hooks" || arg.starts_with("--hooks=") {
+            out.hooks_mode = true;
+        }
+    }
+    out
+}
+
+fn handle_session_command(store: &SessionStore, cmd: &SessionSubcommand) -> anyhow::Result<()> {
+    match cmd {
+        SessionSubcommand::Info => {
+            let data = store.load()?;
+            println!(
+                "session={} messages={} memory={} updated_at={}",
+                data.name,
+                data.messages.len(),
+                data.task_memory.len(),
+                data.updated_at
+            );
+        }
+        SessionSubcommand::Show { last } => {
+            let data = store.load()?;
+            let len = data.messages.len();
+            let start = len.saturating_sub(*last);
+            for (idx, m) in data.messages.iter().enumerate().skip(start) {
+                let role = format!("{:?}", m.role).to_uppercase();
+                println!(
+                    "{} {}: {}",
+                    idx,
+                    role,
+                    m.content.clone().unwrap_or_default().replace('\n', " ")
+                );
+            }
+        }
+        SessionSubcommand::Drop { from, last } => match (from, last) {
+            (Some(i), None) => {
+                store.drop_from(*i)?;
+                println!("dropped messages from index {}", i);
+            }
+            (None, Some(n)) => {
+                store.drop_last(*n)?;
+                println!("dropped last {} messages", n);
+            }
+            _ => return Err(anyhow!("provide exactly one of --from or --last")),
+        },
+        SessionSubcommand::Reset => {
+            store.reset()?;
+            println!("session reset");
+        }
+        SessionSubcommand::Memory { command } => match command {
+            SessionMemorySubcommand::Add { title, content } => {
+                let id = store.add_memory(title, content)?;
+                println!("added memory {}", id);
+            }
+            SessionMemorySubcommand::List => {
+                let data = store.load()?;
+                let mut blocks = data.task_memory.clone();
+                blocks.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+                for b in blocks {
+                    println!("{}\t{}\t{}", b.id, b.title, b.updated_at);
+                }
+            }
+            SessionMemorySubcommand::Show { id } => {
+                let data = store.load()?;
+                let Some(b) = data.task_memory.iter().find(|m| m.id == *id) else {
+                    return Err(anyhow!("memory id not found: {}", id));
+                };
+                println!(
+                    "id={}\ntitle={}\ncreated_at={}\nupdated_at={}\ncontent={}",
+                    b.id, b.title, b.created_at, b.updated_at, b.content
+                );
+            }
+            SessionMemorySubcommand::Update { id, title, content } => {
+                store.update_memory(id, title.as_deref(), content.as_deref())?;
+                println!("updated memory {}", id);
+            }
+            SessionMemorySubcommand::Delete { id } => {
+                store.delete_memory(id)?;
+                println!("deleted memory {}", id);
+            }
+        },
+    }
+    Ok(())
 }
 
 #[cfg(test)]

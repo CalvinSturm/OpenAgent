@@ -6,6 +6,7 @@ pub mod gate;
 pub mod hooks;
 pub mod mcp;
 pub mod providers;
+pub mod session;
 pub mod store;
 pub mod tools;
 pub mod trust;

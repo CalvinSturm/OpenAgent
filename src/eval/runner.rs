@@ -659,7 +659,7 @@ async fn run_single(
         policy_loaded: policy_loaded_info,
     };
     let session_messages = Vec::new();
-    let outcome = agent.run(&task.prompt, session_messages).await;
+    let outcome = agent.run(&task.prompt, session_messages, None).await;
     let failures = evaluate_assertions(&task.assertions, workdir, &outcome);
     let passed = failures.is_empty() && matches!(outcome.exit_reason, AgentExitReason::Ok);
 
@@ -728,6 +728,7 @@ fn write_run_artifact_for_eval(
         compaction_keep_last: config.compaction_keep_last,
         tool_result_persist: format!("{:?}", config.tool_result_persist).to_lowercase(),
         hooks_mode: format!("{:?}", config.hooks_mode).to_lowercase(),
+        caps_mode: "off".to_string(),
         hooks_config_path: config
             .hooks_config
             .as_ref()
@@ -743,6 +744,8 @@ fn write_run_artifact_for_eval(
         hooks_timeout_ms: config.hooks_timeout_ms,
         hooks_max_stdout_bytes: config.hooks_max_stdout_bytes,
         tool_args_strict: format!("{:?}", config.tool_args_strict).to_lowercase(),
+        use_session_settings: false,
+        resolved_settings_source: std::collections::BTreeMap::new(),
         tui_enabled: config.tui_enabled,
         tui_refresh_ms: config.tui_refresh_ms,
         tui_max_log_lines: config.tui_max_log_lines,
@@ -792,6 +795,7 @@ fn write_run_artifact_for_eval(
         compaction_keep_last: config.compaction_keep_last,
         tool_result_persist: format!("{:?}", config.tool_result_persist).to_lowercase(),
         hooks_mode: format!("{:?}", config.hooks_mode).to_lowercase(),
+        caps_mode: "off".to_string(),
         hooks_config_path: config
             .hooks_config
             .as_ref()
@@ -801,6 +805,8 @@ fn write_run_artifact_for_eval(
         hooks_timeout_ms: config.hooks_timeout_ms,
         hooks_max_stdout_bytes: config.hooks_max_stdout_bytes,
         tool_args_strict: format!("{:?}", config.tool_args_strict).to_lowercase(),
+        use_session_settings: false,
+        resolved_settings_source: std::collections::BTreeMap::new(),
         tui_enabled: config.tui_enabled,
         tui_refresh_ms: config.tui_refresh_ms,
         tui_max_log_lines: config.tui_max_log_lines,

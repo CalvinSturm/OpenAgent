@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use hex::encode as hex_encode;
@@ -20,13 +21,6 @@ pub struct StatePaths {
     pub runs_dir: PathBuf,
     pub sessions_dir: PathBuf,
     pub using_legacy_dir: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionFile {
-    pub schema_version: String,
-    pub updated_at: String,
-    pub messages: Vec<Message>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,11 +88,15 @@ pub struct RunCliConfig {
     pub compaction_keep_last: usize,
     pub tool_result_persist: String,
     pub hooks_mode: String,
+    pub caps_mode: String,
     pub hooks_config_path: String,
     pub hooks_strict: bool,
     pub hooks_timeout_ms: u64,
     pub hooks_max_stdout_bytes: usize,
     pub tool_args_strict: String,
+    pub use_session_settings: bool,
+    #[serde(default)]
+    pub resolved_settings_source: BTreeMap<String, String>,
     pub tui_enabled: bool,
     pub tui_refresh_ms: u64,
     pub tui_max_log_lines: usize,
@@ -157,11 +155,14 @@ pub struct ConfigFingerprintV1 {
     pub compaction_keep_last: usize,
     pub tool_result_persist: String,
     pub hooks_mode: String,
+    pub caps_mode: String,
     pub hooks_config_path: String,
     pub hooks_strict: bool,
     pub hooks_timeout_ms: u64,
     pub hooks_max_stdout_bytes: usize,
     pub tool_args_strict: String,
+    pub use_session_settings: bool,
+    pub resolved_settings_source: BTreeMap<String, String>,
     pub tui_enabled: bool,
     pub tui_refresh_ms: u64,
     pub tui_max_log_lines: usize,
@@ -234,36 +235,6 @@ pub fn resolve_state_dir(workdir: &Path, state_dir_override: Option<PathBuf>) ->
 
 pub fn ensure_dir(path: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(path)?;
-    Ok(())
-}
-
-pub fn load_session(path: &Path) -> anyhow::Result<Vec<Message>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = std::fs::read_to_string(path)?;
-    let session: SessionFile = serde_json::from_str(&content)?;
-    Ok(session.messages)
-}
-
-pub fn save_session(path: &Path, messages: &[Message], max_messages: usize) -> anyhow::Result<()> {
-    let mut trimmed = messages.to_vec();
-    if trimmed.len() > max_messages {
-        let keep_from = trimmed.len() - max_messages;
-        trimmed = trimmed[keep_from..].to_vec();
-    }
-    let session = SessionFile {
-        schema_version: "openagent.session.v1".to_string(),
-        updated_at: crate::trust::now_rfc3339(),
-        messages: trimmed,
-    };
-    write_json_atomic(path, &session)
-}
-
-pub fn reset_session(path: &Path) -> anyhow::Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
     Ok(())
 }
 
@@ -387,6 +358,14 @@ pub fn extract_session_messages(messages: &[Message]) -> Vec<Message> {
             {
                 return None;
             }
+            if matches!(m.role, crate::types::Role::Developer)
+                && m.content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with(crate::session::TASK_MEMORY_HEADER)
+            {
+                return None;
+            }
             Some(m.clone())
         })
         .collect()
@@ -420,16 +399,18 @@ pub fn config_hash_hex(fingerprint: &ConfigFingerprintV1) -> anyhow::Result<Stri
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use tempfile::tempdir;
 
     use crate::compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
 
     use super::{
-        config_hash_hex, load_run_record, load_session, reset_session, resolve_state_dir,
-        save_session, sha256_hex, write_run_record, ConfigFingerprintV1, PolicyRecordInfo,
-        RunCliConfig,
+        config_hash_hex, load_run_record, resolve_state_dir, sha256_hex, write_run_record,
+        ConfigFingerprintV1, PolicyRecordInfo, RunCliConfig,
     };
     use crate::agent::{AgentExitReason, AgentOutcome};
+    use crate::session::SessionStore;
     use crate::types::{Message, Role};
 
     #[test]
@@ -467,6 +448,7 @@ mod tests {
     fn session_roundtrip_and_reset() {
         let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("session.json");
+        let store = SessionStore::new(path.clone(), "session".to_string());
         let msgs = vec![Message {
             role: Role::User,
             content: Some("hello".to_string()),
@@ -474,12 +456,48 @@ mod tests {
             tool_name: None,
             tool_calls: None,
         }];
-        save_session(&path, &msgs, 40).expect("save session");
-        let loaded = load_session(&path).expect("load session");
-        assert_eq!(loaded.len(), 1);
-        reset_session(&path).expect("reset");
-        let loaded = load_session(&path).expect("load after reset");
-        assert!(loaded.is_empty());
+        let mut data = store.load().expect("load");
+        data.messages = msgs;
+        store.save(&data, 40).expect("save session");
+        let loaded = store.load().expect("load session");
+        assert_eq!(loaded.messages.len(), 1);
+        store.reset().expect("reset");
+        let loaded = store.load().expect("load after reset");
+        assert!(loaded.messages.is_empty());
+    }
+
+    #[test]
+    fn extract_session_messages_skips_task_memory_block() {
+        let msgs = vec![
+            Message {
+                role: Role::System,
+                content: Some(
+                    "You are an agent that may call tools to gather information.".to_string(),
+                ),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+            Message {
+                role: Role::Developer,
+                content: Some(
+                    "TASK MEMORY (user-authored, authoritative)\n- [1] foo: bar".to_string(),
+                ),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+            Message {
+                role: Role::User,
+                content: Some("hi".to_string()),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+        ];
+        let out = super::extract_session_messages(&msgs);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].role, Role::User));
     }
 
     #[test]
@@ -538,11 +556,14 @@ mod tests {
                 compaction_keep_last: 20,
                 tool_result_persist: "digest".to_string(),
                 hooks_mode: "off".to_string(),
+                caps_mode: "off".to_string(),
                 hooks_config_path: String::new(),
                 hooks_strict: false,
                 hooks_timeout_ms: 2000,
                 hooks_max_stdout_bytes: 200_000,
                 tool_args_strict: "on".to_string(),
+                use_session_settings: false,
+                resolved_settings_source: BTreeMap::new(),
                 tui_enabled: false,
                 tui_refresh_ms: 50,
                 tui_max_log_lines: 200,
@@ -625,11 +646,14 @@ mod tests {
             compaction_keep_last: 20,
             tool_result_persist: "digest".to_string(),
             hooks_mode: "off".to_string(),
+            caps_mode: "off".to_string(),
             hooks_config_path: String::new(),
             hooks_strict: false,
             hooks_timeout_ms: 2000,
             hooks_max_stdout_bytes: 200_000,
             tool_args_strict: "on".to_string(),
+            use_session_settings: false,
+            resolved_settings_source: BTreeMap::new(),
             tui_enabled: false,
             tui_refresh_ms: 50,
             tui_max_log_lines: 200,

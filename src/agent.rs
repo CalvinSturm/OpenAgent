@@ -103,7 +103,12 @@ impl<P: ModelProvider> Agent<P> {
         }
     }
 
-    pub async fn run(&mut self, user_prompt: &str, session_messages: Vec<Message>) -> AgentOutcome {
+    pub async fn run(
+        &mut self,
+        user_prompt: &str,
+        session_messages: Vec<Message>,
+        task_memory_message: Option<Message>,
+    ) -> AgentOutcome {
         let run_id = Uuid::new_v4().to_string();
         self.gate_ctx.run_id = Some(run_id.clone());
         let started_at = crate::trust::now_rfc3339();
@@ -139,6 +144,9 @@ impl<P: ModelProvider> Agent<P> {
             tool_calls: None,
         }];
         messages.extend(session_messages);
+        if let Some(mem) = task_memory_message {
+            messages.push(mem);
+        }
         messages.push(Message {
             role: Role::User,
             content: Some(user_prompt.to_string()),
@@ -1159,7 +1167,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -1176,11 +1184,13 @@ mod tests {
     struct MockProvider {
         generate_calls: Arc<AtomicUsize>,
         stream_calls: Arc<AtomicUsize>,
+        seen_messages: Arc<Mutex<Vec<Message>>>,
     }
 
     #[async_trait]
     impl ModelProvider for MockProvider {
         async fn generate(&self, _req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            *self.seen_messages.lock().expect("lock") = _req.messages.clone();
             self.generate_calls.fetch_add(1, Ordering::SeqCst);
             Ok(GenerateResponse {
                 assistant: Message {
@@ -1215,6 +1225,7 @@ mod tests {
         let provider = MockProvider {
             generate_calls: generate_calls.clone(),
             stream_calls: stream_calls.clone(),
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
         };
         let mut agent = Agent {
             provider,
@@ -1265,10 +1276,87 @@ mod tests {
             .expect("hooks"),
             policy_loaded: None,
         };
-        let out = agent.run("hi", vec![]).await;
+        let out = agent.run("hi", vec![], None).await;
         assert_eq!(out.final_output, "done");
         assert_eq!(generate_calls.load(Ordering::SeqCst), 1);
         assert_eq!(stream_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn task_memory_message_is_injected_into_transcript() {
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let provider = MockProvider {
+            generate_calls: Arc::new(AtomicUsize::new(0)),
+            stream_calls: Arc::new(AtomicUsize::new(0)),
+            seen_messages: seen_messages.clone(),
+        };
+        let mut agent = Agent {
+            provider,
+            model: "m".to_string(),
+            tools: Vec::new(),
+            max_steps: 1,
+            tool_rt: ToolRuntime {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: None,
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+        };
+        let mem_msg = Message {
+            role: Role::Developer,
+            content: Some("TASK MEMORY (user-authored, authoritative)\n- [x] T: C".to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        };
+        let out = agent.run("hi", vec![], Some(mem_msg)).await;
+        assert!(out.messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("TASK MEMORY")));
+        assert!(seen_messages.lock().expect("lock").iter().any(|m| m
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("TASK MEMORY")));
     }
 
     #[test]
