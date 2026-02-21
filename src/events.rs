@@ -18,6 +18,7 @@ pub enum EventKind {
     ToolExecStart,
     ToolExecEnd,
     CompactionPerformed,
+    PolicyLoaded,
     HookStart,
     HookEnd,
     HookError,

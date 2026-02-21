@@ -102,6 +102,7 @@ mod tests {
             error: None,
             messages: Vec::<Message>::new(),
             tool_calls: Vec::new(),
+            tool_decisions: Vec::new(),
             compaction_settings: CompactionSettings {
                 max_context_chars: 0,
                 mode: CompactionMode::Off,

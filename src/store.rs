@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::agent::AgentOutcome;
 use crate::compaction::{CompactionReport, CompactionSettings};
 use crate::gate::TrustMode;
+use crate::trust::policy::McpAllowSummary;
 use crate::types::{Message, ToolCall};
 
 #[derive(Debug, Clone)]
@@ -35,9 +36,16 @@ pub struct RunRecord {
     pub resolved_paths: RunResolvedPaths,
     pub policy_source: String,
     pub policy_hash_hex: Option<String>,
+    pub policy_version: Option<u32>,
+    #[serde(default)]
+    pub includes_resolved: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_allowlist: Option<McpAllowSummary>,
     pub config_hash_hex: String,
     pub transcript: Vec<Message>,
     pub tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    pub tool_decisions: Vec<crate::agent::ToolDecisionRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<RunCompactionRecord>,
     #[serde(default)]
@@ -82,6 +90,11 @@ pub struct RunCliConfig {
     pub hooks_strict: bool,
     pub hooks_timeout_ms: u64,
     pub hooks_max_stdout_bytes: usize,
+    pub policy_version: Option<u32>,
+    #[serde(default)]
+    pub includes_resolved: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_allowlist: Option<McpAllowSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +141,9 @@ pub struct ConfigFingerprintV1 {
     pub hooks_strict: bool,
     pub hooks_timeout_ms: u64,
     pub hooks_max_stdout_bytes: usize,
+    pub policy_version: Option<u32>,
+    pub includes_resolved: Vec<String>,
+    pub mcp_allowlist: Option<McpAllowSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +152,15 @@ pub struct RunCompactionRecord {
     pub final_prompt_size_chars: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<CompactionReport>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicyRecordInfo {
+    pub source: String,
+    pub hash_hex: Option<String>,
+    pub version: Option<u32>,
+    pub includes_resolved: Vec<String>,
+    pub mcp_allowlist: Option<McpAllowSummary>,
 }
 
 pub fn resolve_state_paths(
@@ -214,8 +239,7 @@ pub fn reset_session(path: &Path) -> anyhow::Result<()> {
 pub fn write_run_record(
     paths: &StatePaths,
     cli: RunCliConfig,
-    policy_source: String,
-    policy_hash_hex: Option<String>,
+    policy: PolicyRecordInfo,
     config_hash_hex: String,
     outcome: &AgentOutcome,
 ) -> anyhow::Result<PathBuf> {
@@ -235,11 +259,15 @@ pub fn write_run_record(
             approvals_path: paths.approvals_path.display().to_string(),
             audit_path: paths.audit_path.display().to_string(),
         },
-        policy_source,
-        policy_hash_hex,
+        policy_source: policy.source,
+        policy_hash_hex: policy.hash_hex,
+        policy_version: policy.version,
+        includes_resolved: policy.includes_resolved,
+        mcp_allowlist: policy.mcp_allowlist,
         config_hash_hex,
         transcript: outcome.messages.clone(),
         tool_calls: outcome.tool_calls.clone(),
+        tool_decisions: outcome.tool_decisions.clone(),
         compaction: Some(RunCompactionRecord {
             settings: outcome.compaction_settings.clone(),
             final_prompt_size_chars: outcome.final_prompt_size_chars,
@@ -364,7 +392,8 @@ mod tests {
 
     use super::{
         config_hash_hex, load_run_record, load_session, reset_session, resolve_state_dir,
-        save_session, sha256_hex, write_run_record, ConfigFingerprintV1, RunCliConfig,
+        save_session, sha256_hex, write_run_record, ConfigFingerprintV1, PolicyRecordInfo,
+        RunCliConfig,
     };
     use crate::agent::{AgentExitReason, AgentOutcome};
     use crate::types::{Message, Role};
@@ -432,6 +461,7 @@ mod tests {
             error: None,
             messages: Vec::new(),
             tool_calls: Vec::new(),
+            tool_decisions: Vec::new(),
             compaction_settings: CompactionSettings {
                 max_context_chars: 0,
                 mode: CompactionMode::Off,
@@ -478,9 +508,17 @@ mod tests {
                 hooks_strict: false,
                 hooks_timeout_ms: 2000,
                 hooks_max_stdout_bytes: 200_000,
+                policy_version: None,
+                includes_resolved: Vec::new(),
+                mcp_allowlist: None,
             },
-            "none".to_string(),
-            None,
+            PolicyRecordInfo {
+                source: "none".to_string(),
+                hash_hex: None,
+                version: None,
+                includes_resolved: Vec::new(),
+                mcp_allowlist: None,
+            },
             "cfg_hash".to_string(),
             &outcome,
         )
@@ -546,6 +584,9 @@ mod tests {
             hooks_strict: false,
             hooks_timeout_ms: 2000,
             hooks_max_stdout_bytes: 200_000,
+            policy_version: None,
+            includes_resolved: Vec::new(),
+            mcp_allowlist: None,
         };
         let b = a.clone();
         let ha = config_hash_hex(&a).expect("hash a");

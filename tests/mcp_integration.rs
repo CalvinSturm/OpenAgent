@@ -105,5 +105,5 @@ rules:
     )
     .expect("parse policy");
     let d = policy.evaluate("mcp.playwright.browser_snapshot", &json!({}));
-    assert!(matches!(d, PolicyDecision::Allow));
+    assert!(matches!(d.decision, PolicyDecision::Allow));
 }

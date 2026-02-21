@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::mcp::registry::{
     doctor_server as mcp_doctor_server, list_servers as mcp_list_servers, McpRegistry,
 };
-use agent::{Agent, AgentExitReason};
+use agent::{Agent, AgentExitReason, PolicyLoadedInfo};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
@@ -42,13 +42,14 @@ use store::{
 use tools::{builtin_tools_enabled, ToolRuntime};
 use trust::approvals::ApprovalsStore;
 use trust::audit::AuditLog;
-use trust::policy::Policy;
+use trust::policy::{McpAllowSummary, Policy};
 
 #[derive(Debug, Subcommand)]
 enum Commands {
     Doctor(DoctorArgs),
     Mcp(McpArgs),
     Hooks(HooksArgs),
+    Policy(PolicyArgs),
     Approvals(ApprovalsArgs),
     Approve(ApproveArgs),
     Deny(DenyArgs),
@@ -78,6 +79,26 @@ enum HooksSubcommand {
 struct HooksArgs {
     #[command(subcommand)]
     command: HooksSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicySubcommand {
+    Doctor {
+        #[arg(long)]
+        policy: Option<PathBuf>,
+    },
+    PrintEffective {
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Parser)]
+struct PolicyArgs {
+    #[command(subcommand)]
+    command: PolicySubcommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -376,6 +397,26 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Some(Commands::Policy(args)) => match &args.command {
+            PolicySubcommand::Doctor { policy } => {
+                let policy_path = policy.clone().unwrap_or_else(|| paths.policy_path.clone());
+                match policy_doctor_output(&policy_path) {
+                    Ok(text) => {
+                        println!("{text}");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        println!("FAIL: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            PolicySubcommand::PrintEffective { policy, json } => {
+                let policy_path = policy.clone().unwrap_or_else(|| paths.policy_path.clone());
+                println!("{}", policy_effective_output(&policy_path, *json)?);
+                return Ok(());
+            }
+        },
         Some(Commands::Approvals(args)) => {
             handle_approvals_command(&paths.approvals_path, &args.command)?;
             return Ok(());
@@ -601,6 +642,20 @@ async fn run_agent<P: ModelProvider>(
     let gate_build = build_gate(args, paths)?;
     let policy_hash_hex = gate_build.policy_hash_hex.clone();
     let policy_source = gate_build.policy_source.to_string();
+    let policy_version = gate_build.policy_version;
+    let includes_resolved = gate_build.includes_resolved.clone();
+    let mcp_allowlist = gate_build.mcp_allowlist.clone();
+    let policy_loaded_info = policy_version.map(|version| PolicyLoadedInfo {
+        version,
+        rules_count: gate_build
+            .policy_for_exposure
+            .as_ref()
+            .map(Policy::rules_len)
+            .unwrap_or(0),
+        includes_count: includes_resolved.len(),
+        includes_resolved: includes_resolved.clone(),
+        mcp_allowlist: mcp_allowlist.clone(),
+    });
     let gate = gate_build.gate;
 
     let session_path = paths.sessions_dir.join(format!("{}.json", args.session));
@@ -625,7 +680,11 @@ async fn run_agent<P: ModelProvider>(
 
     let mut all_tools = builtin_tools_enabled(args.enable_write_tools);
     if let Some(reg) = &mcp_registry {
-        all_tools.extend(reg.tool_defs());
+        let mut mcp_defs = reg.tool_defs();
+        if let Some(policy) = &gate_build.policy_for_exposure {
+            mcp_defs.retain(|t| policy.mcp_tool_allowed(&t.name).is_ok());
+        }
+        all_tools.extend(mcp_defs);
     }
     let hooks_config_path = resolved_hooks_config_path(args, &paths.state_dir);
     let hook_manager = HookManager::build(HookRuntimeConfig {
@@ -669,6 +728,7 @@ async fn run_agent<P: ModelProvider>(
             tool_result_persist: args.tool_result_persist,
         },
         hooks: hook_manager,
+        policy_loaded: policy_loaded_info,
     };
 
     let outcome = tokio::select! {
@@ -683,6 +743,7 @@ async fn run_agent<P: ModelProvider>(
                 error: Some("cancelled".to_string()),
                 messages: Vec::new(),
                 tool_calls: Vec::new(),
+                tool_decisions: Vec::new(),
                 compaction_settings: CompactionSettings {
                     max_context_chars: args.max_context_chars,
                     mode: args.compaction_mode,
@@ -742,6 +803,9 @@ async fn run_agent<P: ModelProvider>(
         hooks_strict: args.hooks_strict,
         hooks_timeout_ms: args.hooks_timeout_ms,
         hooks_max_stdout_bytes: args.hooks_max_stdout_bytes,
+        policy_version,
+        includes_resolved: includes_resolved.clone(),
+        mcp_allowlist: mcp_allowlist.clone(),
     };
     let config_fingerprint = ConfigFingerprintV1 {
         schema_version: "openagent.confighash.v1".to_string(),
@@ -786,13 +850,21 @@ async fn run_agent<P: ModelProvider>(
         hooks_strict: args.hooks_strict,
         hooks_timeout_ms: args.hooks_timeout_ms,
         hooks_max_stdout_bytes: args.hooks_max_stdout_bytes,
+        policy_version,
+        includes_resolved: includes_resolved.clone(),
+        mcp_allowlist: mcp_allowlist.clone(),
     };
     let config_hash_hex = config_hash_hex(&config_fingerprint)?;
     if let Err(e) = store::write_run_record(
         paths,
         cli_config,
-        policy_source,
-        policy_hash_hex,
+        store::PolicyRecordInfo {
+            source: policy_source,
+            hash_hex: policy_hash_hex,
+            version: policy_version,
+            includes_resolved,
+            mcp_allowlist,
+        },
         config_hash_hex,
         &outcome,
     ) {
@@ -858,6 +930,34 @@ fn handle_hooks_list(path: &std::path::Path) -> anyhow::Result<()> {
         println!("{}\t{}\t{}", hook.cfg.name, stages, cmd);
     }
     Ok(())
+}
+
+fn policy_doctor_output(policy_path: &std::path::Path) -> anyhow::Result<String> {
+    let p = Policy::from_path(policy_path)?;
+    let mut out = format!(
+        "OK: policy loaded version={} rules={} includes={}",
+        p.version(),
+        p.rules_len(),
+        p.includes_resolved().len()
+    );
+    if let Some(mcp) = p.mcp_allowlist_summary() {
+        out.push_str(&format!(
+            "\nMCP allowlist: servers={} tools={}",
+            mcp.allow_servers.len(),
+            mcp.allow_tools.len()
+        ));
+    }
+    Ok(out)
+}
+
+fn policy_effective_output(policy_path: &std::path::Path, as_json: bool) -> anyhow::Result<String> {
+    let p = Policy::from_path(policy_path)?;
+    let effective = p.to_effective_policy();
+    if as_json {
+        Ok(serde_json::to_string_pretty(&effective)?)
+    } else {
+        Ok(serde_yaml::to_string(&effective)?)
+    }
 }
 
 async fn handle_hooks_doctor(
@@ -965,6 +1065,10 @@ struct GateBuild {
     gate: Box<dyn ToolGate>,
     policy_hash_hex: Option<String>,
     policy_source: &'static str,
+    policy_for_exposure: Option<Policy>,
+    policy_version: Option<u32>,
+    includes_resolved: Vec<String>,
+    mcp_allowlist: Option<McpAllowSummary>,
 }
 
 fn build_gate(args: &RunArgs, paths: &store::StatePaths) -> anyhow::Result<GateBuild> {
@@ -973,6 +1077,10 @@ fn build_gate(args: &RunArgs, paths: &store::StatePaths) -> anyhow::Result<GateB
             gate: Box::new(NoGate::new()),
             policy_hash_hex: None,
             policy_source: "none",
+            policy_for_exposure: None,
+            policy_version: None,
+            includes_resolved: Vec::new(),
+            mcp_allowlist: None,
         }),
         TrustMode::Auto => {
             if !paths.policy_path.exists() {
@@ -980,6 +1088,10 @@ fn build_gate(args: &RunArgs, paths: &store::StatePaths) -> anyhow::Result<GateB
                     gate: Box::new(NoGate::new()),
                     policy_hash_hex: None,
                     policy_source: "none",
+                    policy_for_exposure: None,
+                    policy_version: None,
+                    includes_resolved: Vec::new(),
+                    mcp_allowlist: None,
                 });
             }
             let policy_bytes = std::fs::read(&paths.policy_path).with_context(|| {
@@ -988,17 +1100,19 @@ fn build_gate(args: &RunArgs, paths: &store::StatePaths) -> anyhow::Result<GateB
                     paths.policy_path.display()
                 )
             })?;
-            let policy_text = String::from_utf8_lossy(&policy_bytes).to_string();
-            let policy = Policy::from_yaml(&policy_text).with_context(|| {
+            let policy = Policy::from_path(&paths.policy_path).with_context(|| {
                 format!(
                     "failed parsing policy file: {}",
                     paths.policy_path.display()
                 )
             })?;
             let policy_hash_hex = compute_policy_hash_hex(&policy_bytes);
+            let policy_version = policy.version();
+            let includes_resolved = policy.includes_resolved().to_vec();
+            let mcp_allowlist = policy.mcp_allowlist_summary();
             Ok(GateBuild {
                 gate: Box::new(TrustGate::new(
-                    policy,
+                    policy.clone(),
                     ApprovalsStore::new(paths.approvals_path.clone()),
                     AuditLog::new(paths.audit_path.clone()),
                     TrustMode::Auto,
@@ -1006,6 +1120,10 @@ fn build_gate(args: &RunArgs, paths: &store::StatePaths) -> anyhow::Result<GateB
                 )),
                 policy_hash_hex: Some(policy_hash_hex),
                 policy_source: "file",
+                policy_for_exposure: Some(policy),
+                policy_version: Some(policy_version),
+                includes_resolved,
+                mcp_allowlist,
             })
         }
         TrustMode::On => {
@@ -1016,8 +1134,7 @@ fn build_gate(args: &RunArgs, paths: &store::StatePaths) -> anyhow::Result<GateB
                         paths.policy_path.display()
                     )
                 })?;
-                let policy_text = String::from_utf8_lossy(&policy_bytes).to_string();
-                let policy = Policy::from_yaml(&policy_text).with_context(|| {
+                let policy = Policy::from_path(&paths.policy_path).with_context(|| {
                     format!(
                         "failed parsing policy file: {}",
                         paths.policy_path.display()
@@ -1032,9 +1149,12 @@ fn build_gate(args: &RunArgs, paths: &store::StatePaths) -> anyhow::Result<GateB
                     "default",
                 )
             };
+            let policy_version = policy.version();
+            let includes_resolved = policy.includes_resolved().to_vec();
+            let mcp_allowlist = policy.mcp_allowlist_summary();
             Ok(GateBuild {
                 gate: Box::new(TrustGate::new(
-                    policy,
+                    policy.clone(),
                     ApprovalsStore::new(paths.approvals_path.clone()),
                     AuditLog::new(paths.audit_path.clone()),
                     TrustMode::On,
@@ -1042,6 +1162,10 @@ fn build_gate(args: &RunArgs, paths: &store::StatePaths) -> anyhow::Result<GateB
                 )),
                 policy_hash_hex: Some(policy_hash_hex),
                 policy_source,
+                policy_for_exposure: Some(policy),
+                policy_version: Some(policy_version),
+                includes_resolved,
+                mcp_allowlist,
             })
         }
     }
@@ -1186,12 +1310,54 @@ fn doctor_probe_urls(provider: ProviderKind, base_url: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{doctor_probe_urls, ProviderKind};
+    use tempfile::tempdir;
+
+    use super::{doctor_probe_urls, policy_doctor_output, policy_effective_output, ProviderKind};
 
     #[test]
     fn doctor_url_construction_openai_compat() {
         let urls = doctor_probe_urls(ProviderKind::Lmstudio, "http://localhost:1234/v1/");
         assert_eq!(urls[0], "http://localhost:1234/v1/models");
         assert_eq!(urls[1], "http://localhost:1234/v1");
+    }
+
+    #[test]
+    fn policy_doctor_helper_works() {
+        let tmp = tempdir().expect("tmp");
+        let p = tmp.path().join("policy.yaml");
+        std::fs::write(
+            &p,
+            r#"
+version: 2
+default: deny
+rules:
+  - tool: "read_file"
+    decision: allow
+"#,
+        )
+        .expect("write");
+        let out = policy_doctor_output(&p).expect("doctor");
+        assert!(out.contains("version=2"));
+        assert!(out.contains("rules=1"));
+    }
+
+    #[test]
+    fn policy_effective_helper_json_contains_rules() {
+        let tmp = tempdir().expect("tmp");
+        let p = tmp.path().join("policy.yaml");
+        std::fs::write(
+            &p,
+            r#"
+version: 2
+default: deny
+rules:
+  - tool: "read_file"
+    decision: allow
+"#,
+        )
+        .expect("write");
+        let out = policy_effective_output(&p, true).expect("print");
+        assert!(out.contains("\"rules\""));
+        assert!(out.contains("read_file"));
     }
 }

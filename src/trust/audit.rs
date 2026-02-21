@@ -23,6 +23,8 @@ pub struct AuditEvent {
     pub tool: String,
     pub arguments: Value,
     pub decision: String,
+    pub decision_reason: Option<String>,
+    pub decision_source: Option<String>,
     pub approval_id: Option<String>,
     pub approval_key: Option<String>,
     pub approval_mode: Option<String>,

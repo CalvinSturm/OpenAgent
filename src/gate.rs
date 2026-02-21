@@ -44,15 +44,19 @@ pub enum GateDecision {
     Allow {
         approval_id: Option<String>,
         approval_key: Option<String>,
+        reason: Option<String>,
+        source: Option<String>,
     },
     Deny {
         reason: String,
         approval_key: Option<String>,
+        source: Option<String>,
     },
     RequireApproval {
         reason: String,
         approval_id: String,
         approval_key: Option<String>,
+        source: Option<String>,
     },
 }
 
@@ -82,6 +86,8 @@ pub struct GateEvent {
     pub tool: String,
     pub arguments: Value,
     pub decision: String,
+    pub decision_reason: Option<String>,
+    pub decision_source: Option<String>,
     pub approval_id: Option<String>,
     pub approval_key: Option<String>,
     pub approval_mode: Option<String>,
@@ -119,6 +125,8 @@ impl ToolGate for NoGate {
         GateDecision::Allow {
             approval_id: None,
             approval_key: None,
+            reason: None,
+            source: None,
         }
     }
 
@@ -166,6 +174,7 @@ impl ToolGate for TrustGate {
             return GateDecision::Deny {
                 reason: "shell requires --allow-shell".to_string(),
                 approval_key: Some(approval_key),
+                source: Some("hard_gate".to_string()),
             };
         }
         if (call.name == "write_file" || call.name == "apply_patch")
@@ -175,17 +184,32 @@ impl ToolGate for TrustGate {
             return GateDecision::Deny {
                 reason: "writes require --allow-write".to_string(),
                 approval_key: Some(approval_key),
+                source: Some("hard_gate".to_string()),
             };
         }
 
-        match self.policy.evaluate(&call.name, &call.arguments) {
+        if let Err(reason) = self.policy.mcp_tool_allowed(&call.name) {
+            return GateDecision::Deny {
+                reason,
+                approval_key: Some(approval_key),
+                source: Some("mcp_allowlist".to_string()),
+            };
+        }
+
+        let eval = self.policy.evaluate(&call.name, &call.arguments);
+        match eval.decision {
             PolicyDecision::Allow => GateDecision::Allow {
                 approval_id: None,
                 approval_key: Some(approval_key),
+                reason: eval.reason,
+                source: eval.source,
             },
             PolicyDecision::Deny => GateDecision::Deny {
-                reason: format!("policy denied tool '{}'", call.name),
+                reason: eval
+                    .reason
+                    .unwrap_or_else(|| format!("policy denied tool '{}'", call.name)),
                 approval_key: Some(approval_key),
+                source: eval.source,
             },
             PolicyDecision::RequireApproval => {
                 if matches!(ctx.approval_mode, ApprovalMode::Auto) {
@@ -197,6 +221,8 @@ impl ToolGate for TrustGate {
                                 call.id
                             )),
                             approval_key: Some(approval_key),
+                            reason: eval.reason.clone(),
+                            source: eval.source.clone(),
                         },
                         AutoApproveScope::Session => {
                             match self.approvals.ensure_approved_for_key(
@@ -207,10 +233,13 @@ impl ToolGate for TrustGate {
                                 Ok(id) => GateDecision::Allow {
                                     approval_id: Some(id),
                                     approval_key: Some(approval_key),
+                                    reason: eval.reason.clone(),
+                                    source: eval.source.clone(),
                                 },
                                 Err(e) => GateDecision::Deny {
                                     reason: format!("failed to auto-approve: {e}"),
                                     approval_key: Some(approval_key),
+                                    source: eval.source.clone(),
                                 },
                             }
                         }
@@ -221,6 +250,8 @@ impl ToolGate for TrustGate {
                     Ok(Some(usage)) => GateDecision::Allow {
                         approval_id: Some(usage.id),
                         approval_key: Some(usage.approval_key),
+                        reason: eval.reason.clone(),
+                        source: eval.source.clone(),
                     },
                     Ok(None) => match self.approvals.find_matching_decision(&approval_key) {
                         Ok(Some(ApprovalDecisionMatch {
@@ -229,14 +260,19 @@ impl ToolGate for TrustGate {
                         })) => GateDecision::Deny {
                             reason: format!("approval denied: {id}"),
                             approval_key: Some(approval_key),
+                            source: eval.source.clone(),
                         },
                         Ok(Some(ApprovalDecisionMatch {
                             id,
                             status: ApprovalStatus::Pending,
                         })) => GateDecision::RequireApproval {
-                            reason: format!("approval pending: {id}"),
+                            reason: eval
+                                .reason
+                                .clone()
+                                .unwrap_or_else(|| format!("approval pending: {id}")),
                             approval_id: id,
                             approval_key: Some(approval_key),
+                            source: eval.source.clone(),
                         },
                         Ok(None) => {
                             match self.approvals.create_pending(
@@ -245,28 +281,34 @@ impl ToolGate for TrustGate {
                                 Some(approval_key.clone()),
                             ) {
                                 Ok(id) => GateDecision::RequireApproval {
-                                    reason: if matches!(ctx.approval_mode, ApprovalMode::Fail) {
-                                        format!("approval required (fail mode): {id}")
-                                    } else {
-                                        format!("approval required: {id}")
-                                    },
+                                    reason: eval.reason.clone().unwrap_or_else(|| {
+                                        if matches!(ctx.approval_mode, ApprovalMode::Fail) {
+                                            format!("approval required (fail mode): {id}")
+                                        } else {
+                                            format!("approval required: {id}")
+                                        }
+                                    }),
                                     approval_id: id,
                                     approval_key: Some(approval_key),
+                                    source: eval.source.clone(),
                                 },
                                 Err(e) => GateDecision::Deny {
                                     reason: format!("failed to create approval request: {e}"),
                                     approval_key: Some(approval_key),
+                                    source: eval.source.clone(),
                                 },
                             }
                         }
                         Err(e) => GateDecision::Deny {
                             reason: format!("failed to read approvals store: {e}"),
                             approval_key: Some(approval_key),
+                            source: eval.source.clone(),
                         },
                     },
                     Err(e) => GateDecision::Deny {
                         reason: format!("failed to read approvals store: {e}"),
                         approval_key: Some(approval_key),
+                        source: eval.source,
                     },
                 }
             }
@@ -282,6 +324,8 @@ impl ToolGate for TrustGate {
             tool: event.tool,
             arguments: event.arguments,
             decision: event.decision,
+            decision_reason: event.decision_reason,
+            decision_source: event.decision_source,
             approval_id: event.approval_id,
             approval_key: event.approval_key,
             approval_mode: event.approval_mode,

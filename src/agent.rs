@@ -10,6 +10,7 @@ use crate::hooks::runner::{make_pre_model_input, make_tool_result_input, HookMan
 use crate::mcp::registry::McpRegistry;
 use crate::providers::{ModelProvider, StreamDelta};
 use crate::tools::{execute_tool, ToolRuntime};
+use crate::trust::policy::McpAllowSummary;
 use crate::types::{GenerateRequest, Message, Role, ToolCall, ToolDef};
 
 #[derive(Debug, Clone, Copy)]
@@ -47,10 +48,30 @@ pub struct AgentOutcome {
     pub error: Option<String>,
     pub messages: Vec<Message>,
     pub tool_calls: Vec<ToolCall>,
+    pub tool_decisions: Vec<ToolDecisionRecord>,
     pub compaction_settings: CompactionSettings,
     pub final_prompt_size_chars: usize,
     pub compaction_report: Option<CompactionReport>,
     pub hook_invocations: Vec<HookInvocationReport>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolDecisionRecord {
+    pub step: u32,
+    pub tool_call_id: String,
+    pub tool: String,
+    pub decision: String,
+    pub reason: Option<String>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PolicyLoadedInfo {
+    pub version: u32,
+    pub rules_count: usize,
+    pub includes_count: usize,
+    pub includes_resolved: Vec<String>,
+    pub mcp_allowlist: Option<McpAllowSummary>,
 }
 
 pub struct Agent<P: ModelProvider> {
@@ -66,6 +87,7 @@ pub struct Agent<P: ModelProvider> {
     pub event_sink: Option<Box<dyn EventSink>>,
     pub compaction_settings: CompactionSettings,
     pub hooks: HookManager,
+    pub policy_loaded: Option<PolicyLoadedInfo>,
 }
 
 impl<P: ModelProvider> Agent<P> {
@@ -87,6 +109,19 @@ impl<P: ModelProvider> Agent<P> {
             EventKind::RunStart,
             serde_json::json!({"model": self.model}),
         );
+        if let Some(policy) = &self.policy_loaded {
+            self.emit_event(
+                &run_id,
+                0,
+                EventKind::PolicyLoaded,
+                serde_json::json!({
+                    "version": policy.version,
+                    "rules_count": policy.rules_count,
+                    "includes_count": policy.includes_count,
+                    "mcp_allowlist": policy.mcp_allowlist
+                }),
+            );
+        }
         let mut messages = vec![Message {
             role: Role::System,
             content: Some(
@@ -109,6 +144,7 @@ impl<P: ModelProvider> Agent<P> {
         });
 
         let mut observed_tool_calls = Vec::new();
+        let mut observed_tool_decisions: Vec<ToolDecisionRecord> = Vec::new();
         let mut last_compaction_report: Option<CompactionReport> = None;
         let mut hook_invocations: Vec<HookInvocationReport> = Vec::new();
         for step in 0..self.max_steps {
@@ -136,6 +172,7 @@ impl<P: ModelProvider> Agent<P> {
                         error: Some(format!("compaction failed: {e}")),
                         messages,
                         tool_calls: observed_tool_calls,
+                        tool_decisions: observed_tool_decisions,
                         compaction_settings: self.compaction_settings.clone(),
                         final_prompt_size_chars: 0,
                         compaction_report: last_compaction_report,
@@ -191,6 +228,7 @@ impl<P: ModelProvider> Agent<P> {
                                 )),
                                 messages,
                                 tool_calls: observed_tool_calls,
+                                tool_decisions: observed_tool_decisions,
                                 compaction_settings: self.compaction_settings.clone(),
                                 final_prompt_size_chars: 0,
                                 compaction_report: last_compaction_report,
@@ -242,6 +280,7 @@ impl<P: ModelProvider> Agent<P> {
                                 error: Some(reason),
                                 messages,
                                 tool_calls: observed_tool_calls,
+                                tool_decisions: observed_tool_decisions,
                                 compaction_settings: self.compaction_settings.clone(),
                                 final_prompt_size_chars: prompt_chars,
                                 compaction_report: last_compaction_report,
@@ -291,6 +330,7 @@ impl<P: ModelProvider> Agent<P> {
                                                 ),
                                                 messages,
                                                 tool_calls: observed_tool_calls,
+                                                tool_decisions: observed_tool_decisions,
                                                 compaction_settings: self
                                                     .compaction_settings
                                                     .clone(),
@@ -311,6 +351,7 @@ impl<P: ModelProvider> Agent<P> {
                                             error: Some(e),
                                             messages,
                                             tool_calls: observed_tool_calls,
+                                            tool_decisions: observed_tool_decisions,
                                             compaction_settings: self.compaction_settings.clone(),
                                             final_prompt_size_chars: prompt_chars,
                                             compaction_report: last_compaction_report,
@@ -338,6 +379,7 @@ impl<P: ModelProvider> Agent<P> {
                             error: Some(e.message),
                             messages,
                             tool_calls: observed_tool_calls,
+                            tool_decisions: observed_tool_decisions,
                             compaction_settings: self.compaction_settings.clone(),
                             final_prompt_size_chars: prompt_chars,
                             compaction_report: last_compaction_report,
@@ -431,6 +473,7 @@ impl<P: ModelProvider> Agent<P> {
                         error: Some(e.to_string()),
                         messages,
                         tool_calls: observed_tool_calls,
+                        tool_decisions: observed_tool_decisions,
                         compaction_settings: self.compaction_settings.clone(),
                         final_prompt_size_chars: request_context_chars,
                         compaction_report: last_compaction_report,
@@ -462,6 +505,7 @@ impl<P: ModelProvider> Agent<P> {
                     error: None,
                     messages,
                     tool_calls: observed_tool_calls,
+                    tool_decisions: observed_tool_decisions,
                     compaction_settings: self.compaction_settings.clone(),
                     final_prompt_size_chars: request_context_chars,
                     compaction_report: last_compaction_report,
@@ -498,6 +542,8 @@ impl<P: ModelProvider> Agent<P> {
                     GateDecision::Allow {
                         approval_id,
                         approval_key,
+                        reason,
+                        source,
                     } => {
                         self.emit_event(
                             &run_id,
@@ -508,7 +554,9 @@ impl<P: ModelProvider> Agent<P> {
                                 "name": tc.name,
                                 "decision": "allow",
                                 "approval_id": approval_id.clone(),
-                                "approval_key": approval_key.clone()
+                                "approval_key": approval_key.clone(),
+                                "reason": reason.clone(),
+                                "source": source.clone()
                             }),
                         );
                         self.emit_event(
@@ -586,6 +634,7 @@ impl<P: ModelProvider> Agent<P> {
                                             )),
                                             messages,
                                             tool_calls: observed_tool_calls,
+                                            tool_decisions: observed_tool_decisions,
                                             compaction_settings: self.compaction_settings.clone(),
                                             final_prompt_size_chars: request_context_chars,
                                             compaction_report: last_compaction_report,
@@ -641,6 +690,7 @@ impl<P: ModelProvider> Agent<P> {
                                             error: Some(reason),
                                             messages,
                                             tool_calls: observed_tool_calls,
+                                            tool_decisions: observed_tool_decisions,
                                             compaction_settings: self.compaction_settings.clone(),
                                             final_prompt_size_chars: request_context_chars,
                                             compaction_report: last_compaction_report,
@@ -670,6 +720,7 @@ impl<P: ModelProvider> Agent<P> {
                                         error: Some(e.message),
                                         messages,
                                         tool_calls: observed_tool_calls,
+                                        tool_decisions: observed_tool_decisions,
                                         compaction_settings: self.compaction_settings.clone(),
                                         final_prompt_size_chars: request_context_chars,
                                         compaction_report: last_compaction_report,
@@ -687,6 +738,8 @@ impl<P: ModelProvider> Agent<P> {
                             tool: tc.name.clone(),
                             arguments: tc.arguments.clone(),
                             decision: "allow".to_string(),
+                            decision_reason: reason.clone(),
+                            decision_source: source.clone(),
                             approval_id,
                             approval_key,
                             approval_mode: approval_mode_meta.clone(),
@@ -697,6 +750,14 @@ impl<P: ModelProvider> Agent<P> {
                             result_output_digest: Some(output_digest),
                             result_input_len: Some(input_len),
                             result_output_len: Some(output_len),
+                        });
+                        observed_tool_decisions.push(ToolDecisionRecord {
+                            step: step as u32,
+                            tool_call_id: tc.id.clone(),
+                            tool: tc.name.clone(),
+                            decision: "allow".to_string(),
+                            reason: reason.clone(),
+                            source: source.clone(),
                         });
                         self.emit_event(
                             &run_id,
@@ -714,6 +775,7 @@ impl<P: ModelProvider> Agent<P> {
                     GateDecision::Deny {
                         reason,
                         approval_key,
+                        source,
                     } => {
                         self.emit_event(
                             &run_id,
@@ -724,7 +786,8 @@ impl<P: ModelProvider> Agent<P> {
                                 "name": tc.name,
                                 "decision": "deny",
                                 "reason": reason.clone(),
-                                "approval_key": approval_key.clone()
+                                "approval_key": approval_key.clone(),
+                                "source": source.clone()
                             }),
                         );
                         self.gate.record(GateEvent {
@@ -734,6 +797,8 @@ impl<P: ModelProvider> Agent<P> {
                             tool: tc.name.clone(),
                             arguments: tc.arguments.clone(),
                             decision: "deny".to_string(),
+                            decision_reason: Some(reason.clone()),
+                            decision_source: source.clone(),
                             approval_id: None,
                             approval_key,
                             approval_mode: approval_mode_meta.clone(),
@@ -744,6 +809,14 @@ impl<P: ModelProvider> Agent<P> {
                             result_output_digest: None,
                             result_input_len: None,
                             result_output_len: None,
+                        });
+                        observed_tool_decisions.push(ToolDecisionRecord {
+                            step: step as u32,
+                            tool_call_id: tc.id.clone(),
+                            tool: tc.name.clone(),
+                            decision: "deny".to_string(),
+                            reason: Some(reason.clone()),
+                            source: source.clone(),
                         });
                         self.emit_event(
                             &run_id,
@@ -756,10 +829,19 @@ impl<P: ModelProvider> Agent<P> {
                             started_at,
                             finished_at: crate::trust::now_rfc3339(),
                             exit_reason: AgentExitReason::Denied,
-                            final_output: format!("Tool call '{}' denied: {}", tc.name, reason),
+                            final_output: format!(
+                                "Tool call '{}' denied: {}",
+                                tc.name,
+                                if let Some(src) = &source {
+                                    format!("{} (source: {})", reason, src)
+                                } else {
+                                    reason.clone()
+                                }
+                            ),
                             error: None,
                             messages,
                             tool_calls: observed_tool_calls,
+                            tool_decisions: observed_tool_decisions,
                             compaction_settings: self.compaction_settings.clone(),
                             final_prompt_size_chars: request_context_chars,
                             compaction_report: last_compaction_report,
@@ -770,6 +852,7 @@ impl<P: ModelProvider> Agent<P> {
                         reason,
                         approval_id,
                         approval_key,
+                        source,
                     } => {
                         self.emit_event(
                             &run_id,
@@ -781,7 +864,8 @@ impl<P: ModelProvider> Agent<P> {
                                 "decision": "require_approval",
                                 "reason": reason.clone(),
                                 "approval_id": approval_id.clone(),
-                                "approval_key": approval_key.clone()
+                                "approval_key": approval_key.clone(),
+                                "source": source.clone()
                             }),
                         );
                         self.gate.record(GateEvent {
@@ -791,16 +875,26 @@ impl<P: ModelProvider> Agent<P> {
                             tool: tc.name.clone(),
                             arguments: tc.arguments.clone(),
                             decision: "require_approval".to_string(),
+                            decision_reason: Some(reason.clone()),
+                            decision_source: source.clone(),
                             approval_id: Some(approval_id.clone()),
                             approval_key,
                             approval_mode: approval_mode_meta.clone(),
                             auto_approve_scope: auto_scope_meta.clone(),
                             result_ok: false,
-                            result_content: reason,
+                            result_content: reason.clone(),
                             result_input_digest: None,
                             result_output_digest: None,
                             result_input_len: None,
                             result_output_len: None,
+                        });
+                        observed_tool_decisions.push(ToolDecisionRecord {
+                            step: step as u32,
+                            tool_call_id: tc.id.clone(),
+                            tool: tc.name.clone(),
+                            decision: "require_approval".to_string(),
+                            reason: Some(reason.clone()),
+                            source: source.clone(),
                         });
                         self.emit_event(
                             &run_id,
@@ -814,12 +908,19 @@ impl<P: ModelProvider> Agent<P> {
                             finished_at: crate::trust::now_rfc3339(),
                             exit_reason: AgentExitReason::ApprovalRequired,
                             final_output: format!(
-                                "Approval required: {}. Run: openagent approve {} (or deny) then re-run.",
-                                approval_id, approval_id
+                                "Approval required: {} ({}){}. Run: openagent approve {} (or deny) then re-run.",
+                                approval_id,
+                                reason,
+                                source
+                                    .as_ref()
+                                    .map(|s| format!(" [source: {}]", s))
+                                    .unwrap_or_default(),
+                                approval_id
                             ),
                             error: None,
                             messages,
                             tool_calls: observed_tool_calls,
+                            tool_decisions: observed_tool_decisions,
                             compaction_settings: self.compaction_settings.clone(),
                             final_prompt_size_chars: request_context_chars,
                             compaction_report: last_compaction_report,
@@ -846,6 +947,7 @@ impl<P: ModelProvider> Agent<P> {
             error: None,
             messages,
             tool_calls: observed_tool_calls,
+            tool_decisions: observed_tool_decisions,
             compaction_settings: self.compaction_settings.clone(),
             final_prompt_size_chars,
             compaction_report: last_compaction_report,
@@ -998,6 +1100,7 @@ mod tests {
                 max_stdout_bytes: 200_000,
             })
             .expect("hooks"),
+            policy_loaded: None,
         };
         let out = agent.run("hi", vec![]).await;
         assert_eq!(out.final_output, "done");

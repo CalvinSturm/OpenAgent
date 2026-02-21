@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent::{Agent, AgentExitReason, AgentOutcome};
+use crate::agent::{Agent, AgentExitReason, AgentOutcome, PolicyLoadedInfo};
 use crate::compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
 use crate::eval::assert::evaluate_assertions;
 use crate::eval::tasks::{tasks_for_pack, EvalPack, EvalTask, Fixture};
@@ -27,7 +27,7 @@ use crate::store::{
 use crate::tools::{builtin_tools_enabled, ToolRuntime};
 use crate::trust::approvals::ApprovalsStore;
 use crate::trust::audit::AuditLog;
-use crate::trust::policy::Policy;
+use crate::trust::policy::{McpAllowSummary, Policy};
 
 #[derive(Debug, Clone)]
 pub struct EvalConfig {
@@ -392,6 +392,7 @@ fn write_synthetic_error_artifact(
         error: Some(error),
         messages: Vec::new(),
         tool_calls: Vec::new(),
+        tool_decisions: Vec::new(),
         compaction_settings: CompactionSettings {
             max_context_chars: config.max_context_chars,
             mode: config.compaction_mode,
@@ -407,8 +408,13 @@ fn write_synthetic_error_artifact(
         state_paths,
         model,
         &outcome,
-        "none".to_string(),
-        None,
+        EvalPolicyMeta {
+            source: "none".to_string(),
+            hash_hex: None,
+            version: None,
+            includes_resolved: Vec::new(),
+            mcp_allowlist: None,
+        },
     );
 }
 
@@ -537,6 +543,20 @@ async fn run_single(
     let gate_build = build_gate(config.trust, state_paths)?;
     let policy_hash_hex = gate_build.policy_hash_hex.clone();
     let policy_source = gate_build.policy_source.to_string();
+    let policy_version = gate_build.policy_version;
+    let includes_resolved = gate_build.includes_resolved.clone();
+    let mcp_allowlist = gate_build.mcp_allowlist.clone();
+    let policy_loaded_info = policy_version.map(|version| PolicyLoadedInfo {
+        version,
+        rules_count: gate_build
+            .policy_for_exposure
+            .as_ref()
+            .map(Policy::rules_len)
+            .unwrap_or(0),
+        includes_count: includes_resolved.len(),
+        includes_resolved: includes_resolved.clone(),
+        mcp_allowlist: mcp_allowlist.clone(),
+    });
 
     let mcp_config_path = config
         .mcp_config
@@ -553,7 +573,11 @@ async fn run_single(
 
     let mut tools = builtin_tools_enabled(config.enable_write_tools);
     if let Some(reg) = &mcp_registry {
-        tools.extend(reg.tool_defs());
+        let mut mcp_defs = reg.tool_defs();
+        if let Some(policy) = &gate_build.policy_for_exposure {
+            mcp_defs.retain(|t| policy.mcp_tool_allowed(&t.name).is_ok());
+        }
+        tools.extend(mcp_defs);
     }
 
     let provider = make_provider(config.provider, &config.base_url, config.api_key.clone());
@@ -591,6 +615,7 @@ async fn run_single(
             timeout_ms: config.hooks_timeout_ms,
             max_stdout_bytes: config.hooks_max_stdout_bytes,
         })?,
+        policy_loaded: policy_loaded_info,
     };
     let session_messages = Vec::new();
     let outcome = agent.run(&task.prompt, session_messages).await;
@@ -602,8 +627,13 @@ async fn run_single(
         state_paths,
         model,
         &outcome,
-        policy_source,
-        policy_hash_hex,
+        EvalPolicyMeta {
+            source: policy_source,
+            hash_hex: policy_hash_hex,
+            version: policy_version,
+            includes_resolved,
+            mcp_allowlist,
+        },
     )?;
 
     Ok(EvalRunRow {
@@ -631,8 +661,7 @@ fn write_run_artifact_for_eval(
     state_paths: &StatePaths,
     model: &str,
     outcome: &AgentOutcome,
-    policy_source: String,
-    policy_hash_hex: Option<String>,
+    policy: EvalPolicyMeta,
 ) -> anyhow::Result<()> {
     let cli_config = RunCliConfig {
         provider: provider_to_string(config.provider),
@@ -670,6 +699,9 @@ fn write_run_artifact_for_eval(
         hooks_strict: config.hooks_strict,
         hooks_timeout_ms: config.hooks_timeout_ms,
         hooks_max_stdout_bytes: config.hooks_max_stdout_bytes,
+        policy_version: policy.version,
+        includes_resolved: policy.includes_resolved.clone(),
+        mcp_allowlist: policy.mcp_allowlist.clone(),
     };
     let fingerprint = ConfigFingerprintV1 {
         schema_version: "openagent.confighash.v1".to_string(),
@@ -714,13 +746,21 @@ fn write_run_artifact_for_eval(
         hooks_strict: config.hooks_strict,
         hooks_timeout_ms: config.hooks_timeout_ms,
         hooks_max_stdout_bytes: config.hooks_max_stdout_bytes,
+        policy_version: policy.version,
+        includes_resolved: policy.includes_resolved.clone(),
+        mcp_allowlist: policy.mcp_allowlist.clone(),
     };
     let cfg_hash = config_hash_hex(&fingerprint)?;
     let _ = crate::store::write_run_record(
         state_paths,
         cli_config,
-        policy_source,
-        policy_hash_hex,
+        crate::store::PolicyRecordInfo {
+            source: policy.source,
+            hash_hex: policy.hash_hex,
+            version: policy.version,
+            includes_resolved: policy.includes_resolved,
+            mcp_allowlist: policy.mcp_allowlist,
+        },
         cfg_hash,
         outcome,
     )?;
@@ -731,6 +771,19 @@ struct GateBuild {
     gate: Box<dyn ToolGate>,
     policy_hash_hex: Option<String>,
     policy_source: &'static str,
+    policy_for_exposure: Option<Policy>,
+    policy_version: Option<u32>,
+    includes_resolved: Vec<String>,
+    mcp_allowlist: Option<McpAllowSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct EvalPolicyMeta {
+    source: String,
+    hash_hex: Option<String>,
+    version: Option<u32>,
+    includes_resolved: Vec<String>,
+    mcp_allowlist: Option<McpAllowSummary>,
 }
 
 fn build_gate(trust: TrustMode, paths: &StatePaths) -> anyhow::Result<GateBuild> {
@@ -739,6 +792,10 @@ fn build_gate(trust: TrustMode, paths: &StatePaths) -> anyhow::Result<GateBuild>
             gate: Box::new(NoGate::new()),
             policy_hash_hex: None,
             policy_source: "none",
+            policy_for_exposure: None,
+            policy_version: None,
+            includes_resolved: Vec::new(),
+            mcp_allowlist: None,
         }),
         TrustMode::Auto => {
             if !paths.policy_path.exists() {
@@ -746,17 +803,23 @@ fn build_gate(trust: TrustMode, paths: &StatePaths) -> anyhow::Result<GateBuild>
                     gate: Box::new(NoGate::new()),
                     policy_hash_hex: None,
                     policy_source: "none",
+                    policy_for_exposure: None,
+                    policy_version: None,
+                    includes_resolved: Vec::new(),
+                    mcp_allowlist: None,
                 });
             }
             let bytes = std::fs::read(&paths.policy_path)?;
-            let policy =
-                Policy::from_yaml(&String::from_utf8_lossy(&bytes)).with_context(|| {
-                    format!("failed parsing policy {}", paths.policy_path.display())
-                })?;
+            let policy = Policy::from_path(&paths.policy_path).with_context(|| {
+                format!("failed parsing policy {}", paths.policy_path.display())
+            })?;
             let hash = compute_policy_hash_hex(&bytes);
+            let policy_version = policy.version();
+            let includes_resolved = policy.includes_resolved().to_vec();
+            let mcp_allowlist = policy.mcp_allowlist_summary();
             Ok(GateBuild {
                 gate: Box::new(TrustGate::new(
-                    policy,
+                    policy.clone(),
                     ApprovalsStore::new(paths.approvals_path.clone()),
                     AuditLog::new(paths.audit_path.clone()),
                     TrustMode::Auto,
@@ -764,15 +827,18 @@ fn build_gate(trust: TrustMode, paths: &StatePaths) -> anyhow::Result<GateBuild>
                 )),
                 policy_hash_hex: Some(hash),
                 policy_source: "file",
+                policy_for_exposure: Some(policy),
+                policy_version: Some(policy_version),
+                includes_resolved,
+                mcp_allowlist,
             })
         }
         TrustMode::On => {
             let (policy, hash, src) = if paths.policy_path.exists() {
                 let bytes = std::fs::read(&paths.policy_path)?;
-                let policy =
-                    Policy::from_yaml(&String::from_utf8_lossy(&bytes)).with_context(|| {
-                        format!("failed parsing policy {}", paths.policy_path.display())
-                    })?;
+                let policy = Policy::from_path(&paths.policy_path).with_context(|| {
+                    format!("failed parsing policy {}", paths.policy_path.display())
+                })?;
                 (policy, compute_policy_hash_hex(&bytes), "file")
             } else {
                 let repr = crate::trust::policy::safe_default_policy_repr();
@@ -782,9 +848,12 @@ fn build_gate(trust: TrustMode, paths: &StatePaths) -> anyhow::Result<GateBuild>
                     "default",
                 )
             };
+            let policy_version = policy.version();
+            let includes_resolved = policy.includes_resolved().to_vec();
+            let mcp_allowlist = policy.mcp_allowlist_summary();
             Ok(GateBuild {
                 gate: Box::new(TrustGate::new(
-                    policy,
+                    policy.clone(),
                     ApprovalsStore::new(paths.approvals_path.clone()),
                     AuditLog::new(paths.audit_path.clone()),
                     TrustMode::On,
@@ -792,6 +861,10 @@ fn build_gate(trust: TrustMode, paths: &StatePaths) -> anyhow::Result<GateBuild>
                 )),
                 policy_hash_hex: Some(hash),
                 policy_source: src,
+                policy_for_exposure: Some(policy),
+                policy_version: Some(policy_version),
+                includes_resolved,
+                mcp_allowlist,
             })
         }
     }
