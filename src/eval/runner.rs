@@ -19,6 +19,7 @@ use crate::gate::{
 use crate::hooks::config::HooksMode;
 use crate::hooks::runner::{HookManager, HookRuntimeConfig};
 use crate::mcp::registry::{list_servers, McpRegistry};
+use crate::planner::RunMode;
 use crate::providers::http::HttpConfig;
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::openai_compat::OpenAiCompatProvider;
@@ -78,6 +79,9 @@ pub struct EvalConfig {
     pub workdir_override: Option<PathBuf>,
     pub keep_workdir: bool,
     pub http: HttpConfig,
+    pub mode: RunMode,
+    pub planner_model: Option<String>,
+    pub worker_model: Option<String>,
     pub min_pass_rate: f64,
     pub fail_on_any: bool,
     pub max_avg_steps: Option<f64>,
@@ -145,6 +149,11 @@ pub struct EvalResultsConfig {
     pub http_stream_idle_timeout_ms: u64,
     pub http_max_response_bytes: usize,
     pub http_max_line_bytes: usize,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planner_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_profile_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,6 +210,9 @@ impl EvalResultsConfig {
             http_stream_idle_timeout_ms: 15_000,
             http_max_response_bytes: 10_000_000,
             http_max_line_bytes: 200_000,
+            mode: "single".to_string(),
+            planner_model: None,
+            worker_model: None,
             resolved_profile_name: None,
             resolved_profile_path: None,
             resolved_profile_hash_hex: None,
@@ -444,6 +456,9 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
             http_stream_idle_timeout_ms: config.http.stream_idle_timeout_ms,
             http_max_response_bytes: config.http.max_response_bytes,
             http_max_line_bytes: config.http.max_line_bytes,
+            mode: format!("{:?}", config.mode).to_lowercase(),
+            planner_model: config.planner_model.clone(),
+            worker_model: config.worker_model.clone(),
             resolved_profile_name: config.resolved_profile_name.clone(),
             resolved_profile_path: config.resolved_profile_path.clone(),
             resolved_profile_hash_hex: config.resolved_profile_hash_hex.clone(),
@@ -985,9 +1000,11 @@ async fn run_single(
             max_stdout_bytes: config.hooks_max_stdout_bytes,
         })?,
         policy_loaded: policy_loaded_info,
+        run_id_override: None,
+        omit_tools_field_when_empty: false,
     };
     let session_messages = Vec::new();
-    let outcome = agent.run(&prompt, session_messages, None).await;
+    let outcome = agent.run(&prompt, session_messages, Vec::new()).await;
     let wall_time_ms = run_started.elapsed().as_millis() as u64;
     let mut failures = evaluate_assertions(&task.assertions, workdir, &outcome);
     let verifier_started = std::time::Instant::now();
@@ -1085,9 +1102,15 @@ fn write_run_artifact_for_eval(
     policy: EvalPolicyMeta,
 ) -> anyhow::Result<()> {
     let cli_config = RunCliConfig {
+        mode: format!("{:?}", config.mode).to_lowercase(),
         provider: provider_to_string(config.provider),
         base_url: config.base_url.clone(),
         model: model.to_string(),
+        planner_model: config.planner_model.clone(),
+        worker_model: config.worker_model.clone(),
+        planner_max_steps: None,
+        planner_output: None,
+        planner_strict: None,
         trust_mode: format!("{:?}", config.trust).to_lowercase(),
         allow_shell: config.allow_shell,
         allow_write: config.allow_write,
@@ -1140,9 +1163,15 @@ fn write_run_artifact_for_eval(
     };
     let fingerprint = ConfigFingerprintV1 {
         schema_version: "openagent.confighash.v1".to_string(),
+        mode: format!("{:?}", config.mode).to_lowercase(),
         provider: provider_to_string(config.provider),
         base_url: config.base_url.clone(),
         model: model.to_string(),
+        planner_model: config.planner_model.clone().unwrap_or_default(),
+        worker_model: config.worker_model.clone().unwrap_or_default(),
+        planner_max_steps: 0,
+        planner_output: String::new(),
+        planner_strict: false,
         trust_mode: format!("{:?}", config.trust).to_lowercase(),
         state_dir: stable_path_string(&state_paths.state_dir),
         policy_path: stable_path_string(&state_paths.policy_path),
@@ -1216,6 +1245,12 @@ fn write_run_artifact_for_eval(
         },
         cfg_hash,
         outcome,
+        config.mode,
+        None,
+        Some(crate::store::WorkerRunRecord {
+            model: model.to_string(),
+            injected_planner_hash_hex: None,
+        }),
     )?;
     Ok(())
 }
@@ -1608,6 +1643,7 @@ mod tests {
     use crate::eval::tasks::{EvalTask, Fixture, RequiredCapabilities, VerifierSpec};
     use crate::gate::{ApprovalMode, AutoApproveScope, ProviderKind, TrustMode};
     use crate::hooks::config::HooksMode;
+    use crate::planner::RunMode;
     use crate::providers::http::HttpConfig;
     use crate::tools::ToolArgsStrict;
     use crate::types::ToolCall;
@@ -1816,6 +1852,9 @@ mod tests {
             workdir_override: None,
             keep_workdir: false,
             http: HttpConfig::default(),
+            mode: RunMode::Single,
+            planner_model: None,
+            worker_model: None,
             min_pass_rate: 0.0,
             fail_on_any: false,
             max_avg_steps: None,
@@ -1892,6 +1931,9 @@ mod tests {
             workdir_override: None,
             keep_workdir: false,
             http: HttpConfig::default(),
+            mode: RunMode::Single,
+            planner_model: None,
+            worker_model: None,
             min_pass_rate: 0.0,
             fail_on_any: false,
             max_avg_steps: None,

@@ -5,6 +5,7 @@ pub mod events;
 pub mod gate;
 pub mod hooks;
 pub mod mcp;
+pub mod planner;
 pub mod providers;
 pub mod session;
 pub mod store;

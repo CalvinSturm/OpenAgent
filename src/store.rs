@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 
 use hex::encode as hex_encode;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::agent::AgentOutcome;
 use crate::compaction::{CompactionReport, CompactionSettings};
 use crate::gate::TrustMode;
+use crate::planner::RunMode;
 use crate::trust::policy::McpAllowSummary;
 use crate::types::{Message, SideEffects, ToolCall};
 
@@ -26,6 +28,11 @@ pub struct StatePaths {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     pub metadata: RunMetadata,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planner: Option<PlannerRunRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerRunRecord>,
     pub cli: RunCliConfig,
     pub resolved_paths: RunResolvedPaths,
     pub policy_source: String,
@@ -51,6 +58,28 @@ pub struct RunRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerRunRecord {
+    pub model: String,
+    pub max_steps: u32,
+    pub strict: bool,
+    pub output_format: String,
+    pub plan_json: Value,
+    pub plan_hash_hex: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRunRecord {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub injected_planner_hash_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCatalogEntry {
     pub name: String,
     pub side_effects: SideEffects,
@@ -66,9 +95,20 @@ pub struct RunMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunCliConfig {
+    pub mode: String,
     pub provider: String,
     pub base_url: String,
     pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planner_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planner_max_steps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planner_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planner_strict: Option<bool>,
     pub trust_mode: String,
     pub allow_shell: bool,
     pub allow_write: bool,
@@ -126,9 +166,15 @@ pub struct RunResolvedPaths {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFingerprintV1 {
     pub schema_version: String,
+    pub mode: String,
     pub provider: String,
     pub base_url: String,
     pub model: String,
+    pub planner_model: String,
+    pub worker_model: String,
+    pub planner_max_steps: u32,
+    pub planner_output: String,
+    pub planner_strict: bool,
     pub trust_mode: String,
     pub state_dir: String,
     pub policy_path: String,
@@ -238,12 +284,16 @@ pub fn ensure_dir(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn write_run_record(
     paths: &StatePaths,
     cli: RunCliConfig,
     policy: PolicyRecordInfo,
     config_hash_hex: String,
     outcome: &AgentOutcome,
+    mode: RunMode,
+    planner: Option<PlannerRunRecord>,
+    worker: Option<WorkerRunRecord>,
 ) -> anyhow::Result<PathBuf> {
     ensure_dir(&paths.runs_dir)?;
     let run_path = paths.runs_dir.join(format!("{}.json", outcome.run_id));
@@ -255,6 +305,9 @@ pub fn write_run_record(
             finished_at: outcome.finished_at.clone(),
             exit_reason: outcome.exit_reason.as_str().to_string(),
         },
+        mode: format!("{:?}", mode).to_lowercase(),
+        planner,
+        worker,
         cli,
         resolved_paths: RunResolvedPaths {
             state_dir: paths.state_dir.display().to_string(),
@@ -295,8 +348,9 @@ pub fn load_run_record(state_dir: &Path, run_id: &str) -> anyhow::Result<RunReco
 pub fn render_replay(record: &RunRecord) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "run_id: {}\nprovider: {}\nmodel: {}\nexit_reason: {}\nPolicy hash: {}\nConfig hash: {}\napproval_mode: {}\nauto_approve_scope: {}\nunsafe: {}\nno_limits: {}\nunsafe_bypass_allow_flags: {}\n",
+        "run_id: {}\nmode: {}\nprovider: {}\nmodel: {}\nexit_reason: {}\nPolicy hash: {}\nConfig hash: {}\napproval_mode: {}\nauto_approve_scope: {}\nunsafe: {}\nno_limits: {}\nunsafe_bypass_allow_flags: {}\n",
         record.metadata.run_id,
+        record.mode,
         record.cli.provider,
         record.cli.model,
         record.metadata.exit_reason,
@@ -309,6 +363,23 @@ pub fn render_replay(record: &RunRecord) -> String {
         record.cli.unsafe_bypass_allow_flags
     ));
     out.push_str(&format!("tui_enabled: {}\n", record.cli.tui_enabled));
+    if let Some(planner) = &record.planner {
+        let steps_count = planner
+            .plan_json
+            .get("steps")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let goal = planner
+            .plan_json
+            .get("goal")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "planner: model={} ok={} steps={} hash={}\nplanner_goal: {}\n",
+            planner.model, planner.ok, steps_count, planner.plan_hash_hex, goal
+        ));
+    }
     for m in &record.transcript {
         let content = m.content.clone().unwrap_or_default();
         match m.role {
@@ -366,6 +437,14 @@ pub fn extract_session_messages(messages: &[Message]) -> Vec<Message> {
             {
                 return None;
             }
+            if matches!(m.role, crate::types::Role::Developer)
+                && m.content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with(crate::planner::PLANNER_HANDOFF_HEADER)
+            {
+                return None;
+            }
             Some(m.clone())
         })
         .collect()
@@ -406,10 +485,12 @@ mod tests {
     use crate::compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
 
     use super::{
-        config_hash_hex, load_run_record, resolve_state_dir, sha256_hex, write_run_record,
-        ConfigFingerprintV1, PolicyRecordInfo, RunCliConfig,
+        config_hash_hex, load_run_record, render_replay, resolve_state_dir, sha256_hex,
+        write_run_record, ConfigFingerprintV1, PlannerRunRecord, PolicyRecordInfo, RunCliConfig,
+        RunMetadata, RunRecord, RunResolvedPaths, WorkerRunRecord,
     };
     use crate::agent::{AgentExitReason, AgentOutcome};
+    use crate::planner::RunMode;
     use crate::session::SessionStore;
     use crate::types::{Message, Role};
 
@@ -501,6 +582,32 @@ mod tests {
     }
 
     #[test]
+    fn extract_session_messages_skips_planner_handoff_block() {
+        let msgs = vec![
+            Message {
+                role: Role::Developer,
+                content: Some(
+                    "PLANNER HANDOFF (openagent.plan.v1)\n{\"schema_version\":\"openagent.plan.v1\"}"
+                        .to_string(),
+                ),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+            Message {
+                role: Role::User,
+                content: Some("hi".to_string()),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+        ];
+        let out = super::extract_session_messages(&msgs);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].role, Role::User));
+    }
+
+    #[test]
     fn run_artifact_write_and_read() {
         let tmp = tempdir().expect("tempdir");
         let paths = super::resolve_state_paths(tmp.path(), None, None, None, None);
@@ -538,9 +645,15 @@ mod tests {
         write_run_record(
             &paths,
             RunCliConfig {
+                mode: "single".to_string(),
                 provider: "ollama".to_string(),
                 base_url: "http://localhost:11434".to_string(),
                 model: "m".to_string(),
+                planner_model: None,
+                worker_model: None,
+                planner_max_steps: None,
+                planner_output: None,
+                planner_strict: None,
                 trust_mode: "off".to_string(),
                 allow_shell: false,
                 allow_write: false,
@@ -590,11 +703,18 @@ mod tests {
             },
             "cfg_hash".to_string(),
             &outcome,
+            RunMode::Single,
+            None,
+            Some(super::WorkerRunRecord {
+                model: "m".to_string(),
+                injected_planner_hash_hex: None,
+            }),
         )
         .expect("write run");
         let loaded = load_run_record(&paths.state_dir, "run_1").expect("load run");
         assert_eq!(loaded.metadata.run_id, "run_1");
         assert_eq!(loaded.metadata.exit_reason, "ok");
+        assert_eq!(loaded.mode, "single");
         assert_eq!(loaded.config_hash_hex, "cfg_hash");
         let compaction = loaded.compaction.expect("compaction");
         assert_eq!(compaction.final_prompt_size_chars, 321);
@@ -609,6 +729,121 @@ mod tests {
     }
 
     #[test]
+    fn replay_renders_planner_summary_when_present() {
+        let record = RunRecord {
+            metadata: RunMetadata {
+                run_id: "r".to_string(),
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                finished_at: "2026-01-01T00:00:01Z".to_string(),
+                exit_reason: "ok".to_string(),
+            },
+            mode: "planner_worker".to_string(),
+            planner: Some(PlannerRunRecord {
+                model: "p".to_string(),
+                max_steps: 2,
+                strict: true,
+                output_format: "json".to_string(),
+                plan_json: serde_json::json!({
+                    "schema_version":"openagent.plan.v1",
+                    "goal":"g",
+                    "assumptions":[],
+                    "steps":[{"id":"S1","summary":"s","intended_tools":[]}],
+                    "risks":[],
+                    "success_criteria":[]
+                }),
+                plan_hash_hex: "abc".to_string(),
+                ok: true,
+                raw_output: None,
+                error: None,
+            }),
+            worker: Some(WorkerRunRecord {
+                model: "w".to_string(),
+                injected_planner_hash_hex: Some("abc".to_string()),
+            }),
+            cli: RunCliConfig {
+                mode: "planner_worker".to_string(),
+                provider: "ollama".to_string(),
+                base_url: "http://localhost:11434".to_string(),
+                model: "w".to_string(),
+                planner_model: Some("p".to_string()),
+                worker_model: Some("w".to_string()),
+                planner_max_steps: Some(2),
+                planner_output: Some("json".to_string()),
+                planner_strict: Some(true),
+                trust_mode: "off".to_string(),
+                allow_shell: false,
+                allow_write: false,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                approval_mode: "interrupt".to_string(),
+                auto_approve_scope: "run".to_string(),
+                unsafe_mode: false,
+                no_limits: false,
+                unsafe_bypass_allow_flags: false,
+                stream: false,
+                events_path: None,
+                max_context_chars: 0,
+                compaction_mode: "off".to_string(),
+                compaction_keep_last: 20,
+                tool_result_persist: "digest".to_string(),
+                hooks_mode: "off".to_string(),
+                caps_mode: "off".to_string(),
+                hooks_config_path: String::new(),
+                hooks_strict: false,
+                hooks_timeout_ms: 2000,
+                hooks_max_stdout_bytes: 200_000,
+                tool_args_strict: "on".to_string(),
+                use_session_settings: false,
+                resolved_settings_source: BTreeMap::new(),
+                tui_enabled: false,
+                tui_refresh_ms: 50,
+                tui_max_log_lines: 200,
+                http_max_retries: 2,
+                http_timeout_ms: 60_000,
+                http_connect_timeout_ms: 2_000,
+                http_stream_idle_timeout_ms: 15_000,
+                http_max_response_bytes: 10_000_000,
+                http_max_line_bytes: 200_000,
+                tool_catalog: Vec::new(),
+                policy_version: None,
+                includes_resolved: Vec::new(),
+                mcp_allowlist: None,
+            },
+            resolved_paths: RunResolvedPaths {
+                state_dir: ".".to_string(),
+                policy_path: "./policy.yaml".to_string(),
+                approvals_path: "./approvals.json".to_string(),
+                audit_path: "./audit.jsonl".to_string(),
+            },
+            policy_source: "none".to_string(),
+            policy_hash_hex: None,
+            policy_version: None,
+            includes_resolved: Vec::new(),
+            mcp_allowlist: None,
+            config_hash_hex: "cfg".to_string(),
+            transcript: vec![Message {
+                role: Role::Developer,
+                content: Some("PLANNER HANDOFF (openagent.plan.v1)\n{}".to_string()),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            }],
+            tool_calls: Vec::new(),
+            tool_decisions: Vec::new(),
+            compaction: None,
+            hook_report: Vec::new(),
+            tool_catalog: Vec::new(),
+            final_output: String::new(),
+            error: None,
+        };
+        let rendered = render_replay(&record);
+        assert!(rendered.contains("mode: planner_worker"));
+        assert!(rendered.contains("planner: model=p"));
+        assert!(rendered.contains("PLANNER HANDOFF"));
+    }
+
+    #[test]
     fn sha256_known_bytes() {
         assert_eq!(
             sha256_hex(b"abc"),
@@ -620,9 +855,15 @@ mod tests {
     fn config_hash_stable_and_changes() {
         let mut a = ConfigFingerprintV1 {
             schema_version: "openagent.confighash.v1".to_string(),
+            mode: "single".to_string(),
             provider: "ollama".to_string(),
             base_url: "http://localhost:11434".to_string(),
             model: "m".to_string(),
+            planner_model: String::new(),
+            worker_model: String::new(),
+            planner_max_steps: 0,
+            planner_output: String::new(),
+            planner_strict: false,
             trust_mode: "off".to_string(),
             state_dir: "/tmp/s".to_string(),
             policy_path: "/tmp/s/policy.yaml".to_string(),

@@ -5,6 +5,7 @@ mod events;
 mod gate;
 mod hooks;
 mod mcp;
+mod planner;
 mod providers;
 mod session;
 mod store;
@@ -51,13 +52,14 @@ use session::{
 };
 use store::{
     config_hash_hex, extract_session_messages, provider_to_string, resolve_state_paths,
-    stable_path_string, ConfigFingerprintV1, RunCliConfig,
+    stable_path_string, ConfigFingerprintV1, PlannerRunRecord, RunCliConfig, WorkerRunRecord,
 };
 use tokio::sync::watch;
 use tools::{builtin_tools_enabled, ToolArgsStrict, ToolRuntime};
 use trust::approvals::ApprovalsStore;
 use trust::audit::AuditLog;
 use trust::policy::{McpAllowSummary, Policy};
+use types::{GenerateRequest, Message, Role};
 
 #[derive(Debug, Subcommand)]
 enum Commands {
@@ -423,6 +425,12 @@ struct EvalArgs {
     http_max_response_bytes: usize,
     #[arg(long, default_value_t = 200_000)]
     http_max_line_bytes: usize,
+    #[arg(long, value_enum, default_value_t = planner::RunMode::Single)]
+    mode: planner::RunMode,
+    #[arg(long)]
+    planner_model: Option<String>,
+    #[arg(long)]
+    worker_model: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -539,6 +547,20 @@ struct RunArgs {
     tui_refresh_ms: u64,
     #[arg(long, default_value_t = 200)]
     tui_max_log_lines: usize,
+    #[arg(long, value_enum, default_value_t = planner::RunMode::Single)]
+    mode: planner::RunMode,
+    #[arg(long)]
+    planner_model: Option<String>,
+    #[arg(long)]
+    worker_model: Option<String>,
+    #[arg(long, default_value_t = 2)]
+    planner_max_steps: u32,
+    #[arg(long, value_enum, default_value_t = planner::PlannerOutput::Json)]
+    planner_output: planner::PlannerOutput,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    planner_strict: bool,
+    #[arg(long, default_value_t = false)]
+    no_planner_strict: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -874,6 +896,9 @@ async fn main() -> anyhow::Result<()> {
                 workdir_override: args.workdir.clone(),
                 keep_workdir: args.keep_workdir,
                 http: http_config_from_eval_args(&args),
+                mode: args.mode,
+                planner_model: args.planner_model.clone(),
+                worker_model: args.worker_model.clone(),
                 min_pass_rate: args.min_pass_rate,
                 fail_on_any: args.fail_on_any,
                 max_avg_steps: args.max_avg_steps,
@@ -1083,14 +1108,14 @@ async fn run_agent<P: ModelProvider>(
     provider: P,
     provider_kind: ProviderKind,
     base_url: &str,
-    model: &str,
+    default_model: &str,
     prompt: &str,
     args: &RunArgs,
     paths: &store::StatePaths,
 ) -> anyhow::Result<()> {
     let workdir = std::fs::canonicalize(&args.workdir)
         .with_context(|| format!("failed to resolve workdir: {}", args.workdir.display()))?;
-    let gate_ctx = GateContext {
+    let mut gate_ctx = GateContext {
         workdir: workdir.clone(),
         allow_shell: args.allow_shell,
         allow_write: args.allow_write,
@@ -1111,7 +1136,7 @@ async fn run_agent<P: ModelProvider>(
             args.max_read_bytes
         },
         provider: provider_kind,
-        model: model.to_string(),
+        model: default_model.to_string(),
     };
     let gate_build = build_gate(args, paths)?;
     let policy_hash_hex = gate_build.policy_hash_hex.clone();
@@ -1131,6 +1156,21 @@ async fn run_agent<P: ModelProvider>(
         mcp_allowlist: mcp_allowlist.clone(),
     });
     let gate = gate_build.gate;
+
+    let planner_strict_effective = if args.no_planner_strict {
+        false
+    } else {
+        args.planner_strict
+    };
+    let planner_model = args
+        .planner_model
+        .clone()
+        .unwrap_or_else(|| default_model.to_string());
+    let worker_model = args
+        .worker_model
+        .clone()
+        .unwrap_or_else(|| default_model.to_string());
+    gate_ctx.model = worker_model.clone();
 
     let session_path = paths.sessions_dir.join(format!("{}.json", args.session));
     let session_store = SessionStore::new(session_path.clone(), args.session.clone());
@@ -1204,9 +1244,303 @@ async fn run_agent<P: ModelProvider>(
         })
         .collect::<Vec<_>>();
 
+    let (ui_tx, ui_rx) = if args.tui {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let ui_join = if let Some(rx) = ui_rx {
+        let approvals_path = paths.approvals_path.clone();
+        let cfg = tui::TuiConfig {
+            refresh_ms: args.tui_refresh_ms,
+            max_log_lines: args.tui_max_log_lines,
+            provider: provider_to_string(provider_kind),
+            model: worker_model.clone(),
+            caps_source: format!("{:?}", resolved_settings.caps_mode).to_lowercase(),
+            policy_hash: policy_hash_hex.clone().unwrap_or_default(),
+        };
+        Some(std::thread::spawn(move || {
+            tui::run_live(rx, approvals_path, cfg, cancel_tx.clone())
+        }))
+    } else {
+        None
+    };
+    let mut event_sink = build_event_sink(args.stream, args.events.as_deref(), args.tui, ui_tx)?;
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let mut planner_record: Option<PlannerRunRecord> = None;
+    let mut worker_record: Option<WorkerRunRecord> = None;
+    let mut planner_injected_message: Option<Message> = None;
+
+    if matches!(args.mode, planner::RunMode::PlannerWorker) {
+        emit_event(
+            &mut event_sink,
+            &run_id,
+            0,
+            EventKind::PlannerStart,
+            serde_json::json!({
+                "planner_model": planner_model,
+                "planner_max_steps": args.planner_max_steps,
+                "planner_output": format!("{:?}", args.planner_output).to_lowercase(),
+                "planner_strict": planner_strict_effective
+            }),
+        );
+        let planner_out = run_planner_phase(
+            &provider,
+            &run_id,
+            &planner_model,
+            prompt,
+            args.planner_max_steps,
+            args.planner_output,
+            planner_strict_effective,
+            &mut event_sink,
+        )
+        .await;
+        match planner_out {
+            Ok(out) => {
+                if planner_strict_effective && !out.ok {
+                    emit_event(
+                        &mut event_sink,
+                        &run_id,
+                        0,
+                        EventKind::PlannerEnd,
+                        serde_json::json!({
+                            "ok": false,
+                            "planner_hash_hex": out.plan_hash_hex,
+                            "error_short": out.error.clone().unwrap_or_else(|| "planner validation failed".to_string())
+                        }),
+                    );
+                    let outcome = agent::AgentOutcome {
+                        run_id: run_id.clone(),
+                        started_at: trust::now_rfc3339(),
+                        finished_at: trust::now_rfc3339(),
+                        exit_reason: AgentExitReason::PlannerError,
+                        final_output: String::new(),
+                        error: out.error.clone(),
+                        messages: vec![Message {
+                            role: Role::Assistant,
+                            content: out.raw_output.clone(),
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_calls: None,
+                        }],
+                        tool_calls: Vec::new(),
+                        tool_decisions: Vec::new(),
+                        compaction_settings: CompactionSettings {
+                            max_context_chars: resolved_settings.max_context_chars,
+                            mode: resolved_settings.compaction_mode,
+                            keep_last: resolved_settings.compaction_keep_last,
+                            tool_result_persist: resolved_settings.tool_result_persist,
+                        },
+                        final_prompt_size_chars: 0,
+                        compaction_report: None,
+                        hook_invocations: Vec::new(),
+                        provider_retry_count: 0,
+                        provider_error_count: 0,
+                        token_usage: None,
+                    };
+                    planner_record = Some(PlannerRunRecord {
+                        model: planner_model.clone(),
+                        max_steps: args.planner_max_steps,
+                        strict: planner_strict_effective,
+                        output_format: format!("{:?}", args.planner_output).to_lowercase(),
+                        plan_json: out.plan_json,
+                        plan_hash_hex: out.plan_hash_hex,
+                        ok: false,
+                        raw_output: out.raw_output,
+                        error: out.error,
+                    });
+                    worker_record = Some(WorkerRunRecord {
+                        model: worker_model.clone(),
+                        injected_planner_hash_hex: None,
+                    });
+                    let cli_config = build_run_cli_config(
+                        provider_kind,
+                        base_url,
+                        &worker_model,
+                        args,
+                        &resolved_settings,
+                        &hooks_config_path,
+                        tool_catalog.clone(),
+                        policy_version,
+                        includes_resolved.clone(),
+                        mcp_allowlist.clone(),
+                        args.mode,
+                        Some(planner_model.clone()),
+                        Some(worker_model.clone()),
+                        Some(args.planner_max_steps),
+                        Some(format!("{:?}", args.planner_output).to_lowercase()),
+                        Some(planner_strict_effective),
+                    );
+                    let config_fingerprint =
+                        build_config_fingerprint(&cli_config, args, &worker_model, paths);
+                    let cfg_hash = config_hash_hex(&config_fingerprint)?;
+                    if let Err(write_err) = store::write_run_record(
+                        paths,
+                        cli_config,
+                        store::PolicyRecordInfo {
+                            source: policy_source,
+                            hash_hex: policy_hash_hex,
+                            version: policy_version,
+                            includes_resolved,
+                            mcp_allowlist,
+                        },
+                        cfg_hash,
+                        &outcome,
+                        args.mode,
+                        planner_record,
+                        worker_record,
+                    ) {
+                        eprintln!("WARN: failed to write run artifact: {write_err}");
+                    }
+                    if let Some(h) = ui_join {
+                        let _ = h.join();
+                    }
+                    return Err(anyhow!(outcome
+                        .error
+                        .unwrap_or_else(|| "planner error".to_string())));
+                }
+                emit_event(
+                    &mut event_sink,
+                    &run_id,
+                    0,
+                    EventKind::PlannerEnd,
+                    serde_json::json!({
+                        "ok": out.ok,
+                        "planner_hash_hex": out.plan_hash_hex,
+                        "error_short": out.error.clone().unwrap_or_default()
+                    }),
+                );
+                let handoff = planner::planner_handoff_content(&out.plan_json)?;
+                planner_injected_message = Some(Message {
+                    role: Role::Developer,
+                    content: Some(handoff),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                });
+                worker_record = Some(WorkerRunRecord {
+                    model: worker_model.clone(),
+                    injected_planner_hash_hex: Some(out.plan_hash_hex.clone()),
+                });
+                planner_record = Some(PlannerRunRecord {
+                    model: planner_model.clone(),
+                    max_steps: args.planner_max_steps,
+                    strict: planner_strict_effective,
+                    output_format: format!("{:?}", args.planner_output).to_lowercase(),
+                    plan_json: out.plan_json,
+                    plan_hash_hex: out.plan_hash_hex,
+                    ok: out.ok,
+                    raw_output: out.raw_output,
+                    error: out.error,
+                });
+                emit_event(
+                    &mut event_sink,
+                    &run_id,
+                    0,
+                    EventKind::WorkerStart,
+                    serde_json::json!({
+                        "worker_model": worker_model,
+                        "planner_hash_hex": planner_record.as_ref().map(|p| p.plan_hash_hex.clone()).unwrap_or_default()
+                    }),
+                );
+            }
+            Err(e) => {
+                let err_short = e.to_string();
+                emit_event(
+                    &mut event_sink,
+                    &run_id,
+                    0,
+                    EventKind::PlannerEnd,
+                    serde_json::json!({
+                        "ok": false,
+                        "planner_hash_hex": "",
+                        "error_short": err_short
+                    }),
+                );
+                let outcome = agent::AgentOutcome {
+                    run_id: run_id.clone(),
+                    started_at: trust::now_rfc3339(),
+                    finished_at: trust::now_rfc3339(),
+                    exit_reason: AgentExitReason::PlannerError,
+                    final_output: String::new(),
+                    error: Some(e.to_string()),
+                    messages: vec![Message {
+                        role: Role::User,
+                        content: Some(prompt.to_string()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    }],
+                    tool_calls: Vec::new(),
+                    tool_decisions: Vec::new(),
+                    compaction_settings: CompactionSettings {
+                        max_context_chars: resolved_settings.max_context_chars,
+                        mode: resolved_settings.compaction_mode,
+                        keep_last: resolved_settings.compaction_keep_last,
+                        tool_result_persist: resolved_settings.tool_result_persist,
+                    },
+                    final_prompt_size_chars: 0,
+                    compaction_report: None,
+                    hook_invocations: Vec::new(),
+                    provider_retry_count: 0,
+                    provider_error_count: 0,
+                    token_usage: None,
+                };
+                let cli_config = build_run_cli_config(
+                    provider_kind,
+                    base_url,
+                    &worker_model,
+                    args,
+                    &resolved_settings,
+                    &hooks_config_path,
+                    tool_catalog.clone(),
+                    policy_version,
+                    includes_resolved.clone(),
+                    mcp_allowlist.clone(),
+                    args.mode,
+                    Some(planner_model.clone()),
+                    Some(worker_model.clone()),
+                    Some(args.planner_max_steps),
+                    Some(format!("{:?}", args.planner_output).to_lowercase()),
+                    Some(planner_strict_effective),
+                );
+                let config_fingerprint =
+                    build_config_fingerprint(&cli_config, args, &worker_model, paths);
+                let cfg_hash = config_hash_hex(&config_fingerprint)?;
+                if let Err(write_err) = store::write_run_record(
+                    paths,
+                    cli_config,
+                    store::PolicyRecordInfo {
+                        source: policy_source,
+                        hash_hex: policy_hash_hex,
+                        version: policy_version,
+                        includes_resolved,
+                        mcp_allowlist,
+                    },
+                    cfg_hash,
+                    &outcome,
+                    args.mode,
+                    planner_record,
+                    worker_record,
+                ) {
+                    eprintln!("WARN: failed to write run artifact: {write_err}");
+                }
+                if let Some(h) = ui_join {
+                    let _ = h.join();
+                }
+                return Err(anyhow!(outcome
+                    .error
+                    .unwrap_or_else(|| "planner error".to_string())));
+            }
+        }
+    }
+
     let mut agent = Agent {
         provider,
-        model: model.to_string(),
+        model: worker_model.clone(),
         tools: all_tools,
         max_steps: args.max_steps,
         tool_rt: ToolRuntime {
@@ -1230,7 +1564,7 @@ async fn run_agent<P: ModelProvider>(
         gate_ctx,
         mcp_registry,
         stream: args.stream,
-        event_sink: None,
+        event_sink,
         compaction_settings: CompactionSettings {
             max_context_chars: resolved_settings.max_context_chars,
             mode: resolved_settings.compaction_mode,
@@ -1239,35 +1573,12 @@ async fn run_agent<P: ModelProvider>(
         },
         hooks: hook_manager,
         policy_loaded: policy_loaded_info,
+        run_id_override: Some(run_id.clone()),
+        omit_tools_field_when_empty: false,
     };
-
-    let (ui_tx, ui_rx) = if args.tui {
-        let (tx, rx) = std::sync::mpsc::channel();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let (cancel_tx, mut cancel_rx) = watch::channel(false);
-    let ui_join = if let Some(rx) = ui_rx {
-        let approvals_path = paths.approvals_path.clone();
-        let cfg = tui::TuiConfig {
-            refresh_ms: args.tui_refresh_ms,
-            max_log_lines: args.tui_max_log_lines,
-            provider: provider_to_string(provider_kind),
-            model: model.to_string(),
-            caps_source: format!("{:?}", resolved_settings.caps_mode).to_lowercase(),
-            policy_hash: policy_hash_hex.clone().unwrap_or_default(),
-        };
-        Some(std::thread::spawn(move || {
-            tui::run_live(rx, approvals_path, cfg, cancel_tx.clone())
-        }))
-    } else {
-        None
-    };
-    agent.event_sink = build_event_sink(args.stream, args.events.as_deref(), args.tui, ui_tx)?;
 
     let outcome = tokio::select! {
-        out = agent.run(prompt, session_messages, task_memory) => out,
+        out = agent.run(prompt, session_messages, merge_injected_messages(task_memory, planner_injected_message)) => out,
         _ = tokio::signal::ctrl_c() => {
             agent::AgentOutcome {
                 run_id: uuid::Uuid::new_v4().to_string(),
@@ -1347,10 +1658,284 @@ async fn run_agent<P: ModelProvider>(
         }
     }
 
-    let cli_config = RunCliConfig {
+    if worker_record.is_none() {
+        worker_record = Some(WorkerRunRecord {
+            model: worker_model.clone(),
+            injected_planner_hash_hex: planner_record.as_ref().map(|p| p.plan_hash_hex.clone()),
+        });
+    }
+    let cli_config = build_run_cli_config(
+        provider_kind,
+        base_url,
+        &worker_model,
+        args,
+        &resolved_settings,
+        &hooks_config_path,
+        tool_catalog.clone(),
+        policy_version,
+        includes_resolved.clone(),
+        mcp_allowlist.clone(),
+        args.mode,
+        Some(planner_model.clone()),
+        Some(worker_model.clone()),
+        Some(args.planner_max_steps),
+        Some(format!("{:?}", args.planner_output).to_lowercase()),
+        Some(planner_strict_effective),
+    );
+    let config_fingerprint = build_config_fingerprint(&cli_config, args, &worker_model, paths);
+    let config_hash_hex = config_hash_hex(&config_fingerprint)?;
+    if let Err(e) = store::write_run_record(
+        paths,
+        cli_config,
+        store::PolicyRecordInfo {
+            source: policy_source,
+            hash_hex: policy_hash_hex,
+            version: policy_version,
+            includes_resolved,
+            mcp_allowlist,
+        },
+        config_hash_hex,
+        &outcome,
+        args.mode,
+        planner_record,
+        worker_record,
+    ) {
+        eprintln!("WARN: failed to write run artifact: {e}");
+    }
+
+    if args.tui {
+        if !outcome.final_output.is_empty() {
+            println!("{}", outcome.final_output);
+        }
+    } else if !args.stream {
+        println!("{}", outcome.final_output);
+    }
+
+    if matches!(outcome.exit_reason, AgentExitReason::ProviderError) {
+        let err = outcome
+            .error
+            .unwrap_or_else(|| "provider error".to_string());
+        return Err(anyhow!(
+            "{}\nHint: run `openagent doctor --provider {} --base-url {}`\nDefault base URL for {} is {}",
+            err,
+            provider_cli_name(provider_kind),
+            base_url,
+            provider_cli_name(provider_kind),
+            default_base_url(provider_kind)
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct PlannerPhaseOutput {
+    plan_json: serde_json::Value,
+    plan_hash_hex: String,
+    raw_output: Option<String>,
+    error: Option<String>,
+    ok: bool,
+}
+
+fn emit_event(
+    sink: &mut Option<Box<dyn EventSink>>,
+    run_id: &str,
+    step: u32,
+    kind: EventKind,
+    data: serde_json::Value,
+) {
+    if let Some(s) = sink {
+        if let Err(e) = s.emit(Event::new(run_id.to_string(), step, kind, data)) {
+            eprintln!("WARN: failed to emit event: {e}");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_planner_phase<P: ModelProvider>(
+    provider: &P,
+    run_id: &str,
+    planner_model: &str,
+    prompt: &str,
+    planner_max_steps: u32,
+    planner_output: planner::PlannerOutput,
+    planner_strict: bool,
+    sink: &mut Option<Box<dyn EventSink>>,
+) -> anyhow::Result<PlannerPhaseOutput> {
+    let mut messages = vec![
+        Message {
+            role: Role::System,
+            content: Some(
+                "You are the planner. Do not call tools. Produce only the requested plan output."
+                    .to_string(),
+            ),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        },
+        Message {
+            role: Role::User,
+            content: Some(prompt.to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        },
+    ];
+
+    let max_steps = planner_max_steps.max(1);
+    let mut last_output = String::new();
+    for step in 0..max_steps {
+        emit_event(
+            sink,
+            run_id,
+            step,
+            EventKind::ModelRequestStart,
+            serde_json::json!({
+                "model": planner_model,
+                "tool_count": 0,
+                "stream": false,
+                "phase": "planner"
+            }),
+        );
+        let req = GenerateRequest {
+            model: planner_model.to_string(),
+            messages: messages.clone(),
+            tools: None,
+        };
+        let resp = match provider.generate(req).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                if let Some(pe) = e.downcast_ref::<providers::http::ProviderError>() {
+                    for r in &pe.retries {
+                        emit_event(
+                            sink,
+                            run_id,
+                            step,
+                            EventKind::ProviderRetry,
+                            serde_json::json!({
+                                "attempt": r.attempt,
+                                "max_attempts": r.max_attempts,
+                                "kind": r.kind,
+                                "status": r.status,
+                                "backoff_ms": r.backoff_ms
+                            }),
+                        );
+                    }
+                    emit_event(
+                        sink,
+                        run_id,
+                        step,
+                        EventKind::ProviderError,
+                        serde_json::json!({
+                            "kind": pe.kind,
+                            "status": pe.http_status,
+                            "retryable": pe.retryable,
+                            "attempt": pe.attempt,
+                            "max_attempts": pe.max_attempts,
+                            "message_short": providers::http::message_short(&pe.message)
+                        }),
+                    );
+                }
+                return Err(e);
+            }
+        };
+
+        let output = resp.assistant.content.clone().unwrap_or_default();
+        emit_event(
+            sink,
+            run_id,
+            step,
+            EventKind::ModelResponseEnd,
+            serde_json::json!({
+                "content": output,
+                "tool_calls": resp.tool_calls.len(),
+                "phase": "planner"
+            }),
+        );
+        if !resp.tool_calls.is_empty() {
+            let wrapped =
+                planner::normalize_planner_output(&output, prompt, planner_output, false)?;
+            return Ok(PlannerPhaseOutput {
+                plan_json: wrapped.plan_json,
+                plan_hash_hex: wrapped.plan_hash_hex,
+                raw_output: wrapped.raw_output,
+                error: Some(format!(
+                    "planner emitted tool calls while tools are disabled (count={})",
+                    resp.tool_calls.len()
+                )),
+                ok: false,
+            });
+        }
+        messages.push(resp.assistant);
+        last_output = output;
+        if !last_output.trim().is_empty() {
+            break;
+        }
+    }
+
+    match planner::normalize_planner_output(&last_output, prompt, planner_output, planner_strict) {
+        Ok(normalized) => Ok(PlannerPhaseOutput {
+            plan_json: normalized.plan_json,
+            plan_hash_hex: normalized.plan_hash_hex,
+            raw_output: normalized.raw_output,
+            error: normalized.error,
+            ok: !normalized.used_wrapper,
+        }),
+        Err(e) => {
+            let wrapped = planner::wrap_text_plan(prompt, &last_output);
+            let hash = planner::hash_canonical_json(&wrapped)?;
+            Ok(PlannerPhaseOutput {
+                plan_json: wrapped,
+                plan_hash_hex: hash,
+                raw_output: Some(last_output),
+                error: Some(e.to_string()),
+                ok: false,
+            })
+        }
+    }
+}
+
+fn merge_injected_messages(
+    task_memory: Option<Message>,
+    planner_handoff: Option<Message>,
+) -> Vec<Message> {
+    match (task_memory, planner_handoff) {
+        (None, None) => Vec::new(),
+        (Some(m), None) => vec![m],
+        (None, Some(m)) => vec![m],
+        (Some(a), Some(b)) => vec![a, b],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_run_cli_config(
+    provider_kind: ProviderKind,
+    base_url: &str,
+    model: &str,
+    args: &RunArgs,
+    resolved_settings: &session::RunSettingResolution,
+    hooks_config_path: &std::path::Path,
+    tool_catalog: Vec<store::ToolCatalogEntry>,
+    policy_version: Option<u32>,
+    includes_resolved: Vec<String>,
+    mcp_allowlist: Option<McpAllowSummary>,
+    mode: planner::RunMode,
+    planner_model: Option<String>,
+    worker_model: Option<String>,
+    planner_max_steps: Option<u32>,
+    planner_output: Option<String>,
+    planner_strict: Option<bool>,
+) -> RunCliConfig {
+    RunCliConfig {
+        mode: format!("{:?}", mode).to_lowercase(),
         provider: provider_to_string(provider_kind),
         base_url: base_url.to_string(),
         model: model.to_string(),
+        planner_model,
+        worker_model,
+        planner_max_steps,
+        planner_output,
+        planner_strict,
         trust_mode: store::cli_trust_mode(args.trust),
         allow_shell: args.allow_shell,
         allow_write: args.allow_write,
@@ -1370,7 +1955,7 @@ async fn run_agent<P: ModelProvider>(
         tool_result_persist: format!("{:?}", resolved_settings.tool_result_persist).to_lowercase(),
         hooks_mode: format!("{:?}", resolved_settings.hooks_mode).to_lowercase(),
         caps_mode: format!("{:?}", resolved_settings.caps_mode).to_lowercase(),
-        hooks_config_path: stable_path_string(&hooks_config_path),
+        hooks_config_path: stable_path_string(hooks_config_path),
         hooks_strict: args.hooks_strict,
         hooks_timeout_ms: args.hooks_timeout_ms,
         hooks_max_stdout_bytes: args.hooks_max_stdout_bytes,
@@ -1386,16 +1971,30 @@ async fn run_agent<P: ModelProvider>(
         tui_enabled: args.tui,
         tui_refresh_ms: args.tui_refresh_ms,
         tui_max_log_lines: args.tui_max_log_lines,
-        tool_catalog: tool_catalog.clone(),
+        tool_catalog,
         policy_version,
-        includes_resolved: includes_resolved.clone(),
-        mcp_allowlist: mcp_allowlist.clone(),
-    };
-    let config_fingerprint = ConfigFingerprintV1 {
+        includes_resolved,
+        mcp_allowlist,
+    }
+}
+
+fn build_config_fingerprint(
+    cli_config: &RunCliConfig,
+    args: &RunArgs,
+    model: &str,
+    paths: &store::StatePaths,
+) -> ConfigFingerprintV1 {
+    ConfigFingerprintV1 {
         schema_version: "openagent.confighash.v1".to_string(),
-        provider: provider_to_string(provider_kind),
-        base_url: base_url.to_string(),
+        mode: cli_config.mode.clone(),
+        provider: cli_config.provider.clone(),
+        base_url: cli_config.base_url.clone(),
         model: model.to_string(),
+        planner_model: cli_config.planner_model.clone().unwrap_or_default(),
+        worker_model: cli_config.worker_model.clone().unwrap_or_default(),
+        planner_max_steps: cli_config.planner_max_steps.unwrap_or_default(),
+        planner_output: cli_config.planner_output.clone().unwrap_or_default(),
+        planner_strict: cli_config.planner_strict.unwrap_or(false),
         trust_mode: store::cli_trust_mode(args.trust),
         state_dir: stable_path_string(&paths.state_dir),
         policy_path: stable_path_string(&paths.policy_path),
@@ -1425,73 +2024,37 @@ async fn run_agent<P: ModelProvider>(
             .as_ref()
             .map(|p| stable_path_string(p))
             .unwrap_or_default(),
-        max_context_chars: resolved_settings.max_context_chars,
-        compaction_mode: format!("{:?}", resolved_settings.compaction_mode).to_lowercase(),
-        compaction_keep_last: resolved_settings.compaction_keep_last,
-        tool_result_persist: format!("{:?}", resolved_settings.tool_result_persist).to_lowercase(),
-        hooks_mode: format!("{:?}", resolved_settings.hooks_mode).to_lowercase(),
-        caps_mode: format!("{:?}", resolved_settings.caps_mode).to_lowercase(),
-        hooks_config_path: stable_path_string(&hooks_config_path),
-        hooks_strict: args.hooks_strict,
-        hooks_timeout_ms: args.hooks_timeout_ms,
-        hooks_max_stdout_bytes: args.hooks_max_stdout_bytes,
-        tool_args_strict: format!("{:?}", resolved_settings.tool_args_strict).to_lowercase(),
-        use_session_settings: args.use_session_settings,
-        resolved_settings_source: resolved_settings.sources.clone(),
-        http_max_retries: args.http_max_retries,
-        http_timeout_ms: args.http_timeout_ms,
-        http_connect_timeout_ms: args.http_connect_timeout_ms,
-        http_stream_idle_timeout_ms: args.http_stream_idle_timeout_ms,
-        http_max_response_bytes: args.http_max_response_bytes,
-        http_max_line_bytes: args.http_max_line_bytes,
-        tui_enabled: args.tui,
-        tui_refresh_ms: args.tui_refresh_ms,
-        tui_max_log_lines: args.tui_max_log_lines,
-        tool_catalog_names: tool_catalog.iter().map(|t| t.name.clone()).collect(),
-        policy_version,
-        includes_resolved: includes_resolved.clone(),
-        mcp_allowlist: mcp_allowlist.clone(),
-    };
-    let config_hash_hex = config_hash_hex(&config_fingerprint)?;
-    if let Err(e) = store::write_run_record(
-        paths,
-        cli_config,
-        store::PolicyRecordInfo {
-            source: policy_source,
-            hash_hex: policy_hash_hex,
-            version: policy_version,
-            includes_resolved,
-            mcp_allowlist,
-        },
-        config_hash_hex,
-        &outcome,
-    ) {
-        eprintln!("WARN: failed to write run artifact: {e}");
+        max_context_chars: cli_config.max_context_chars,
+        compaction_mode: cli_config.compaction_mode.clone(),
+        compaction_keep_last: cli_config.compaction_keep_last,
+        tool_result_persist: cli_config.tool_result_persist.clone(),
+        hooks_mode: cli_config.hooks_mode.clone(),
+        caps_mode: cli_config.caps_mode.clone(),
+        hooks_config_path: cli_config.hooks_config_path.clone(),
+        hooks_strict: cli_config.hooks_strict,
+        hooks_timeout_ms: cli_config.hooks_timeout_ms,
+        hooks_max_stdout_bytes: cli_config.hooks_max_stdout_bytes,
+        tool_args_strict: cli_config.tool_args_strict.clone(),
+        use_session_settings: cli_config.use_session_settings,
+        resolved_settings_source: cli_config.resolved_settings_source.clone(),
+        tui_enabled: cli_config.tui_enabled,
+        tui_refresh_ms: cli_config.tui_refresh_ms,
+        tui_max_log_lines: cli_config.tui_max_log_lines,
+        http_max_retries: cli_config.http_max_retries,
+        http_timeout_ms: cli_config.http_timeout_ms,
+        http_connect_timeout_ms: cli_config.http_connect_timeout_ms,
+        http_stream_idle_timeout_ms: cli_config.http_stream_idle_timeout_ms,
+        http_max_response_bytes: cli_config.http_max_response_bytes,
+        http_max_line_bytes: cli_config.http_max_line_bytes,
+        tool_catalog_names: cli_config
+            .tool_catalog
+            .iter()
+            .map(|t| t.name.clone())
+            .collect(),
+        policy_version: cli_config.policy_version,
+        includes_resolved: cli_config.includes_resolved.clone(),
+        mcp_allowlist: cli_config.mcp_allowlist.clone(),
     }
-
-    if args.tui {
-        if !outcome.final_output.is_empty() {
-            println!("{}", outcome.final_output);
-        }
-    } else if !args.stream {
-        println!("{}", outcome.final_output);
-    }
-
-    if matches!(outcome.exit_reason, AgentExitReason::ProviderError) {
-        let err = outcome
-            .error
-            .unwrap_or_else(|| "provider error".to_string());
-        return Err(anyhow!(
-            "{}\nHint: run `openagent doctor --provider {} --base-url {}`\nDefault base URL for {} is {}",
-            err,
-            provider_cli_name(provider_kind),
-            base_url,
-            provider_cli_name(provider_kind),
-            default_base_url(provider_kind)
-        ));
-    }
-
-    Ok(())
 }
 
 fn resolved_mcp_config_path(args: &RunArgs, state_dir: &std::path::Path) -> PathBuf {
@@ -2172,9 +2735,59 @@ fn handle_session_command(store: &SessionStore, cmd: &SessionSubcommand) -> anyh
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
     use tempfile::tempdir;
 
+    use crate::providers::{ModelProvider, StreamDelta};
+    use crate::types::{GenerateRequest, GenerateResponse, Message, Role};
+
     use super::{doctor_probe_urls, policy_doctor_output, policy_effective_output, ProviderKind};
+
+    struct CaptureSink {
+        events: Arc<Mutex<Vec<crate::events::Event>>>,
+    }
+
+    impl crate::events::EventSink for CaptureSink {
+        fn emit(&mut self, event: crate::events::Event) -> anyhow::Result<()> {
+            self.events.lock().expect("lock").push(event);
+            Ok(())
+        }
+    }
+
+    struct PlannerTestProvider {
+        seen_tools_none: Arc<Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for PlannerTestProvider {
+        async fn generate(&self, req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            self.seen_tools_none
+                .lock()
+                .expect("lock")
+                .push(req.tools.is_none());
+            Ok(GenerateResponse {
+                assistant: Message {
+                    role: Role::Assistant,
+                    content: Some("not-json".to_string()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+
+        async fn generate_streaming(
+            &self,
+            req: GenerateRequest,
+            _on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+        ) -> anyhow::Result<GenerateResponse> {
+            self.generate(req).await
+        }
+    }
 
     #[test]
     fn doctor_url_construction_openai_compat() {
@@ -2221,5 +2834,42 @@ rules:
         let out = policy_effective_output(&p, true).expect("print");
         assert!(out.contains("\"rules\""));
         assert!(out.contains("read_file"));
+    }
+
+    #[tokio::test]
+    async fn planner_phase_omits_tools_and_emits_tool_count_zero() {
+        let seen = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let provider = PlannerTestProvider {
+            seen_tools_none: seen.clone(),
+        };
+        let events = Arc::new(Mutex::new(Vec::<crate::events::Event>::new()));
+        let mut sink: Option<Box<dyn crate::events::EventSink>> = Some(Box::new(CaptureSink {
+            events: events.clone(),
+        }));
+        let out = super::run_planner_phase(
+            &provider,
+            "run_test",
+            "m",
+            "do thing",
+            1,
+            crate::planner::PlannerOutput::Json,
+            false,
+            &mut sink,
+        )
+        .await
+        .expect("planner");
+        assert!(out.plan_json.get("schema_version").is_some());
+        assert_eq!(seen.lock().expect("lock").as_slice(), &[true]);
+        let model_start = events
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|e| matches!(e.kind, crate::events::EventKind::ModelRequestStart))
+            .cloned()
+            .expect("model request event");
+        assert_eq!(
+            model_start.data.get("tool_count").and_then(|v| v.as_u64()),
+            Some(0)
+        );
     }
 }

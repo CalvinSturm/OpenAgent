@@ -58,7 +58,8 @@ struct OpenAiToolFunction {
 struct OpenAiRequest {
     model: String,
     messages: Vec<Message>,
-    tools: Vec<OpenAiToolEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OpenAiToolEnvelope>>,
     tool_choice: String,
     temperature: f32,
     stream: bool,
@@ -513,18 +514,18 @@ fn drain_sse_events(buf: &mut String) -> Vec<String> {
 }
 
 fn to_request(req: GenerateRequest, stream: bool) -> OpenAiRequest {
-    let tools = req
-        .tools
-        .into_iter()
-        .map(|t| OpenAiToolEnvelope {
-            tool_type: "function".to_string(),
-            function: OpenAiToolFunction {
-                name: t.name,
-                description: t.description,
-                parameters: t.parameters,
-            },
-        })
-        .collect::<Vec<_>>();
+    let tools = req.tools.map(|list| {
+        list.into_iter()
+            .map(|t| OpenAiToolEnvelope {
+                tool_type: "function".to_string(),
+                function: OpenAiToolFunction {
+                    name: t.name,
+                    description: t.description,
+                    parameters: t.parameters,
+                },
+            })
+            .collect::<Vec<_>>()
+    });
     OpenAiRequest {
         model: req.model,
         messages: req.messages,

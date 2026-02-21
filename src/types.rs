@@ -53,7 +53,8 @@ pub struct ToolCall {
 pub struct GenerateRequest {
     pub model: String,
     pub messages: Vec<Message>,
-    pub tools: Vec<ToolDef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDef>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

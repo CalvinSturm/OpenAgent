@@ -21,6 +21,7 @@ use crate::types::{GenerateRequest, Message, Role, TokenUsage, ToolCall, ToolDef
 pub enum AgentExitReason {
     Ok,
     ProviderError,
+    PlannerError,
     Denied,
     ApprovalRequired,
     HookAborted,
@@ -33,6 +34,7 @@ impl AgentExitReason {
         match self {
             AgentExitReason::Ok => "ok",
             AgentExitReason::ProviderError => "provider_error",
+            AgentExitReason::PlannerError => "planner_error",
             AgentExitReason::Denied => "denied",
             AgentExitReason::ApprovalRequired => "approval_required",
             AgentExitReason::HookAborted => "hook_aborted",
@@ -95,6 +97,8 @@ pub struct Agent<P: ModelProvider> {
     pub compaction_settings: CompactionSettings,
     pub hooks: HookManager,
     pub policy_loaded: Option<PolicyLoadedInfo>,
+    pub run_id_override: Option<String>,
+    pub omit_tools_field_when_empty: bool,
 }
 
 impl<P: ModelProvider> Agent<P> {
@@ -110,9 +114,12 @@ impl<P: ModelProvider> Agent<P> {
         &mut self,
         user_prompt: &str,
         session_messages: Vec<Message>,
-        task_memory_message: Option<Message>,
+        injected_messages: Vec<Message>,
     ) -> AgentOutcome {
-        let run_id = Uuid::new_v4().to_string();
+        let run_id = self
+            .run_id_override
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         self.gate_ctx.run_id = Some(run_id.clone());
         let started_at = crate::trust::now_rfc3339();
         self.emit_event(
@@ -147,8 +154,8 @@ impl<P: ModelProvider> Agent<P> {
             tool_calls: None,
         }];
         messages.extend(session_messages);
-        if let Some(mem) = task_memory_message {
-            messages.push(mem);
+        for msg in injected_messages {
+            messages.push(msg);
         }
         messages.push(Message {
             role: Role::User,
@@ -484,7 +491,11 @@ impl<P: ModelProvider> Agent<P> {
             let req = GenerateRequest {
                 model: self.model.clone(),
                 messages: messages.clone(),
-                tools: tools_sorted,
+                tools: if self.omit_tools_field_when_empty && tools_sorted.is_empty() {
+                    None
+                } else {
+                    Some(tools_sorted)
+                },
             };
             let request_context_chars = context_size_chars(&req.messages);
 
@@ -492,7 +503,10 @@ impl<P: ModelProvider> Agent<P> {
                 &run_id,
                 step as u32,
                 EventKind::ModelRequestStart,
-                serde_json::json!({"message_count": req.messages.len(), "tool_count": req.tools.len()}),
+                serde_json::json!({
+                    "message_count": req.messages.len(),
+                    "tool_count": req.tools.as_ref().map(|t| t.len()).unwrap_or(0)
+                }),
             );
             let resp_result = if self.stream {
                 if self.provider.supports_streaming() {
@@ -1432,8 +1446,10 @@ mod tests {
             })
             .expect("hooks"),
             policy_loaded: None,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
         };
-        let out = agent.run("hi", vec![], None).await;
+        let out = agent.run("hi", vec![], Vec::new()).await;
         assert_eq!(out.final_output, "done");
         assert_eq!(generate_calls.load(Ordering::SeqCst), 1);
         assert_eq!(stream_calls.load(Ordering::SeqCst), 0);
@@ -1495,6 +1511,8 @@ mod tests {
             })
             .expect("hooks"),
             policy_loaded: None,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
         };
         let mem_msg = Message {
             role: Role::Developer,
@@ -1503,7 +1521,7 @@ mod tests {
             tool_name: None,
             tool_calls: None,
         };
-        let out = agent.run("hi", vec![], Some(mem_msg)).await;
+        let out = agent.run("hi", vec![], vec![mem_msg]).await;
         assert!(out.messages.iter().any(|m| m
             .content
             .as_deref()

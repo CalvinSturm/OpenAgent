@@ -61,7 +61,8 @@ struct OllamaMessageOut {
 struct OllamaRequest {
     model: String,
     messages: Vec<OllamaMessageOut>,
-    tools: Vec<OllamaToolEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OllamaToolEnvelope>>,
     stream: bool,
 }
 
@@ -428,18 +429,18 @@ fn drain_json_lines(buf: &mut String) -> Vec<String> {
 }
 
 fn to_request(req: GenerateRequest, stream: bool) -> OllamaRequest {
-    let tools = req
-        .tools
-        .into_iter()
-        .map(|t| OllamaToolEnvelope {
-            tool_type: "function".to_string(),
-            function: OllamaToolFunction {
-                name: t.name,
-                description: t.description,
-                parameters: t.parameters,
-            },
-        })
-        .collect::<Vec<_>>();
+    let tools = req.tools.map(|list| {
+        list.into_iter()
+            .map(|t| OllamaToolEnvelope {
+                tool_type: "function".to_string(),
+                function: OllamaToolFunction {
+                    name: t.name,
+                    description: t.description,
+                    parameters: t.parameters,
+                },
+            })
+            .collect::<Vec<_>>()
+    });
     let messages = req
         .messages
         .into_iter()
