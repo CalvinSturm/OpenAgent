@@ -104,6 +104,12 @@ impl NoGate {
     }
 }
 
+impl Default for NoGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolGate for NoGate {
     fn decide(&mut self, _ctx: &GateContext, _call: &ToolCall) -> GateDecision {
         GateDecision::Allow {

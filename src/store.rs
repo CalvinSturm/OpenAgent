@@ -65,6 +65,9 @@ pub struct RunCliConfig {
     pub unsafe_mode: bool,
     pub no_limits: bool,
     pub unsafe_bypass_allow_flags: bool,
+    pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +103,8 @@ pub struct ConfigFingerprintV1 {
     pub unsafe_mode: bool,
     pub no_limits: bool,
     pub unsafe_bypass_allow_flags: bool,
+    pub stream: bool,
+    pub events_path: String,
 }
 
 pub fn resolve_state_paths(
@@ -395,6 +400,8 @@ mod tests {
                 unsafe_mode: false,
                 no_limits: false,
                 unsafe_bypass_allow_flags: false,
+                stream: false,
+                events_path: None,
             },
             "none".to_string(),
             None,
@@ -442,6 +449,8 @@ mod tests {
             unsafe_mode: false,
             no_limits: false,
             unsafe_bypass_allow_flags: false,
+            stream: false,
+            events_path: String::new(),
         };
         let b = a.clone();
         let ha = config_hash_hex(&a).expect("hash a");

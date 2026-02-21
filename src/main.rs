@@ -1,5 +1,8 @@
 mod agent;
+mod eval;
+mod events;
 mod gate;
+mod mcp;
 mod providers;
 mod store;
 mod tools;
@@ -9,9 +12,15 @@ mod types;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::mcp::registry::{
+    doctor_server as mcp_doctor_server, list_servers as mcp_list_servers, McpRegistry,
+};
 use agent::{Agent, AgentExitReason};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
+use eval::runner::{run_eval, EvalConfig};
+use eval::tasks::EvalPack;
+use events::{Event, EventKind, EventSink, JsonlFileSink, MultiSink, StdoutSink};
 use gate::{
     compute_policy_hash_hex, ApprovalMode, AutoApproveScope, GateContext, NoGate, ProviderKind,
     ToolGate, TrustGate, TrustMode,
@@ -32,10 +41,24 @@ use trust::policy::Policy;
 #[derive(Debug, Subcommand)]
 enum Commands {
     Doctor(DoctorArgs),
+    Mcp(McpArgs),
     Approvals(ApprovalsArgs),
     Approve(ApproveArgs),
     Deny(DenyArgs),
     Replay(ReplayArgs),
+    Eval(Box<EvalArgs>),
+}
+
+#[derive(Debug, Subcommand)]
+enum McpSubcommand {
+    List,
+    Doctor { name: String },
+}
+
+#[derive(Debug, Parser)]
+struct McpArgs {
+    #[command(subcommand)]
+    command: McpSubcommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -70,6 +93,68 @@ struct ReplayArgs {
 }
 
 #[derive(Debug, Parser)]
+struct EvalArgs {
+    #[arg(long, value_enum, default_value_t = ProviderKind::Ollama)]
+    provider: ProviderKind,
+    #[arg(long)]
+    base_url: Option<String>,
+    #[arg(long)]
+    models: String,
+    #[arg(long, value_enum, default_value_t = EvalPack::All)]
+    pack: EvalPack,
+    #[arg(long)]
+    out: Option<PathBuf>,
+    #[arg(long, default_value_t = 1)]
+    runs_per_task: usize,
+    #[arg(long, default_value_t = 30)]
+    max_steps: usize,
+    #[arg(long, default_value_t = 600)]
+    timeout_seconds: u64,
+    #[arg(long, value_enum, default_value_t = TrustMode::On)]
+    trust: TrustMode,
+    #[arg(long, value_enum, default_value_t = ApprovalMode::Auto)]
+    approval_mode: ApprovalMode,
+    #[arg(long, value_enum, default_value_t = AutoApproveScope::Run)]
+    auto_approve_scope: AutoApproveScope,
+    #[arg(long, default_value_t = false)]
+    enable_write_tools: bool,
+    #[arg(long, default_value_t = false)]
+    allow_write: bool,
+    #[arg(long, default_value_t = false)]
+    allow_shell: bool,
+    #[arg(long = "unsafe", default_value_t = false)]
+    unsafe_mode: bool,
+    #[arg(long, default_value_t = false)]
+    no_limits: bool,
+    #[arg(long, default_value_t = false)]
+    unsafe_bypass_allow_flags: bool,
+    #[arg(long = "mcp")]
+    mcp: Vec<String>,
+    #[arg(long)]
+    mcp_config: Option<PathBuf>,
+    #[arg(long, default_value = "default")]
+    session: String,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    no_session: bool,
+    #[arg(long, default_value_t = 40)]
+    max_session_messages: usize,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    #[arg(long)]
+    workdir: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    keep_workdir: bool,
+    #[arg(long)]
+    policy: Option<PathBuf>,
+    #[arg(long)]
+    approvals: Option<PathBuf>,
+    #[arg(long)]
+    audit: Option<PathBuf>,
+    #[arg(long)]
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Parser)]
 #[command(name = "openagent")]
 #[command(about = "Local-runtime OpenAgent loop with tool calling", long_about = None)]
 struct Cli {
@@ -97,6 +182,10 @@ struct RunArgs {
     workdir: PathBuf,
     #[arg(long)]
     state_dir: Option<PathBuf>,
+    #[arg(long = "mcp")]
+    mcp: Vec<String>,
+    #[arg(long)]
+    mcp_config: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     allow_shell: bool,
     #[arg(long, default_value_t = false)]
@@ -133,6 +222,10 @@ struct RunArgs {
     reset_session: bool,
     #[arg(long, default_value_t = 40)]
     max_session_messages: usize,
+    #[arg(long, default_value_t = false)]
+    stream: bool,
+    #[arg(long)]
+    events: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -181,6 +274,30 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         },
+        Some(Commands::Mcp(args)) => {
+            let mcp_config_path = resolved_mcp_config_path(&cli.run, &paths.state_dir);
+            match &args.command {
+                McpSubcommand::List => {
+                    let names = mcp_list_servers(&mcp_config_path)?;
+                    for n in names {
+                        println!("{n}");
+                    }
+                    return Ok(());
+                }
+                McpSubcommand::Doctor { name } => {
+                    match mcp_doctor_server(&mcp_config_path, name).await {
+                        Ok(count) => {
+                            println!("OK: mcp {} tool_count={}", name, count);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            println!("FAIL: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
         Some(Commands::Approvals(args)) => {
             handle_approvals_command(&paths.approvals_path, &args.command)?;
             return Ok(());
@@ -212,6 +329,65 @@ async fn main() -> anyhow::Result<()> {
                     ));
                 }
             }
+        }
+        Some(Commands::Eval(args)) => {
+            if args.no_limits && !args.unsafe_mode {
+                return Err(anyhow!("--no-limits requires --unsafe"));
+            }
+            if args.unsafe_mode {
+                eprintln!("WARN: unsafe mode enabled");
+            }
+            let models = args
+                .models
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if models.is_empty() {
+                return Err(anyhow!("--models is required and must not be empty"));
+            }
+            let mut enable_write_tools = args.enable_write_tools;
+            if matches!(args.pack, EvalPack::Coding | EvalPack::All) && !args.enable_write_tools {
+                enable_write_tools = true;
+            }
+            let cfg = EvalConfig {
+                provider: args.provider,
+                base_url: args
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| default_base_url(args.provider).to_string()),
+                api_key: args.api_key.clone(),
+                models,
+                pack: args.pack,
+                out: args.out.clone(),
+                runs_per_task: args.runs_per_task,
+                max_steps: args.max_steps,
+                timeout_seconds: args.timeout_seconds,
+                trust: args.trust,
+                approval_mode: args.approval_mode,
+                auto_approve_scope: args.auto_approve_scope,
+                enable_write_tools,
+                allow_write: args.allow_write,
+                allow_shell: args.allow_shell,
+                unsafe_mode: args.unsafe_mode,
+                no_limits: args.no_limits,
+                unsafe_bypass_allow_flags: args.unsafe_bypass_allow_flags,
+                mcp: args.mcp.clone(),
+                mcp_config: args.mcp_config.clone(),
+                session: args.session.clone(),
+                no_session: args.no_session,
+                max_session_messages: args.max_session_messages,
+                state_dir_override: args.state_dir.clone(),
+                policy_override: args.policy.clone(),
+                approvals_override: args.approvals.clone(),
+                audit_override: args.audit.clone(),
+                workdir_override: args.workdir.clone(),
+                keep_workdir: args.keep_workdir,
+            };
+            let cwd = std::env::current_dir().with_context(|| "failed to read current dir")?;
+            run_eval(cfg, &cwd).await?;
+            return Ok(());
         }
         None => {}
     }
@@ -350,10 +526,25 @@ async fn run_agent<P: ModelProvider>(
         store::load_session(&session_path)?
     };
 
+    let mcp_config_path = resolved_mcp_config_path(args, &paths.state_dir);
+    let mcp_registry = if args.mcp.is_empty() {
+        None
+    } else {
+        Some(
+            McpRegistry::from_config_path(&mcp_config_path, &args.mcp, Duration::from_secs(30))
+                .await?,
+        )
+    };
+
+    let mut all_tools = builtin_tools_enabled(args.enable_write_tools);
+    if let Some(reg) = &mcp_registry {
+        all_tools.extend(reg.tool_defs());
+    }
+
     let mut agent = Agent {
         provider,
         model: model.to_string(),
-        tools: builtin_tools_enabled(args.enable_write_tools),
+        tools: all_tools,
         max_steps: args.max_steps,
         tool_rt: ToolRuntime {
             workdir,
@@ -373,9 +564,38 @@ async fn run_agent<P: ModelProvider>(
         },
         gate,
         gate_ctx,
+        mcp_registry,
+        stream: args.stream,
+        event_sink: build_event_sink(args.stream, args.events.as_deref())?,
     };
 
-    let outcome = agent.run(prompt, session_messages).await;
+    let outcome = tokio::select! {
+        out = agent.run(prompt, session_messages) => out,
+        _ = tokio::signal::ctrl_c() => {
+            agent::AgentOutcome {
+                run_id: uuid::Uuid::new_v4().to_string(),
+                started_at: trust::now_rfc3339(),
+                finished_at: trust::now_rfc3339(),
+                exit_reason: AgentExitReason::Cancelled,
+                final_output: String::new(),
+                error: Some("cancelled".to_string()),
+                messages: Vec::new(),
+                tool_calls: Vec::new(),
+            }
+        }
+    };
+    if matches!(outcome.exit_reason, AgentExitReason::Cancelled) {
+        if let Some(sink) = &mut agent.event_sink {
+            if let Err(e) = sink.emit(Event::new(
+                outcome.run_id.clone(),
+                0,
+                EventKind::RunEnd,
+                serde_json::json!({"exit_reason":"cancelled"}),
+            )) {
+                eprintln!("WARN: failed to emit cancellation event: {e}");
+            }
+        }
+    }
     if !args.no_session {
         let session_messages = extract_session_messages(&outcome.messages);
         if let Err(e) =
@@ -400,6 +620,8 @@ async fn run_agent<P: ModelProvider>(
         unsafe_mode: args.unsafe_mode,
         no_limits: args.no_limits,
         unsafe_bypass_allow_flags: args.unsafe_bypass_allow_flags,
+        stream: args.stream,
+        events_path: args.events.as_ref().map(|p| p.display().to_string()),
     };
     let config_fingerprint = ConfigFingerprintV1 {
         schema_version: "openagent.confighash.v1".to_string(),
@@ -429,6 +651,12 @@ async fn run_agent<P: ModelProvider>(
         unsafe_mode: args.unsafe_mode,
         no_limits: args.no_limits,
         unsafe_bypass_allow_flags: args.unsafe_bypass_allow_flags,
+        stream: args.stream,
+        events_path: args
+            .events
+            .as_ref()
+            .map(|p| stable_path_string(p))
+            .unwrap_or_default(),
     };
     let config_hash_hex = config_hash_hex(&config_fingerprint)?;
     if let Err(e) = store::write_run_record(
@@ -442,7 +670,9 @@ async fn run_agent<P: ModelProvider>(
         eprintln!("WARN: failed to write run artifact: {e}");
     }
 
-    println!("{}", outcome.final_output);
+    if !args.stream {
+        println!("{}", outcome.final_output);
+    }
 
     if matches!(outcome.exit_reason, AgentExitReason::ProviderError) {
         let err = outcome
@@ -459,6 +689,30 @@ async fn run_agent<P: ModelProvider>(
     }
 
     Ok(())
+}
+
+fn resolved_mcp_config_path(args: &RunArgs, state_dir: &std::path::Path) -> PathBuf {
+    args.mcp_config
+        .clone()
+        .unwrap_or_else(|| state_dir.join("mcp_servers.json"))
+}
+
+fn build_event_sink(
+    stream: bool,
+    events_path: Option<&std::path::Path>,
+) -> anyhow::Result<Option<Box<dyn EventSink>>> {
+    let mut multi = MultiSink::new();
+    if stream {
+        multi.push(Box::new(StdoutSink::new()));
+    }
+    if let Some(path) = events_path {
+        multi.push(Box::new(JsonlFileSink::new(path)?));
+    }
+    if multi.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Box::new(multi)))
+    }
 }
 
 struct GateBuild {
