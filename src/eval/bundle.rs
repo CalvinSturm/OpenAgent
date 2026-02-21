@@ -270,7 +270,7 @@ with zipfile.ZipFile(sys.argv[1], "r") as z:
     #[test]
     fn bundle_contains_expected_entries() {
         let td = tempfile::tempdir().expect("tempdir");
-        let state_dir = td.path().join(".openagent");
+        let state_dir = td.path().join(".localagent");
         fs::create_dir_all(state_dir.join("runs")).expect("mkdir");
         fs::write(
             state_dir.join("runs").join("r1.json"),

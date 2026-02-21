@@ -317,7 +317,7 @@ mod tests {
         })
         .expect("init");
         assert!(out.contains("STATE_DIR"));
-        let state_dir = workdir.join(".openagent");
+        let state_dir = workdir.join(".localagent");
         assert!(state_dir.join("policy.yaml").exists());
         assert!(state_dir.join("approvals.json").exists());
         assert!(state_dir.join("mcp_servers.json").exists());
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn init_respects_force_and_print_only() {
         let tmp = TempDir::new().expect("tmp");
-        let state_dir = tmp.path().join(".openagent");
+        let state_dir = tmp.path().join(".localagent");
         std::fs::create_dir_all(&state_dir).expect("mkdir");
         let policy = state_dir.join("policy.yaml");
         std::fs::write(&policy, "custom\n").expect("write");
@@ -360,7 +360,7 @@ mod tests {
             print_only: true,
         })
         .expect("print");
-        assert!(!tmp2.path().join(".openagent").exists());
+        assert!(!tmp2.path().join(".localagent").exists());
     }
 
     #[test]

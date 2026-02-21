@@ -79,19 +79,19 @@ localagent
 
 ## State + Templates
 
-Default state dir: `<workdir>/.openagent`
+Default state dir: `<workdir>/.localagent`
 
 ```bash
 localagent init
 localagent init --print
 localagent template list
 localagent template show instructions.yaml
-localagent template write policy.yaml --out .openagent/policy.yaml --force
+localagent template write policy.yaml --out .localagent/policy.yaml --force
 ```
 
 ## Instructions Profiles
 
-`localagent init` now scaffolds `.openagent/instructions.yaml`.
+`localagent init` now scaffolds `.localagent/instructions.yaml`.
 
 Use task/model overlays:
 

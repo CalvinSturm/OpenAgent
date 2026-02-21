@@ -36,7 +36,7 @@ Date: 2026-02-21
 
 ## Init + Templates
 
-- `localagent init` scaffolds `.openagent/` state.
+- `localagent init` scaffolds `.localagent/` state.
 - Includes deterministic templates such as:
   - `policy.yaml`
   - `instructions.yaml`

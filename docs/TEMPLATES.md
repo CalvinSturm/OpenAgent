@@ -24,13 +24,13 @@ localagent template show policy.yaml
 Write a template to disk:
 
 ```bash
-localagent template write policy_cases.yaml --out .openagent/policy_cases.yaml
+localagent template write policy_cases.yaml --out .localagent/policy_cases.yaml
 ```
 
 Overwrite existing file:
 
 ```bash
-localagent template write policy.yaml --out .openagent/policy.yaml --force
+localagent template write policy.yaml --out .localagent/policy.yaml --force
 ```
 
 ## Init Relationship
