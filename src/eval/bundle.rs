@@ -154,6 +154,16 @@ fn copy_to_staging(root: &Path, relative: &Path, source: &Path) -> anyhow::Resul
 }
 
 fn compress_staging_dir(staging: &Path, output_zip: &Path) -> anyhow::Result<()> {
+    if cfg!(windows) {
+        compress_with_powershell(staging, output_zip)
+            .or_else(|_| compress_with_python(staging, output_zip))
+    } else {
+        compress_with_python(staging, output_zip)
+            .or_else(|_| compress_with_powershell(staging, output_zip))
+    }
+}
+
+fn compress_with_powershell(staging: &Path, output_zip: &Path) -> anyhow::Result<()> {
     let script = format!(
         "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; if (Test-Path '{}') {{ Remove-Item '{}' -Force }}; [System.IO.Compression.ZipFile]::CreateFromDirectory('{}','{}')",
         output_zip.display(),
@@ -164,12 +174,50 @@ fn compress_staging_dir(staging: &Path, output_zip: &Path) -> anyhow::Result<()>
     let status = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
         .status()
-        .context("failed to run Compress-Archive")?;
+        .context("failed to run PowerShell zip")?;
     if status.success() {
         Ok(())
     } else {
-        Err(anyhow!("Compress-Archive failed with status {status}"))
+        Err(anyhow!("PowerShell zip failed with status {status}"))
     }
+}
+
+fn compress_with_python(staging: &Path, output_zip: &Path) -> anyhow::Result<()> {
+    let script = r#"
+import os, sys, zipfile
+staging = sys.argv[1]
+out = sys.argv[2]
+if os.path.exists(out):
+    os.remove(out)
+with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    for root, _, files in os.walk(staging):
+        files.sort()
+        for f in files:
+            p = os.path.join(root, f)
+            rel = os.path.relpath(p, staging).replace("\\", "/")
+            z.write(p, rel)
+"#;
+    let mut last_err: Option<anyhow::Error> = None;
+    for py in ["python3", "python"] {
+        match std::process::Command::new(py)
+            .args([
+                "-c",
+                script,
+                &staging.to_string_lossy(),
+                &output_zip.to_string_lossy(),
+            ])
+            .status()
+        {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_err = Some(anyhow!("{py} zip failed with status {status}"));
+            }
+            Err(err) => {
+                last_err = Some(anyhow!("{py} not available: {err}"));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("python zip unavailable")))
 }
 
 #[cfg(test)]
@@ -184,26 +232,39 @@ mod tests {
     use super::{create_bundle, BundleSpec};
 
     fn list_zip_entries(zip_path: &Path) -> anyhow::Result<Vec<String>> {
-        let script = format!(
-            "Add-Type -AssemblyName System.IO.Compression.FileSystem; $a=[IO.Compression.ZipFile]::OpenRead('{}'); $a.Entries | ForEach-Object {{$_.FullName}}; $a.Dispose()",
-            zip_path.display()
-        );
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .output()?;
-        if !out.status.success() {
-            return Err(anyhow::anyhow!(
-                "failed listing zip entries: {}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
+        let script = r#"
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "r") as z:
+    names = sorted(n.replace("\\", "/") for n in z.namelist() if not n.endswith("/"))
+    for n in names:
+        print(n)
+"#;
+        let mut last_err: Option<anyhow::Error> = None;
+        for py in ["python3", "python"] {
+            match std::process::Command::new(py)
+                .args(["-c", script, &zip_path.to_string_lossy()])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    let lines = String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>();
+                    return Ok(lines);
+                }
+                Ok(out) => {
+                    last_err = Some(anyhow::anyhow!(
+                        "{py} zip listing failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                Err(err) => {
+                    last_err = Some(anyhow::anyhow!("{py} not available: {err}"));
+                }
+            }
         }
-        let mut lines = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|s| s.trim().replace('\\', "/"))
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-        lines.sort();
-        Ok(lines)
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no python available for zip listing")))
     }
 
     #[test]
