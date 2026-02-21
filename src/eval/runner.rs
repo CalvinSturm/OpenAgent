@@ -76,6 +76,14 @@ pub struct EvalConfig {
     pub workdir_override: Option<PathBuf>,
     pub keep_workdir: bool,
     pub http: HttpConfig,
+    pub min_pass_rate: f64,
+    pub fail_on_any: bool,
+    pub max_avg_steps: Option<f64>,
+    pub resolved_profile_name: Option<String>,
+    pub resolved_profile_path: Option<String>,
+    pub resolved_profile_hash_hex: Option<String>,
+    pub junit: Option<PathBuf>,
+    pub summary_md: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +94,10 @@ pub struct EvalResults {
     pub summary: EvalSummary,
     pub by_model: BTreeMap<String, ModelSummary>,
     pub runs: Vec<EvalRunRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<EvalBaselineStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regression: Option<crate::eval::baseline::RegressionResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +140,76 @@ pub struct EvalResultsConfig {
     pub http_stream_idle_timeout_ms: u64,
     pub http_max_response_bytes: usize,
     pub http_max_line_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_profile_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_profile_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_profile_hash_hex: Option<String>,
+    pub min_pass_rate: f64,
+    pub fail_on_any: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_avg_steps: Option<f64>,
+}
+
+impl EvalResultsConfig {
+    #[cfg(test)]
+    pub fn minimal_for_tests() -> Self {
+        Self {
+            provider: "ollama".to_string(),
+            base_url: "http://localhost:11434".to_string(),
+            models: vec!["m".to_string()],
+            pack: "all".to_string(),
+            runs_per_task: 1,
+            max_steps: 30,
+            timeout_seconds: 60,
+            trust_mode: "on".to_string(),
+            approval_mode: "auto".to_string(),
+            auto_approve_scope: "run".to_string(),
+            allow_shell: false,
+            allow_write: false,
+            enable_write_tools: false,
+            unsafe_mode: false,
+            no_limits: false,
+            unsafe_bypass_allow_flags: false,
+            mcp: vec![],
+            no_session: true,
+            session: "default".to_string(),
+            max_context_chars: 0,
+            compaction_mode: "off".to_string(),
+            compaction_keep_last: 20,
+            tool_result_persist: "digest".to_string(),
+            hooks_mode: "off".to_string(),
+            hooks_config_path: String::new(),
+            hooks_strict: false,
+            hooks_timeout_ms: 2000,
+            hooks_max_stdout_bytes: 200_000,
+            tool_args_strict: "on".to_string(),
+            tui_enabled: false,
+            tui_refresh_ms: 50,
+            tui_max_log_lines: 200,
+            http_max_retries: 2,
+            http_timeout_ms: 60_000,
+            http_connect_timeout_ms: 2_000,
+            http_stream_idle_timeout_ms: 15_000,
+            http_max_response_bytes: 10_000_000,
+            http_max_line_bytes: 200_000,
+            resolved_profile_name: None,
+            resolved_profile_path: None,
+            resolved_profile_hash_hex: None,
+            min_pass_rate: 0.0,
+            fail_on_any: false,
+            max_avg_steps: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalBaselineStatus {
+    pub name: String,
+    pub path: String,
+    pub loaded: bool,
+    pub profile_hash_mismatch: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -296,10 +378,18 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
             http_stream_idle_timeout_ms: config.http.stream_idle_timeout_ms,
             http_max_response_bytes: config.http.max_response_bytes,
             http_max_line_bytes: config.http.max_line_bytes,
+            resolved_profile_name: config.resolved_profile_name.clone(),
+            resolved_profile_path: config.resolved_profile_path.clone(),
+            resolved_profile_hash_hex: config.resolved_profile_hash_hex.clone(),
+            min_pass_rate: config.min_pass_rate,
+            fail_on_any: config.fail_on_any,
+            max_avg_steps: config.max_avg_steps,
         },
         summary: EvalSummary::default(),
         by_model: BTreeMap::new(),
         runs: Vec::new(),
+        baseline: None,
+        regression: None,
     };
 
     for model in &config.models {
@@ -413,6 +503,12 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
 
     finalize_summary(&mut results);
     write_results(&out_path, &results)?;
+    if let Some(junit) = &config.junit {
+        write_junit(junit, &results)?;
+    }
+    if let Some(md) = &config.summary_md {
+        write_summary_md(md, &results)?;
+    }
     println!("eval results written: {}", out_path.display());
     Ok(out_path)
 }
@@ -1138,6 +1234,87 @@ fn write_results(path: &Path, results: &EvalResults) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn write_junit(path: &Path, results: &EvalResults) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites>\n");
+    for (model, stats) in &results.by_model {
+        let tests = stats.passed + stats.failed + stats.skipped;
+        xml.push_str(&format!(
+            "<testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" skipped=\"{}\">\n",
+            xml_escape(model),
+            tests,
+            stats.failed,
+            stats.skipped
+        ));
+        for (task_id, task) in &stats.tasks {
+            for run in &task.runs {
+                xml.push_str(&format!(
+                    "<testcase name=\"{}:{}:{}\" time=\"0\">",
+                    xml_escape(model),
+                    xml_escape(task_id),
+                    run.run_index
+                ));
+                if run.status == "skipped" {
+                    xml.push_str(&format!(
+                        "<skipped message=\"{}\"/>",
+                        xml_escape(run.skip_reason.as_deref().unwrap_or("skipped"))
+                    ));
+                } else if !run.passed {
+                    xml.push_str(&format!(
+                        "<failure message=\"{}\">{}</failure>",
+                        xml_escape(&run.exit_reason),
+                        xml_escape(&run.failures.join("; "))
+                    ));
+                }
+                xml.push_str("</testcase>\n");
+            }
+        }
+        xml.push_str("</testsuite>\n");
+    }
+    xml.push_str("</testsuites>\n");
+    std::fs::write(path, xml)?;
+    Ok(())
+}
+
+fn write_summary_md(path: &Path, results: &EvalResults) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut md = String::new();
+    md.push_str("# OpenAgent Eval Summary\n\n");
+    md.push_str(&format!(
+        "- Total: {}\n- Passed: {}\n- Failed: {}\n- Skipped: {}\n- Pass rate: {:.2}%\n\n",
+        results.summary.total_runs,
+        results.summary.passed,
+        results.summary.failed,
+        results.summary.skipped,
+        results.summary.pass_rate * 100.0
+    ));
+    md.push_str("## Per model\n\n");
+    for (model, stats) in &results.by_model {
+        md.push_str(&format!(
+            "- {}: passed {}, failed {}, skipped {}, pass {:.2}%\n",
+            model,
+            stats.passed,
+            stats.failed,
+            stats.skipped,
+            stats.pass_rate * 100.0
+        ));
+    }
+    std::fs::write(path, md)?;
+    Ok(())
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1158,46 +1335,7 @@ mod tests {
         let mut results = EvalResults {
             schema_version: "openagent.eval.v1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
-            config: EvalResultsConfig {
-                provider: "ollama".to_string(),
-                base_url: "http://localhost:11434".to_string(),
-                models: vec!["m".to_string()],
-                pack: "coding".to_string(),
-                runs_per_task: 1,
-                max_steps: 30,
-                timeout_seconds: 60,
-                trust_mode: "on".to_string(),
-                approval_mode: "auto".to_string(),
-                auto_approve_scope: "run".to_string(),
-                allow_shell: false,
-                allow_write: false,
-                enable_write_tools: true,
-                unsafe_mode: false,
-                no_limits: false,
-                unsafe_bypass_allow_flags: false,
-                mcp: vec![],
-                no_session: true,
-                session: "default".to_string(),
-                max_context_chars: 0,
-                compaction_mode: "off".to_string(),
-                compaction_keep_last: 20,
-                tool_result_persist: "digest".to_string(),
-                hooks_mode: "off".to_string(),
-                hooks_config_path: String::new(),
-                hooks_strict: false,
-                hooks_timeout_ms: 2000,
-                hooks_max_stdout_bytes: 200_000,
-                tool_args_strict: "on".to_string(),
-                tui_enabled: false,
-                tui_refresh_ms: 50,
-                tui_max_log_lines: 200,
-                http_max_retries: 2,
-                http_timeout_ms: 60_000,
-                http_connect_timeout_ms: 2_000,
-                http_stream_idle_timeout_ms: 15_000,
-                http_max_response_bytes: 10_000_000,
-                http_max_line_bytes: 200_000,
-            },
+            config: EvalResultsConfig::minimal_for_tests(),
             summary: Default::default(),
             by_model: BTreeMap::new(),
             runs: vec![
@@ -1250,6 +1388,8 @@ mod tests {
                     }),
                 },
             ],
+            baseline: None,
+            regression: None,
         };
         finalize_summary(&mut results);
         assert_eq!(results.summary.total_runs, 2);
@@ -1323,6 +1463,14 @@ mod tests {
             workdir_override: None,
             keep_workdir: false,
             http: HttpConfig::default(),
+            min_pass_rate: 0.0,
+            fail_on_any: false,
+            max_avg_steps: None,
+            resolved_profile_name: None,
+            resolved_profile_path: None,
+            resolved_profile_hash_hex: None,
+            junit: None,
+            summary_md: None,
         };
         let reason = missing_capability_reason(&task, &cfg, false).expect("reason");
         assert!(reason.contains("--enable-write-tools"));
@@ -1390,6 +1538,14 @@ mod tests {
             workdir_override: None,
             keep_workdir: false,
             http: HttpConfig::default(),
+            min_pass_rate: 0.0,
+            fail_on_any: false,
+            max_avg_steps: None,
+            resolved_profile_name: None,
+            resolved_profile_path: None,
+            resolved_profile_hash_hex: None,
+            junit: None,
+            summary_md: None,
         };
         let reason = missing_capability_reason(&task, &cfg, false).expect("reason");
         assert!(reason.contains("--mcp playwright"));

@@ -24,6 +24,12 @@ use agent::{Agent, AgentExitReason, PolicyLoadedInfo};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
+use eval::baseline::{
+    baseline_path, compare_results, create_baseline_from_results, delete_baseline, list_baselines,
+    load_baseline,
+};
+use eval::bundle::{create_bundle, BundleSpec};
+use eval::profile::{doctor_profile, list_profiles, load_profile};
 use eval::runner::{run_eval, EvalConfig};
 use eval::tasks::EvalPack;
 use events::{Event, EventKind, EventSink, JsonlFileSink, MultiSink, StdoutSink};
@@ -63,8 +69,61 @@ enum Commands {
     Deny(DenyArgs),
     Replay(ReplayArgs),
     Session(SessionArgs),
-    Eval(Box<EvalArgs>),
+    Eval(Box<EvalCmd>),
     Tui(TuiArgs),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum EvalProfileSubcommand {
+    List,
+    Show {
+        name: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long)]
+        profile_path: Option<PathBuf>,
+    },
+    Doctor {
+        name: String,
+        #[arg(long)]
+        profile_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum EvalBaselineSubcommand {
+    Create {
+        name: String,
+        #[arg(long)]
+        from: PathBuf,
+    },
+    Show {
+        name: String,
+    },
+    Delete {
+        name: String,
+    },
+    List,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum EvalSubcommand {
+    Profile {
+        #[command(subcommand)]
+        command: EvalProfileSubcommand,
+    },
+    Baseline {
+        #[command(subcommand)]
+        command: EvalBaselineSubcommand,
+    },
+}
+
+#[derive(Debug, Clone, Parser)]
+struct EvalCmd {
+    #[command(subcommand)]
+    command: Option<EvalSubcommand>,
+    #[command(flatten)]
+    run: EvalArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -208,24 +267,34 @@ struct ReplayArgs {
     run_id: String,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 struct EvalArgs {
     #[arg(long, value_enum, default_value_t = ProviderKind::Ollama)]
     provider: ProviderKind,
     #[arg(long)]
     base_url: Option<String>,
     #[arg(long)]
-    models: String,
+    models: Option<String>,
     #[arg(long, value_enum, default_value_t = EvalPack::All)]
     pack: EvalPack,
     #[arg(long)]
     out: Option<PathBuf>,
+    #[arg(long)]
+    junit: Option<PathBuf>,
+    #[arg(long = "summary-md")]
+    summary_md: Option<PathBuf>,
     #[arg(long, default_value_t = 1)]
     runs_per_task: usize,
     #[arg(long, default_value_t = 30)]
     max_steps: usize,
     #[arg(long, default_value_t = 600)]
     timeout_seconds: u64,
+    #[arg(long, default_value_t = 0.0)]
+    min_pass_rate: f64,
+    #[arg(long, default_value_t = false)]
+    fail_on_any: bool,
+    #[arg(long)]
+    max_avg_steps: Option<f64>,
     #[arg(long, value_enum, default_value_t = TrustMode::On)]
     trust: TrustMode,
     #[arg(long, value_enum, default_value_t = ApprovalMode::Auto)]
@@ -293,6 +362,20 @@ struct EvalArgs {
     tool_args_strict: ToolArgsStrict,
     #[arg(long, value_enum, default_value_t = CapsMode::Off)]
     caps: CapsMode,
+    #[arg(long)]
+    profile: Option<String>,
+    #[arg(long)]
+    profile_path: Option<PathBuf>,
+    #[arg(long)]
+    baseline: Option<String>,
+    #[arg(long)]
+    compare_baseline: Option<String>,
+    #[arg(long, default_value_t = false)]
+    fail_on_regression: bool,
+    #[arg(long)]
+    bundle: Option<PathBuf>,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    bundle_on_fail: bool,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     #[arg(long)]
@@ -593,7 +676,99 @@ async fn main() -> anyhow::Result<()> {
             handle_session_command(&store, &args.command)?;
             return Ok(());
         }
-        Some(Commands::Eval(args)) => {
+        Some(Commands::Eval(eval_cmd)) => {
+            if let Some(sub) = &eval_cmd.command {
+                match sub {
+                    EvalSubcommand::Profile { command } => {
+                        match command {
+                            EvalProfileSubcommand::List => {
+                                for p in list_profiles(&paths.state_dir)? {
+                                    println!("{p}");
+                                }
+                            }
+                            EvalProfileSubcommand::Show {
+                                name,
+                                json,
+                                profile_path,
+                            } => {
+                                let loaded = load_profile(
+                                    &paths.state_dir,
+                                    Some(name.as_str()),
+                                    profile_path.as_deref(),
+                                )?;
+                                if *json {
+                                    println!("{}", serde_json::to_string_pretty(&loaded.profile)?);
+                                } else {
+                                    println!("{}", serde_yaml::to_string(&loaded.profile)?);
+                                }
+                            }
+                            EvalProfileSubcommand::Doctor { name, profile_path } => {
+                                let loaded = load_profile(
+                                    &paths.state_dir,
+                                    Some(name.as_str()),
+                                    profile_path.as_deref(),
+                                )?;
+                                let req = doctor_profile(&loaded.profile)?;
+                                let provider = match loaded.profile.provider.as_deref() {
+                                    Some("lmstudio") => ProviderKind::Lmstudio,
+                                    Some("llamacpp") => ProviderKind::Llamacpp,
+                                    _ => ProviderKind::Ollama,
+                                };
+                                let base_url = loaded
+                                    .profile
+                                    .base_url
+                                    .clone()
+                                    .unwrap_or_else(|| default_base_url(provider).to_string());
+                                match doctor_check(&DoctorArgs {
+                                    provider,
+                                    base_url: Some(base_url.clone()),
+                                    api_key: None,
+                                })
+                                .await
+                                {
+                                    Ok(ok) => println!("{ok}"),
+                                    Err(e) => {
+                                        eprintln!("FAIL: {e}");
+                                        std::process::exit(1);
+                                    }
+                                }
+                                if req.is_empty() {
+                                    println!("Required flags: (none)");
+                                } else {
+                                    println!("Required flags: {}", req.join(" "));
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                    EvalSubcommand::Baseline { command } => {
+                        match command {
+                            EvalBaselineSubcommand::Create { name, from } => {
+                                let path =
+                                    create_baseline_from_results(&paths.state_dir, name, from)?;
+                                println!("created baseline {} at {}", name, path.display());
+                            }
+                            EvalBaselineSubcommand::Show { name } => {
+                                let b = load_baseline(&paths.state_dir, name)?;
+                                println!("{}", serde_json::to_string_pretty(&b)?);
+                            }
+                            EvalBaselineSubcommand::Delete { name } => {
+                                delete_baseline(&paths.state_dir, name)?;
+                                println!("deleted baseline {name}");
+                            }
+                            EvalBaselineSubcommand::List => {
+                                for n in list_baselines(&paths.state_dir)? {
+                                    println!("{n}");
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            let mut args = eval_cmd.run.clone();
+            let loaded_profile = apply_eval_profile_overrides(&mut args, &paths.state_dir)?;
+
             if args.no_limits && !args.unsafe_mode {
                 return Err(anyhow!("--no-limits requires --unsafe"));
             }
@@ -602,6 +777,8 @@ async fn main() -> anyhow::Result<()> {
             }
             let models = args
                 .models
+                .clone()
+                .ok_or_else(|| anyhow!("--models is required and must not be empty"))?
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -624,6 +801,8 @@ async fn main() -> anyhow::Result<()> {
                 models,
                 pack: args.pack,
                 out: args.out.clone(),
+                junit: args.junit.clone(),
+                summary_md: args.summary_md.clone(),
                 runs_per_task: args.runs_per_task,
                 max_steps: args.max_steps,
                 timeout_seconds: args.timeout_seconds,
@@ -660,10 +839,108 @@ async fn main() -> anyhow::Result<()> {
                 audit_override: args.audit.clone(),
                 workdir_override: args.workdir.clone(),
                 keep_workdir: args.keep_workdir,
-                http: http_config_from_eval_args(args),
+                http: http_config_from_eval_args(&args),
+                min_pass_rate: args.min_pass_rate,
+                fail_on_any: args.fail_on_any,
+                max_avg_steps: args.max_avg_steps,
+                resolved_profile_name: args.profile.clone(),
+                resolved_profile_path: loaded_profile
+                    .as_ref()
+                    .map(|p| stable_path_string(&p.path))
+                    .or_else(|| args.profile_path.as_ref().map(|p| stable_path_string(p))),
+                resolved_profile_hash_hex: loaded_profile.as_ref().map(|p| p.hash_hex.clone()),
             };
             let cwd = std::env::current_dir().with_context(|| "failed to read current dir")?;
-            run_eval(cfg, &cwd).await?;
+            let results_path = run_eval(cfg.clone(), &cwd).await?;
+            let mut exit_fail = false;
+            let mut results: eval::runner::EvalResults =
+                serde_json::from_slice(&std::fs::read(&results_path)?)?;
+
+            if let Some(name) = args.baseline.clone() {
+                let created = create_baseline_from_results(&paths.state_dir, &name, &results_path)?;
+                println!("baseline created: {} ({})", name, created.display());
+            }
+
+            let avg_steps = eval::baseline::avg_steps(&results);
+            let mut threshold_failures = Vec::new();
+            if results.summary.pass_rate < args.min_pass_rate {
+                threshold_failures.push(format!(
+                    "pass_rate {} < min_pass_rate {}",
+                    results.summary.pass_rate, args.min_pass_rate
+                ));
+            }
+            if let Some(max_avg) = args.max_avg_steps {
+                if avg_steps > max_avg {
+                    threshold_failures.push(format!(
+                        "avg_steps {} > max_avg_steps {}",
+                        avg_steps, max_avg
+                    ));
+                }
+            }
+            if args.fail_on_any && results.summary.failed > 0 {
+                threshold_failures.push(format!("failed runs present: {}", results.summary.failed));
+            }
+            if !threshold_failures.is_empty() {
+                exit_fail = true;
+                eprintln!("THRESHOLDS: FAIL");
+                for f in &threshold_failures {
+                    eprintln!(" - {f}");
+                }
+            }
+
+            if let Some(name) = args.compare_baseline.clone() {
+                let path = baseline_path(&paths.state_dir, &name);
+                let baseline = load_baseline(&paths.state_dir, &name)?;
+                let mut profile_hash_mismatch = false;
+                if baseline.profile_hash_hex != results.config.resolved_profile_hash_hex {
+                    profile_hash_mismatch = true;
+                    eprintln!(
+                        "WARN: baseline profile hash mismatch (baseline={:?}, current={:?})",
+                        baseline.profile_hash_hex, results.config.resolved_profile_hash_hex
+                    );
+                }
+                let reg = compare_results(&baseline, &results);
+                println!(
+                    "REGRESSION: {}",
+                    if reg.passed {
+                        "PASS".to_string()
+                    } else {
+                        format!("FAIL ({} failures)", reg.failures.len())
+                    }
+                );
+                if args.fail_on_regression && !reg.passed {
+                    exit_fail = true;
+                }
+                results.baseline = Some(eval::runner::EvalBaselineStatus {
+                    name,
+                    path: stable_path_string(&path),
+                    loaded: true,
+                    profile_hash_mismatch,
+                });
+                results.regression = Some(reg);
+                std::fs::write(&results_path, serde_json::to_string_pretty(&results)?)?;
+            }
+
+            if let Some(bundle_path) = args.bundle.clone() {
+                let should_bundle = !args.bundle_on_fail || exit_fail;
+                if should_bundle {
+                    let out = create_bundle(&BundleSpec {
+                        bundle_path,
+                        state_dir: paths.state_dir.clone(),
+                        results_path: results_path.clone(),
+                        junit_path: args.junit.clone(),
+                        summary_md_path: args.summary_md.clone(),
+                        baseline_name: args.compare_baseline.clone(),
+                        profile_name: args.profile.clone(),
+                        profile_hash_hex: results.config.resolved_profile_hash_hex.clone(),
+                    })?;
+                    println!("bundle written: {}", out.display());
+                }
+            }
+
+            if exit_fail {
+                std::process::exit(1);
+            }
             return Ok(());
         }
         Some(Commands::Tui(args)) => match &args.command {
@@ -1602,6 +1879,138 @@ fn http_config_from_eval_args(args: &EvalArgs) -> HttpConfig {
         http_max_retries: args.http_max_retries,
         ..HttpConfig::default()
     }
+}
+
+fn cli_has_flag(flag: &str) -> bool {
+    std::env::args().any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+}
+
+fn apply_eval_profile_overrides(
+    args: &mut EvalArgs,
+    state_dir: &std::path::Path,
+) -> anyhow::Result<Option<eval::profile::LoadedProfile>> {
+    let loaded = if args.profile.is_some() || args.profile_path.is_some() {
+        Some(load_profile(
+            state_dir,
+            args.profile.as_deref(),
+            args.profile_path.as_deref(),
+        )?)
+    } else {
+        None
+    };
+    let Some(loaded) = loaded else {
+        return Ok(None);
+    };
+    let p = &loaded.profile;
+
+    if !cli_has_flag("--provider") {
+        if let Some(v) = &p.provider {
+            args.provider = match v.as_str() {
+                "lmstudio" => ProviderKind::Lmstudio,
+                "llamacpp" => ProviderKind::Llamacpp,
+                _ => ProviderKind::Ollama,
+            };
+        }
+    }
+    if !cli_has_flag("--base-url") {
+        if let Some(v) = &p.base_url {
+            args.base_url = Some(v.clone());
+        }
+    }
+    if !cli_has_flag("--models") {
+        if let Some(v) = &p.models {
+            args.models = Some(v.join(","));
+        }
+    }
+    if !cli_has_flag("--pack") {
+        if let Some(v) = &p.pack {
+            args.pack = match v.as_str() {
+                "coding" => EvalPack::Coding,
+                "browser" => EvalPack::Browser,
+                _ => EvalPack::All,
+            };
+        }
+    }
+    if !cli_has_flag("--runs-per-task") {
+        if let Some(v) = p.runs_per_task {
+            args.runs_per_task = v;
+        }
+    }
+    if !cli_has_flag("--caps") {
+        if let Some(v) = &p.caps {
+            args.caps = match v.as_str() {
+                "off" => CapsMode::Off,
+                "strict" => CapsMode::Strict,
+                _ => CapsMode::Auto,
+            };
+        }
+    }
+    if !cli_has_flag("--trust") {
+        if let Some(v) = &p.trust {
+            args.trust = match v.as_str() {
+                "off" => TrustMode::Off,
+                "auto" => TrustMode::Auto,
+                _ => TrustMode::On,
+            };
+        }
+    }
+    if !cli_has_flag("--approval-mode") {
+        if let Some(v) = &p.approval_mode {
+            args.approval_mode = match v.as_str() {
+                "interrupt" => ApprovalMode::Interrupt,
+                "fail" => ApprovalMode::Fail,
+                _ => ApprovalMode::Auto,
+            };
+        }
+    }
+    if !cli_has_flag("--auto-approve-scope") {
+        if let Some(v) = &p.auto_approve_scope {
+            args.auto_approve_scope = match v.as_str() {
+                "session" => AutoApproveScope::Session,
+                _ => AutoApproveScope::Run,
+            };
+        }
+    }
+    if !cli_has_flag("--mcp") {
+        if let Some(v) = &p.mcp {
+            args.mcp = v.clone();
+        }
+    }
+    if let Some(flags) = &p.flags {
+        if !cli_has_flag("--enable-write-tools") {
+            if let Some(v) = flags.enable_write_tools {
+                args.enable_write_tools = v;
+            }
+        }
+        if !cli_has_flag("--allow-write") {
+            if let Some(v) = flags.allow_write {
+                args.allow_write = v;
+            }
+        }
+        if !cli_has_flag("--allow-shell") {
+            if let Some(v) = flags.allow_shell {
+                args.allow_shell = v;
+            }
+        }
+    }
+    if let Some(th) = &p.thresholds {
+        if !cli_has_flag("--min-pass-rate") {
+            if let Some(v) = th.min_pass_rate {
+                args.min_pass_rate = v;
+            }
+        }
+        if !cli_has_flag("--fail-on-any") {
+            if let Some(v) = th.fail_on_any {
+                args.fail_on_any = v;
+            }
+        }
+        if !cli_has_flag("--max-avg-steps") {
+            if let Some(v) = th.max_avg_steps {
+                args.max_avg_steps = Some(v);
+            }
+        }
+    }
+    Ok(Some(loaded))
 }
 
 fn provider_cli_name(provider: ProviderKind) -> &'static str {
