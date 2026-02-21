@@ -15,7 +15,6 @@ Date: 2026-02-21
 ## Primary Command Name
 
 - Primary binary/CLI command is now `localagent`.
-- Compatibility alias `openagent` is retained.
 
 ## UX Notes
 

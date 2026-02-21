@@ -2426,7 +2426,7 @@ fn keybinds_overlay_text() -> Option<String> {
     )
 }
 
-fn openagent_banner(_tick: u64) -> String {
+fn localagent_banner(_tick: u64) -> String {
     let raw = r#"
 ██╗      █████╗  █████╗  █████╗ ██╗      █████╗  ██████╗ ███████╗███╗  ██╗████████╗
 ██║     ██╔══██╗██╔══██╗██╔══██╗██║     ██╔══██╗██╔════╝ ██╔════╝████╗ ██║╚══██╔══╝
@@ -2501,7 +2501,7 @@ fn draw_chat_frame(
 
     let mut chat_text = String::new();
     if show_banner {
-        chat_text.push_str(&openagent_banner(ui_tick));
+        chat_text.push_str(&localagent_banner(ui_tick));
         chat_text.push_str("\n\n");
     }
     let transcript_text = transcript

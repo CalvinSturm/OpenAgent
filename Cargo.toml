@@ -3,19 +3,15 @@ name = "openagent"
 version = "0.1.0"
 edition = "2021"
 default-run = "localagent"
-repository = "https://github.com/CalvinSturm/OpenAgent"
+repository = "https://github.com/CalvinSturm/LocalAgent"
 license = "MIT"
 readme = "README.md"
-keywords = ["agent", "cli", "llm", "tool-calling", "openagent"]
+keywords = ["agent", "cli", "llm", "tool-calling", "localagent"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "localagent"
 path = "src/main.rs"
-
-[[bin]]
-name = "openagent"
-path = "src/bin/openagent.rs"
 
 [dependencies]
 anyhow = "1"

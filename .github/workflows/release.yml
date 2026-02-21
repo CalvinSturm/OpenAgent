@@ -13,13 +13,13 @@ jobs:
         include:
           - os: ubuntu-latest
             archive_ext: tar.gz
-            binary_name: openagent
+            binary_name: localagent
           - os: macos-latest
             archive_ext: tar.gz
-            binary_name: openagent
+            binary_name: localagent
           - os: windows-latest
             archive_ext: zip
-            binary_name: openagent.exe
+            binary_name: localagent.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,18 +33,18 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/${{ matrix.binary_name }} dist/
-          tar -czf openagent-${{ runner.os }}-${{ github.ref_name }}.tar.gz -C dist ${{ matrix.binary_name }}
+          tar -czf localagent-${{ runner.os }}-${{ github.ref_name }}.tar.gz -C dist ${{ matrix.binary_name }}
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/${{ matrix.binary_name }} dist/
-          Compress-Archive -Path dist/${{ matrix.binary_name }} -DestinationPath openagent-${{ runner.os }}-${{ github.ref_name }}.zip -Force
+          Compress-Archive -Path dist/${{ matrix.binary_name }} -DestinationPath localagent-${{ runner.os }}-${{ github.ref_name }}.zip -Force
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openagent-${{ runner.os }}-${{ github.ref_name }}
+          name: localagent-${{ runner.os }}-${{ github.ref_name }}
           path: |
             *.tar.gz
             *.zip

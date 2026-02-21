@@ -2,7 +2,7 @@
 
 LocalAgent is a local-runtime agent CLI with tool calling, trust controls, and replayable artifacts.
 
-Primary command is `localagent`. Compatibility alias `openagent` is also available.
+Primary command is `localagent`.
 
 ## Quickstart
 

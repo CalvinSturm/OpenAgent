@@ -12,7 +12,7 @@ Then bootstrap state/config:
 localagent init
 ```
 
-Primary command is `localagent`. Compatibility alias `openagent` is also available.
+Primary command is `localagent`.
 
 ## From GitHub Releases
 
