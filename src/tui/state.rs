@@ -194,6 +194,35 @@ impl UiState {
                     self.policy_hash = hash.to_string();
                 }
             }
+            EventKind::ProviderError => {
+                let msg = ev
+                    .data
+                    .get("message_short")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("provider error");
+                self.push_log(format!("provider_error: {msg}"));
+            }
+            EventKind::ProviderRetry => {
+                let attempt = ev.data.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
+                let max_attempts = ev
+                    .data
+                    .get("max_attempts")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let kind = ev
+                    .data
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("other");
+                let backoff_ms = ev
+                    .data
+                    .get("backoff_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                self.push_log(format!(
+                    "provider_retry: attempt {attempt}/{max_attempts} kind={kind} backoff_ms={backoff_ms}"
+                ));
+            }
             EventKind::Error => {
                 let msg = ev
                     .data

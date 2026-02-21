@@ -22,6 +22,8 @@ pub enum EventKind {
     HookStart,
     HookEnd,
     HookError,
+    ProviderRetry,
+    ProviderError,
     McpServerStart,
     McpServerStop,
     Error,

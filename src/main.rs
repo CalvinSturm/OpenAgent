@@ -33,6 +33,7 @@ use gate::{
 use hooks::config::HooksMode;
 use hooks::protocol::{PreModelCompactionPayload, PreModelPayload, ToolResultPayload};
 use hooks::runner::{make_pre_model_input, make_tool_result_input, HookManager, HookRuntimeConfig};
+use providers::http::HttpConfig;
 use providers::ollama::OllamaProvider;
 use providers::openai_compat::OpenAiCompatProvider;
 use providers::ModelProvider;
@@ -232,6 +233,18 @@ struct EvalArgs {
     audit: Option<PathBuf>,
     #[arg(long)]
     api_key: Option<String>,
+    #[arg(long, default_value_t = 2)]
+    http_max_retries: u32,
+    #[arg(long, default_value_t = 60_000)]
+    http_timeout_ms: u64,
+    #[arg(long, default_value_t = 2_000)]
+    http_connect_timeout_ms: u64,
+    #[arg(long, default_value_t = 15_000)]
+    http_stream_idle_timeout_ms: u64,
+    #[arg(long, default_value_t = 10_000_000)]
+    http_max_response_bytes: usize,
+    #[arg(long, default_value_t = 200_000)]
+    http_max_line_bytes: usize,
 }
 
 #[derive(Debug, Parser)]
@@ -326,6 +339,18 @@ struct RunArgs {
     stream: bool,
     #[arg(long)]
     events: Option<PathBuf>,
+    #[arg(long, default_value_t = 2)]
+    http_max_retries: u32,
+    #[arg(long, default_value_t = 60_000)]
+    http_timeout_ms: u64,
+    #[arg(long, default_value_t = 2_000)]
+    http_connect_timeout_ms: u64,
+    #[arg(long, default_value_t = 15_000)]
+    http_stream_idle_timeout_ms: u64,
+    #[arg(long, default_value_t = 10_000_000)]
+    http_max_response_bytes: usize,
+    #[arg(long, default_value_t = 200_000)]
+    http_max_line_bytes: usize,
     #[arg(long, default_value_t = false)]
     tui: bool,
     #[arg(long, default_value_t = 50)]
@@ -546,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
                 audit_override: args.audit.clone(),
                 workdir_override: args.workdir.clone(),
                 keep_workdir: args.keep_workdir,
+                http: http_config_from_eval_args(args),
             };
             let cwd = std::env::current_dir().with_context(|| "failed to read current dir")?;
             run_eval(cfg, &cwd).await?;
@@ -585,7 +611,11 @@ async fn main() -> anyhow::Result<()> {
 
     match provider_kind {
         ProviderKind::Lmstudio | ProviderKind::Llamacpp => {
-            let provider = OpenAiCompatProvider::new(base_url.clone(), cli.run.api_key.clone());
+            let provider = OpenAiCompatProvider::new(
+                base_url.clone(),
+                cli.run.api_key.clone(),
+                http_config_from_run_args(&cli.run),
+            )?;
             run_agent(
                 provider,
                 provider_kind,
@@ -598,7 +628,8 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         ProviderKind::Ollama => {
-            let provider = OllamaProvider::new(base_url.clone());
+            let provider =
+                OllamaProvider::new(base_url.clone(), http_config_from_run_args(&cli.run))?;
             run_agent(
                 provider,
                 provider_kind,
@@ -911,6 +942,12 @@ async fn run_agent<P: ModelProvider>(
         hooks_timeout_ms: args.hooks_timeout_ms,
         hooks_max_stdout_bytes: args.hooks_max_stdout_bytes,
         tool_args_strict: format!("{:?}", args.tool_args_strict).to_lowercase(),
+        http_max_retries: args.http_max_retries,
+        http_timeout_ms: args.http_timeout_ms,
+        http_connect_timeout_ms: args.http_connect_timeout_ms,
+        http_stream_idle_timeout_ms: args.http_stream_idle_timeout_ms,
+        http_max_response_bytes: args.http_max_response_bytes,
+        http_max_line_bytes: args.http_max_line_bytes,
         tui_enabled: args.tui,
         tui_refresh_ms: args.tui_refresh_ms,
         tui_max_log_lines: args.tui_max_log_lines,
@@ -963,6 +1000,12 @@ async fn run_agent<P: ModelProvider>(
         hooks_timeout_ms: args.hooks_timeout_ms,
         hooks_max_stdout_bytes: args.hooks_max_stdout_bytes,
         tool_args_strict: format!("{:?}", args.tool_args_strict).to_lowercase(),
+        http_max_retries: args.http_max_retries,
+        http_timeout_ms: args.http_timeout_ms,
+        http_connect_timeout_ms: args.http_connect_timeout_ms,
+        http_stream_idle_timeout_ms: args.http_stream_idle_timeout_ms,
+        http_max_response_bytes: args.http_max_response_bytes,
+        http_max_line_bytes: args.http_max_line_bytes,
         tui_enabled: args.tui,
         tui_refresh_ms: args.tui_refresh_ms,
         tui_max_log_lines: args.tui_max_log_lines,
@@ -1413,6 +1456,30 @@ fn default_base_url(provider: ProviderKind) -> &'static str {
         ProviderKind::Lmstudio => "http://localhost:1234/v1",
         ProviderKind::Llamacpp => "http://localhost:8080/v1",
         ProviderKind::Ollama => "http://localhost:11434",
+    }
+}
+
+fn http_config_from_run_args(args: &RunArgs) -> HttpConfig {
+    HttpConfig {
+        connect_timeout_ms: args.http_connect_timeout_ms,
+        request_timeout_ms: args.http_timeout_ms,
+        stream_idle_timeout_ms: args.http_stream_idle_timeout_ms,
+        max_response_bytes: args.http_max_response_bytes,
+        max_line_bytes: args.http_max_line_bytes,
+        http_max_retries: args.http_max_retries,
+        ..HttpConfig::default()
+    }
+}
+
+fn http_config_from_eval_args(args: &EvalArgs) -> HttpConfig {
+    HttpConfig {
+        connect_timeout_ms: args.http_connect_timeout_ms,
+        request_timeout_ms: args.http_timeout_ms,
+        stream_idle_timeout_ms: args.http_stream_idle_timeout_ms,
+        max_response_bytes: args.http_max_response_bytes,
+        max_line_bytes: args.http_max_line_bytes,
+        http_max_retries: args.http_max_retries,
+        ..HttpConfig::default()
     }
 }
 

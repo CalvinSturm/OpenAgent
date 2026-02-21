@@ -8,6 +8,7 @@ use crate::hooks::protocol::{
 };
 use crate::hooks::runner::{make_pre_model_input, make_tool_result_input, HookManager};
 use crate::mcp::registry::McpRegistry;
+use crate::providers::http::{message_short, ProviderError};
 use crate::providers::{ModelProvider, StreamDelta};
 use crate::tools::{
     envelope_to_message, execute_tool, to_tool_result_envelope, tool_side_effects,
@@ -154,6 +155,35 @@ impl<P: ModelProvider> Agent<P> {
             let compacted = match maybe_compact(&messages, &self.compaction_settings) {
                 Ok(c) => c,
                 Err(e) => {
+                    if let Some(pe) = e.downcast_ref::<ProviderError>() {
+                        for r in &pe.retries {
+                            self.emit_event(
+                                &run_id,
+                                step as u32,
+                                EventKind::ProviderRetry,
+                                serde_json::json!({
+                                    "attempt": r.attempt,
+                                    "max_attempts": r.max_attempts,
+                                    "kind": r.kind,
+                                    "status": r.status,
+                                    "backoff_ms": r.backoff_ms
+                                }),
+                            );
+                        }
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::ProviderError,
+                            serde_json::json!({
+                                "kind": pe.kind,
+                                "status": pe.http_status,
+                                "retryable": pe.retryable,
+                                "attempt": pe.attempt,
+                                "max_attempts": pe.max_attempts,
+                                "message_short": message_short(&pe.message)
+                            }),
+                        );
+                    }
                     self.emit_event(
                         &run_id,
                         step as u32,

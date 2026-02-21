@@ -1,10 +1,14 @@
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::providers::http::{
+    classify_reqwest_error, classify_status, deterministic_backoff_ms, HttpConfig, ProviderError,
+    ProviderErrorKind, RetryRecord,
+};
 use crate::providers::{ModelProvider, StreamDelta, ToolCallFragment};
 use crate::types::{GenerateRequest, GenerateResponse, Message, Role, ToolCall};
 
@@ -12,14 +16,21 @@ use crate::types::{GenerateRequest, GenerateResponse, Message, Role, ToolCall};
 pub struct OllamaProvider {
     client: Client,
     base_url: String,
+    http: HttpConfig,
 }
 
 impl OllamaProvider {
-    pub fn new(base_url: String) -> Self {
-        Self {
-            client: Client::new(),
+    pub fn new(base_url: String, http: HttpConfig) -> anyhow::Result<Self> {
+        let client = Client::builder()
+            .connect_timeout(http.connect_timeout())
+            .timeout(http.request_timeout())
+            .build()
+            .context("failed to build Ollama HTTP client")?;
+        Ok(Self {
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
-        }
+            http,
+        })
     }
 }
 
@@ -82,81 +93,95 @@ struct OllamaFunctionCall {
 impl ModelProvider for OllamaProvider {
     async fn generate(&self, req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
         let url = format!("{}/api/chat", self.base_url);
-        let tools = req
-            .tools
-            .into_iter()
-            .map(|t| OllamaToolEnvelope {
-                tool_type: "function".to_string(),
-                function: OllamaToolFunction {
-                    name: t.name,
-                    description: t.description,
-                    parameters: t.parameters,
-                },
-            })
-            .collect::<Vec<_>>();
-
-        let messages = req
-            .messages
-            .into_iter()
-            .map(|m| {
-                let role = match m.role {
-                    Role::System | Role::Developer => "system",
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                    Role::Tool => "tool",
+        let payload = to_request(req, false);
+        let max_attempts = self.http.http_max_retries + 1;
+        let mut retries = Vec::<RetryRecord>::new();
+        for attempt in 1..=max_attempts {
+            let sent = self.client.post(&url).json(&payload).send().await;
+            let response = match sent {
+                Ok(r) => r,
+                Err(e) => {
+                    let cls = classify_reqwest_error(&e);
+                    if cls.retryable && attempt < max_attempts {
+                        let backoff = deterministic_backoff_ms(self.http, attempt - 1);
+                        retries.push(RetryRecord {
+                            attempt,
+                            max_attempts,
+                            kind: cls.kind,
+                            status: cls.status,
+                            backoff_ms: backoff,
+                        });
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                        continue;
+                    }
+                    return Err(anyhow!(ProviderError {
+                        kind: cls.kind,
+                        http_status: cls.status,
+                        retryable: cls.retryable,
+                        attempt,
+                        max_attempts,
+                        message: format!("failed to call Ollama endpoint: {e}"),
+                        retries,
+                    }));
                 }
-                .to_string();
-                OllamaMessageOut {
-                    role,
-                    content: m.content,
-                    tool_name: m.tool_name,
+            };
+            let status = response.status();
+            if !status.is_success() {
+                let cls = classify_status(status.as_u16());
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<body unavailable>".to_string());
+                if cls.retryable && attempt < max_attempts {
+                    let backoff = deterministic_backoff_ms(self.http, attempt - 1);
+                    retries.push(RetryRecord {
+                        attempt,
+                        max_attempts,
+                        kind: cls.kind,
+                        status: Some(status.as_u16()),
+                        backoff_ms: backoff,
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    continue;
                 }
-            })
-            .collect::<Vec<_>>();
-
-        let payload = OllamaRequest {
-            model: req.model,
-            messages,
-            tools,
-            stream: false,
-        };
-
-        let resp: OllamaResponse = self
-            .client
-            .post(url)
-            .json(&payload)
-            .send()
-            .await
-            .context("failed to call Ollama endpoint")?
-            .error_for_status()
-            .context("Ollama endpoint returned error status")?
-            .json()
-            .await
-            .context("failed to parse Ollama JSON response")?;
-
-        let tool_calls = resp
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .enumerate()
-            .map(|(idx, tc)| ToolCall {
-                id: format!("ollama_tc_{idx}"),
-                name: tc.function.name,
-                arguments: tc.function.arguments,
-            })
-            .collect::<Vec<_>>();
-
-        Ok(GenerateResponse {
-            assistant: Message {
-                role: Role::Assistant,
-                content: resp.message.content,
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls: None,
-            },
-            tool_calls,
-        })
+                return Err(anyhow!(ProviderError {
+                    kind: cls.kind,
+                    http_status: Some(status.as_u16()),
+                    retryable: cls.retryable,
+                    attempt,
+                    max_attempts,
+                    message: format!(
+                        "Ollama endpoint returned HTTP {}: {}",
+                        status.as_u16(),
+                        truncate_for_error(&body, 200)
+                    ),
+                    retries,
+                }));
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .context("failed to read Ollama response body")?;
+            if bytes.len() > self.http.max_response_bytes {
+                return Err(anyhow!(ProviderError {
+                    kind: ProviderErrorKind::PayloadTooLarge,
+                    http_status: Some(status.as_u16()),
+                    retryable: false,
+                    attempt,
+                    max_attempts,
+                    message: format!(
+                        "response exceeded max bytes: {} > {}",
+                        bytes.len(),
+                        self.http.max_response_bytes
+                    ),
+                    retries,
+                }));
+            }
+            let resp: OllamaResponse =
+                serde_json::from_slice(&bytes).context("failed to parse Ollama JSON response")?;
+            return Ok(map_ollama_response(resp));
+        }
+        Err(anyhow!("unexpected retry loop termination"))
     }
 
     fn supports_streaming(&self) -> bool {
@@ -169,87 +194,296 @@ impl ModelProvider for OllamaProvider {
         on_delta: &mut (dyn FnMut(StreamDelta) + Send),
     ) -> anyhow::Result<GenerateResponse> {
         let url = format!("{}/api/chat", self.base_url);
-        let tools = req
-            .tools
-            .into_iter()
-            .map(|t| OllamaToolEnvelope {
-                tool_type: "function".to_string(),
-                function: OllamaToolFunction {
-                    name: t.name,
-                    description: t.description,
-                    parameters: t.parameters,
-                },
-            })
-            .collect::<Vec<_>>();
+        let payload = to_request(req, true);
+        let max_attempts = self.http.http_max_retries + 1;
+        let mut retries = Vec::<RetryRecord>::new();
 
-        let messages = req
-            .messages
-            .into_iter()
-            .map(|m| {
-                let role = match m.role {
-                    Role::System | Role::Developer => "system",
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                    Role::Tool => "tool",
+        for attempt in 1..=max_attempts {
+            let sent = self.client.post(&url).json(&payload).send().await;
+            let response = match sent {
+                Ok(r) => r,
+                Err(e) => {
+                    let cls = classify_reqwest_error(&e);
+                    if cls.retryable && attempt < max_attempts {
+                        let backoff = deterministic_backoff_ms(self.http, attempt - 1);
+                        retries.push(RetryRecord {
+                            attempt,
+                            max_attempts,
+                            kind: cls.kind,
+                            status: cls.status,
+                            backoff_ms: backoff,
+                        });
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                        continue;
+                    }
+                    return Err(anyhow!(ProviderError {
+                        kind: cls.kind,
+                        http_status: cls.status,
+                        retryable: cls.retryable,
+                        attempt,
+                        max_attempts,
+                        message: format!("failed to call Ollama endpoint: {e}"),
+                        retries,
+                    }));
                 }
-                .to_string();
-                OllamaMessageOut {
-                    role,
-                    content: m.content,
-                    tool_name: m.tool_name,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let payload = OllamaRequest {
-            model: req.model,
-            messages,
-            tools,
-            stream: true,
-        };
-
-        let response = self
-            .client
-            .post(url)
-            .json(&payload)
-            .send()
-            .await
-            .context("failed to call Ollama endpoint")?
-            .error_for_status()
-            .context("Ollama endpoint returned error status")?;
-
-        let mut stream = response.bytes_stream();
-        let mut text_buf = String::new();
-        let mut content_accum = String::new();
-        let mut tool_calls = Vec::new();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("failed reading Ollama stream chunk")?;
-            text_buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = text_buf.find('\n') {
-                let line = text_buf[..pos].trim().to_string();
-                text_buf = text_buf[pos + 1..].to_string();
-                if line.is_empty() {
+            };
+            let status = response.status();
+            if !status.is_success() {
+                let cls = classify_status(status.as_u16());
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<body unavailable>".to_string());
+                if cls.retryable && attempt < max_attempts {
+                    let backoff = deterministic_backoff_ms(self.http, attempt - 1);
+                    retries.push(RetryRecord {
+                        attempt,
+                        max_attempts,
+                        kind: cls.kind,
+                        status: Some(status.as_u16()),
+                        backoff_ms: backoff,
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                     continue;
                 }
-                handle_ollama_stream_json(&line, on_delta, &mut content_accum, &mut tool_calls)?;
+                return Err(anyhow!(ProviderError {
+                    kind: cls.kind,
+                    http_status: Some(status.as_u16()),
+                    retryable: cls.retryable,
+                    attempt,
+                    max_attempts,
+                    message: format!(
+                        "Ollama endpoint returned HTTP {}: {}",
+                        status.as_u16(),
+                        truncate_for_error(&body, 200)
+                    ),
+                    retries,
+                }));
             }
+
+            let mut stream = response.bytes_stream();
+            let mut text_buf = String::new();
+            let mut content_accum = String::new();
+            let mut tool_calls = Vec::new();
+            let mut total_bytes = 0usize;
+            let mut emitted_any = false;
+
+            loop {
+                let next = tokio::time::timeout(self.http.idle_timeout(), stream.next()).await;
+                let maybe_chunk = match next {
+                    Ok(v) => v,
+                    Err(_) => {
+                        if !emitted_any && attempt < max_attempts {
+                            let backoff = deterministic_backoff_ms(self.http, attempt - 1);
+                            retries.push(RetryRecord {
+                                attempt,
+                                max_attempts,
+                                kind: ProviderErrorKind::Timeout,
+                                status: Some(status.as_u16()),
+                                backoff_ms: backoff,
+                            });
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                            break;
+                        }
+                        return Err(anyhow!(ProviderError {
+                            kind: ProviderErrorKind::Timeout,
+                            http_status: Some(status.as_u16()),
+                            retryable: !emitted_any,
+                            attempt,
+                            max_attempts,
+                            message: "stream idle timeout exceeded".to_string(),
+                            retries,
+                        }));
+                    }
+                };
+                let Some(chunk_res) = maybe_chunk else {
+                    break;
+                };
+                let chunk = match chunk_res {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let cls = classify_reqwest_error(&e);
+                        if cls.retryable && !emitted_any && attempt < max_attempts {
+                            let backoff = deterministic_backoff_ms(self.http, attempt - 1);
+                            retries.push(RetryRecord {
+                                attempt,
+                                max_attempts,
+                                kind: cls.kind,
+                                status: cls.status.or(Some(status.as_u16())),
+                                backoff_ms: backoff,
+                            });
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                            break;
+                        }
+                        return Err(anyhow!(ProviderError {
+                            kind: cls.kind,
+                            http_status: cls.status.or(Some(status.as_u16())),
+                            retryable: cls.retryable && !emitted_any,
+                            attempt,
+                            max_attempts,
+                            message: format!("failed reading stream chunk: {e}"),
+                            retries,
+                        }));
+                    }
+                };
+                total_bytes = total_bytes.saturating_add(chunk.len());
+                if total_bytes > self.http.max_response_bytes {
+                    return Err(anyhow!(ProviderError {
+                        kind: ProviderErrorKind::PayloadTooLarge,
+                        http_status: Some(status.as_u16()),
+                        retryable: false,
+                        attempt,
+                        max_attempts,
+                        message: format!(
+                            "stream exceeded max bytes: {} > {}",
+                            total_bytes, self.http.max_response_bytes
+                        ),
+                        retries,
+                    }));
+                }
+                text_buf.push_str(&String::from_utf8_lossy(&chunk));
+                for mut line in drain_json_lines(&mut text_buf) {
+                    line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if line.len() > self.http.max_line_bytes {
+                        return Err(anyhow!(ProviderError {
+                            kind: ProviderErrorKind::PayloadTooLarge,
+                            http_status: Some(status.as_u16()),
+                            retryable: false,
+                            attempt,
+                            max_attempts,
+                            message: format!(
+                                "json line exceeded max bytes: {} > {}",
+                                line.len(),
+                                self.http.max_line_bytes
+                            ),
+                            retries,
+                        }));
+                    }
+                    handle_ollama_stream_json(&line, on_delta, &mut content_accum, &mut tool_calls)
+                        .map_err(|e| {
+                            anyhow!(ProviderError {
+                                kind: ProviderErrorKind::Parse,
+                                http_status: Some(status.as_u16()),
+                                retryable: false,
+                                attempt,
+                                max_attempts,
+                                message: format!(
+                                    "malformed Ollama stream line: {}",
+                                    truncate_for_error(&format!("{e}"), 200)
+                                ),
+                                retries: retries.clone(),
+                            })
+                        })?;
+                    emitted_any = true;
+                }
+            }
+
+            if attempt < max_attempts && !emitted_any {
+                continue;
+            }
+
+            return Ok(GenerateResponse {
+                assistant: Message {
+                    role: Role::Assistant,
+                    content: if content_accum.is_empty() {
+                        None
+                    } else {
+                        Some(content_accum)
+                    },
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+                tool_calls,
+            });
         }
 
-        Ok(GenerateResponse {
-            assistant: Message {
-                role: Role::Assistant,
-                content: if content_accum.is_empty() {
-                    None
-                } else {
-                    Some(content_accum)
-                },
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls: None,
+        Err(anyhow!(ProviderError {
+            kind: ProviderErrorKind::Other,
+            http_status: None,
+            retryable: false,
+            attempt: self.http.http_max_retries + 1,
+            max_attempts: self.http.http_max_retries + 1,
+            message: "stream ended before response completed".to_string(),
+            retries: Vec::new(),
+        }))
+    }
+}
+
+fn drain_json_lines(buf: &mut String) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(pos) = buf.find('\n') {
+        out.push(buf[..pos].to_string());
+        *buf = buf[pos + 1..].to_string();
+    }
+    out
+}
+
+fn to_request(req: GenerateRequest, stream: bool) -> OllamaRequest {
+    let tools = req
+        .tools
+        .into_iter()
+        .map(|t| OllamaToolEnvelope {
+            tool_type: "function".to_string(),
+            function: OllamaToolFunction {
+                name: t.name,
+                description: t.description,
+                parameters: t.parameters,
             },
-            tool_calls,
         })
+        .collect::<Vec<_>>();
+    let messages = req
+        .messages
+        .into_iter()
+        .map(|m| {
+            let role = match m.role {
+                Role::System | Role::Developer => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+            }
+            .to_string();
+            OllamaMessageOut {
+                role,
+                content: m.content,
+                tool_name: m.tool_name,
+            }
+        })
+        .collect::<Vec<_>>();
+    OllamaRequest {
+        model: req.model,
+        messages,
+        tools,
+        stream,
+    }
+}
+
+fn map_ollama_response(resp: OllamaResponse) -> GenerateResponse {
+    let tool_calls = resp
+        .message
+        .tool_calls
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, tc)| ToolCall {
+            id: format!("ollama_tc_{idx}"),
+            name: tc.function.name,
+            arguments: tc.function.arguments,
+        })
+        .collect::<Vec<_>>();
+
+    GenerateResponse {
+        assistant: Message {
+            role: Role::Assistant,
+            content: resp.message.content,
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        },
+        tool_calls,
     }
 }
 
@@ -288,9 +522,16 @@ fn handle_ollama_stream_json(
     Ok(())
 }
 
+fn truncate_for_error(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max).collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::handle_ollama_stream_json;
+    use super::{drain_json_lines, handle_ollama_stream_json};
     use crate::providers::StreamDelta;
 
     #[test]
@@ -308,5 +549,36 @@ mod tests {
         assert_eq!(content, "Hi");
         assert_eq!(tool_calls.len(), 1);
         assert!(matches!(deltas[0], StreamDelta::Content(_)));
+    }
+
+    #[test]
+    fn drains_json_lines_with_partial_chunks() {
+        let mut buf = "{\"a\":1}".to_string();
+        assert!(drain_json_lines(&mut buf).is_empty());
+        buf.push('\n');
+        buf.push_str("{\"b\":2}\n");
+        let lines = drain_json_lines(&mut buf);
+        assert_eq!(
+            lines,
+            vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn malformed_ollama_line_returns_error() {
+        let mut deltas = Vec::new();
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let err = handle_ollama_stream_json(
+            "{\"message\":",
+            &mut |d| deltas.push(d),
+            &mut content,
+            &mut tool_calls,
+        )
+        .expect_err("expected parse error");
+        assert!(err
+            .to_string()
+            .contains("failed parsing Ollama stream event"));
     }
 }

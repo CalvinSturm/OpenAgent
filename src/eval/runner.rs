@@ -17,6 +17,7 @@ use crate::gate::{
 use crate::hooks::config::HooksMode;
 use crate::hooks::runner::{HookManager, HookRuntimeConfig};
 use crate::mcp::registry::{list_servers, McpRegistry};
+use crate::providers::http::HttpConfig;
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::openai_compat::OpenAiCompatProvider;
 use crate::providers::ModelProvider;
@@ -73,6 +74,7 @@ pub struct EvalConfig {
     pub audit_override: Option<PathBuf>,
     pub workdir_override: Option<PathBuf>,
     pub keep_workdir: bool,
+    pub http: HttpConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +121,12 @@ pub struct EvalResultsConfig {
     pub tui_enabled: bool,
     pub tui_refresh_ms: u64,
     pub tui_max_log_lines: usize,
+    pub http_max_retries: u32,
+    pub http_timeout_ms: u64,
+    pub http_connect_timeout_ms: u64,
+    pub http_stream_idle_timeout_ms: u64,
+    pub http_max_response_bytes: usize,
+    pub http_max_line_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -259,6 +267,12 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
             tui_enabled: config.tui_enabled,
             tui_refresh_ms: config.tui_refresh_ms,
             tui_max_log_lines: config.tui_max_log_lines,
+            http_max_retries: config.http.http_max_retries,
+            http_timeout_ms: config.http.request_timeout_ms,
+            http_connect_timeout_ms: config.http.connect_timeout_ms,
+            http_stream_idle_timeout_ms: config.http.stream_idle_timeout_ms,
+            http_max_response_bytes: config.http.max_response_bytes,
+            http_max_line_bytes: config.http.max_line_bytes,
         },
         summary: EvalSummary::default(),
         by_model: BTreeMap::new(),
@@ -601,7 +615,12 @@ async fn run_single(
         })
         .collect::<Vec<_>>();
 
-    let provider = make_provider(config.provider, &config.base_url, config.api_key.clone());
+    let provider = make_provider(
+        config.provider,
+        &config.base_url,
+        config.api_key.clone(),
+        config.http,
+    )?;
     let mut agent = Agent {
         provider,
         model: model.to_string(),
@@ -727,6 +746,12 @@ fn write_run_artifact_for_eval(
         tui_enabled: config.tui_enabled,
         tui_refresh_ms: config.tui_refresh_ms,
         tui_max_log_lines: config.tui_max_log_lines,
+        http_max_retries: config.http.http_max_retries,
+        http_timeout_ms: config.http.request_timeout_ms,
+        http_connect_timeout_ms: config.http.connect_timeout_ms,
+        http_stream_idle_timeout_ms: config.http.stream_idle_timeout_ms,
+        http_max_response_bytes: config.http.max_response_bytes,
+        http_max_line_bytes: config.http.max_line_bytes,
         tool_catalog,
         policy_version: policy.version,
         includes_resolved: policy.includes_resolved.clone(),
@@ -779,6 +804,12 @@ fn write_run_artifact_for_eval(
         tui_enabled: config.tui_enabled,
         tui_refresh_ms: config.tui_refresh_ms,
         tui_max_log_lines: config.tui_max_log_lines,
+        http_max_retries: config.http.http_max_retries,
+        http_timeout_ms: config.http.request_timeout_ms,
+        http_connect_timeout_ms: config.http.connect_timeout_ms,
+        http_stream_idle_timeout_ms: config.http.stream_idle_timeout_ms,
+        http_max_response_bytes: config.http.max_response_bytes,
+        http_max_line_bytes: config.http.max_line_bytes,
         tool_catalog_names: cli_config
             .tool_catalog
             .iter()
@@ -926,12 +957,20 @@ impl ModelProvider for EvalProvider {
     }
 }
 
-fn make_provider(provider: ProviderKind, base_url: &str, api_key: Option<String>) -> EvalProvider {
+fn make_provider(
+    provider: ProviderKind,
+    base_url: &str,
+    api_key: Option<String>,
+    http: HttpConfig,
+) -> anyhow::Result<EvalProvider> {
     match provider {
-        ProviderKind::Lmstudio | ProviderKind::Llamacpp => {
-            EvalProvider::OpenAiCompat(OpenAiCompatProvider::new(base_url.to_string(), api_key))
-        }
-        ProviderKind::Ollama => EvalProvider::Ollama(OllamaProvider::new(base_url.to_string())),
+        ProviderKind::Lmstudio | ProviderKind::Llamacpp => Ok(EvalProvider::OpenAiCompat(
+            OpenAiCompatProvider::new(base_url.to_string(), api_key, http)?,
+        )),
+        ProviderKind::Ollama => Ok(EvalProvider::Ollama(OllamaProvider::new(
+            base_url.to_string(),
+            http,
+        )?)),
     }
 }
 
@@ -987,6 +1026,12 @@ mod tests {
                 tui_enabled: false,
                 tui_refresh_ms: 50,
                 tui_max_log_lines: 200,
+                http_max_retries: 2,
+                http_timeout_ms: 60_000,
+                http_connect_timeout_ms: 2_000,
+                http_stream_idle_timeout_ms: 15_000,
+                http_max_response_bytes: 10_000_000,
+                http_max_line_bytes: 200_000,
             },
             summary: Default::default(),
             by_model: BTreeMap::new(),
