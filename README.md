@@ -301,6 +301,7 @@ localagent doctor --provider ollama
 - Templates: `docs/TEMPLATES.md`
 - CLI reference: `docs/CLI_REFERENCE.md`
 - Provider setup: `docs/LLM_SETUP.md`
+- Contributing: `CONTRIBUTING.md`
 - Release notes: `docs/RELEASE_NOTES_v0.1.0.md`
 - Changelog: `CHANGELOG.md`
 
