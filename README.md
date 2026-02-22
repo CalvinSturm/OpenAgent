@@ -1,5 +1,6 @@
 # LocalAgent
-<img width="858" height="445" alt="Screenshot 2026-02-21 052058" src="https://github.com/user-attachments/assets/b2dbe95b-90bd-4bb3-821a-4bb019834c49" />
+
+<img width="978" height="579" alt="11" src="https://github.com/user-attachments/assets/47fba015-05c4-4e83-afdb-ce001e9ffa62" />
 
 LocalAgent is a local-first agent runtime CLI for coding and automation with explicit safety controls.
 
