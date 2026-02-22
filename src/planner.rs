@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 
 pub const PLAN_SCHEMA_VERSION: &str = "openagent.plan.v1";
 pub const PLANNER_HANDOFF_HEADER: &str = "PLANNER HANDOFF (openagent.plan.v1)";
+pub const STEP_RESULT_SCHEMA_VERSION: &str = "openagent.step_result.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +98,27 @@ pub fn planner_handoff_content(plan_json: &Value) -> anyhow::Result<String> {
     Ok(format!("{PLANNER_HANDOFF_HEADER}\n{body}"))
 }
 
+pub fn planner_worker_contract_content(plan_json: &Value) -> anyhow::Result<String> {
+    let step_ids = plan_step_ids(plan_json)?;
+    let allow = if step_ids.is_empty() {
+        "final".to_string()
+    } else {
+        format!("{}, final", step_ids.join(", "))
+    };
+    Ok(format!(
+        "WORKER STEP RESULT CONTRACT ({STEP_RESULT_SCHEMA_VERSION})\n\
+Return final output as JSON only with fields:\n\
+{{\n\
+  \"schema_version\": \"{STEP_RESULT_SCHEMA_VERSION}\",\n\
+  \"step_id\": \"<one of: {allow}>\",\n\
+  \"status\": \"done|retry|replan|fail\",\n\
+  \"evidence\": [\"short factual observations\"],\n\
+  \"next_step_id\": \"optional next step id\",\n\
+  \"notes\": \"optional brief note\"\n\
+}}"
+    ))
+}
+
 pub fn normalize_plan_json(raw: &str) -> anyhow::Result<Value> {
     let value: Value = serde_json::from_str(raw).context("planner output was not valid JSON")?;
     let obj = value
@@ -167,10 +189,28 @@ pub fn normalize_plan_json(raw: &str) -> anyhow::Result<Value> {
             .map(value_intended_tools_array)
             .transpose()?
             .unwrap_or_default();
+        let done_criteria = step_obj
+            .get("done_criteria")
+            .map(value_string_array)
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(Value::String)
+            .collect::<Vec<_>>();
+        let verifier_checks = step_obj
+            .get("verifier_checks")
+            .map(value_string_array)
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(Value::String)
+            .collect::<Vec<_>>();
         let mut out_step = Map::new();
         out_step.insert("id".to_string(), Value::String(format!("S{}", idx + 1)));
         out_step.insert("summary".to_string(), Value::String(summary));
         out_step.insert("intended_tools".to_string(), Value::Array(intended_tools));
+        out_step.insert("done_criteria".to_string(), Value::Array(done_criteria));
+        out_step.insert("verifier_checks".to_string(), Value::Array(verifier_checks));
         steps.push(Value::Object(out_step));
     }
 
@@ -188,6 +228,153 @@ pub fn normalize_plan_json(raw: &str) -> anyhow::Result<Value> {
         Value::Array(success_criteria),
     );
     Ok(Value::Object(out))
+}
+
+pub fn normalize_worker_step_result(raw: &str, plan_json: &Value) -> anyhow::Result<Value> {
+    let value = parse_jsonish(raw)?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow!("worker step result must be a JSON object"))?;
+    let schema = obj
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("worker step result missing schema_version"))?;
+    if schema != STEP_RESULT_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "worker step result schema_version must be {STEP_RESULT_SCHEMA_VERSION}, got {schema}"
+        ));
+    }
+    let step_id = obj
+        .get("step_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("worker step result missing step_id"))?;
+    let allowed_steps = plan_step_ids(plan_json)?;
+    if step_id != "final" && !allowed_steps.iter().any(|s| s == step_id) {
+        return Err(anyhow!(
+            "worker step_id '{step_id}' not present in plan (allowed: {})",
+            if allowed_steps.is_empty() {
+                "final".to_string()
+            } else {
+                format!("{}, final", allowed_steps.join(", "))
+            }
+        ));
+    }
+    let status = obj
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("worker step result missing status"))?;
+    match status {
+        "done" | "retry" | "replan" | "fail" => {}
+        _ => {
+            return Err(anyhow!(
+                "worker step result invalid status '{status}' (expected done|retry|replan|fail)"
+            ));
+        }
+    }
+    let evidence = obj
+        .get("evidence")
+        .map(value_string_array)
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    let next_step_id = obj
+        .get("next_step_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(next) = &next_step_id {
+        if next != "final" && !allowed_steps.iter().any(|s| s == next) {
+            return Err(anyhow!(
+                "worker next_step_id '{next}' not present in plan (allowed: {})",
+                if allowed_steps.is_empty() {
+                    "final".to_string()
+                } else {
+                    format!("{}, final", allowed_steps.join(", "))
+                }
+            ));
+        }
+    }
+    let notes = obj.get("notes").and_then(Value::as_str).map(str::to_string);
+
+    let mut normalized = Map::new();
+    normalized.insert(
+        "schema_version".to_string(),
+        Value::String(STEP_RESULT_SCHEMA_VERSION.to_string()),
+    );
+    normalized.insert("step_id".to_string(), Value::String(step_id.to_string()));
+    normalized.insert("status".to_string(), Value::String(status.to_string()));
+    normalized.insert("evidence".to_string(), Value::Array(evidence));
+    if let Some(next) = next_step_id {
+        normalized.insert("next_step_id".to_string(), Value::String(next));
+    }
+    if let Some(n) = notes {
+        normalized.insert("notes".to_string(), Value::String(n));
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn plan_step_ids(plan_json: &Value) -> anyhow::Result<Vec<String>> {
+    let steps = plan_json
+        .get("steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("plan_json missing steps array"))?;
+    let mut out = Vec::with_capacity(steps.len());
+    for (idx, step) in steps.iter().enumerate() {
+        let id = step
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("plan step {} missing id", idx + 1))?;
+        out.push(id.to_string());
+    }
+    Ok(out)
+}
+
+fn parse_jsonish(raw: &str) -> anyhow::Result<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("empty worker step result"));
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        return Ok(v);
+    }
+    if let Some(candidate) = fenced_json_candidate(trimmed) {
+        if let Ok(v) = serde_json::from_str::<Value>(&candidate) {
+            return Ok(v);
+        }
+    }
+    if let Some((start, end)) = find_json_bounds(trimmed) {
+        let candidate = &trimmed[start..=end];
+        if let Ok(v) = serde_json::from_str::<Value>(candidate) {
+            return Ok(v);
+        }
+    }
+    Err(anyhow!(
+        "worker step result must be valid JSON (plain JSON or fenced ```json block)"
+    ))
+}
+
+fn fenced_json_candidate(s: &str) -> Option<String> {
+    if !s.starts_with("```") {
+        return None;
+    }
+    let lines = s.lines().collect::<Vec<_>>();
+    if lines.len() < 3 {
+        return None;
+    }
+    if !lines.first()?.starts_with("```") || !lines.last()?.starts_with("```") {
+        return None;
+    }
+    Some(lines[1..lines.len() - 1].join("\n"))
+}
+
+fn find_json_bounds(s: &str) -> Option<(usize, usize)> {
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some((start, end))
 }
 
 fn value_string_array(value: &Value) -> anyhow::Result<Vec<String>> {
@@ -290,7 +477,8 @@ fn canonicalize(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_canonical_json, normalize_plan_json, normalize_planner_output, PlannerOutput,
+        hash_canonical_json, normalize_plan_json, normalize_planner_output,
+        normalize_worker_step_result, PlannerOutput, STEP_RESULT_SCHEMA_VERSION,
     };
 
     #[test]
@@ -330,6 +518,31 @@ mod tests {
         assert_eq!(
             hash_canonical_json(&a).expect("ha"),
             hash_canonical_json(&b).expect("hb")
+        );
+    }
+
+    #[test]
+    fn worker_step_result_validates_against_plan_step_ids() {
+        let plan = serde_json::json!({
+            "schema_version":"openagent.plan.v1",
+            "goal":"g",
+            "assumptions":[],
+            "steps":[{"id":"S1","summary":"s1","intended_tools":[],"done_criteria":[],"verifier_checks":[]}],
+            "risks":[],
+            "success_criteria":[]
+        });
+        let raw = format!(
+            r#"{{"schema_version":"{}","step_id":"S1","status":"done","evidence":["ok"]}}"#,
+            STEP_RESULT_SCHEMA_VERSION
+        );
+        let normalized = normalize_worker_step_result(&raw, &plan).expect("valid");
+        assert_eq!(
+            normalized.get("step_id").and_then(|v| v.as_str()),
+            Some("S1")
+        );
+        assert_eq!(
+            normalized.get("status").and_then(|v| v.as_str()),
+            Some("done")
         );
     }
 }

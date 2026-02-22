@@ -87,6 +87,12 @@ pub struct WorkerRunRecord {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub injected_planner_hash_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_result_valid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_result_json: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_result_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -838,6 +844,9 @@ mod tests {
             Some(super::WorkerRunRecord {
                 model: "m".to_string(),
                 injected_planner_hash_hex: None,
+                step_result_valid: None,
+                step_result_json: None,
+                step_result_error: None,
             }),
             BTreeMap::new(),
             None,
@@ -902,6 +911,9 @@ mod tests {
             worker: Some(WorkerRunRecord {
                 model: "w".to_string(),
                 injected_planner_hash_hex: Some("abc".to_string()),
+                step_result_valid: None,
+                step_result_json: None,
+                step_result_error: None,
             }),
             cli: RunCliConfig {
                 mode: "planner_worker".to_string(),

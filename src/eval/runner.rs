@@ -1331,6 +1331,9 @@ fn write_run_artifact_for_eval(
         Some(crate::store::WorkerRunRecord {
             model: model.to_string(),
             injected_planner_hash_hex: None,
+            step_result_valid: None,
+            step_result_json: None,
+            step_result_error: None,
         }),
         tool_schema_hash_hex_map,
         hooks_config_hash_hex,
