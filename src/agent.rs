@@ -140,6 +140,22 @@ pub struct PolicyLoadedInfo {
     pub mcp_allowlist: Option<McpAllowSummary>,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanToolEnforcementMode {
+    Off,
+    Soft,
+    Hard,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlanStepConstraint {
+    pub step_id: String,
+    pub intended_tools: Vec<String>,
+}
+
 pub struct Agent<P: ModelProvider> {
     pub provider: P,
     pub model: String,
@@ -160,6 +176,8 @@ pub struct Agent<P: ModelProvider> {
     pub taint_digest_bytes: usize,
     pub run_id_override: Option<String>,
     pub omit_tools_field_when_empty: bool,
+    pub plan_tool_enforcement: PlanToolEnforcementMode,
+    pub plan_step_constraints: Vec<PlanStepConstraint>,
 }
 
 impl<P: ModelProvider> Agent<P> {
@@ -235,6 +253,7 @@ impl<P: ModelProvider> Agent<P> {
         let mut total_token_usage = TokenUsage::default();
         let mut saw_token_usage = false;
         let mut taint_state = TaintState::new();
+        let mut active_plan_step_idx: usize = 0;
         for step in 0..self.max_steps {
             let compacted = match maybe_compact(&messages, &self.compaction_settings) {
                 Ok(c) => c,
@@ -791,6 +810,7 @@ impl<P: ModelProvider> Agent<P> {
                 };
             }
 
+            let mut saw_plan_violation = false;
             for tc in &resp.tool_calls {
                 observed_tool_calls.push(tc.clone());
                 self.emit_event(
@@ -840,6 +860,18 @@ impl<P: ModelProvider> Agent<P> {
                 let tool_schema_hash_hex = self.gate_ctx.tool_schema_hashes.get(&tc.name).cloned();
                 let hooks_config_hash_hex = self.gate_ctx.hooks_config_hash_hex.clone();
                 let planner_hash_hex = self.gate_ctx.planner_hash_hex.clone();
+                let plan_constraint = self
+                    .plan_step_constraints
+                    .get(active_plan_step_idx)
+                    .cloned();
+                let plan_allowed_tools = plan_constraint
+                    .as_ref()
+                    .map(|c| c.intended_tools.clone())
+                    .unwrap_or_default();
+                let plan_tool_allowed =
+                    matches!(self.plan_tool_enforcement, PlanToolEnforcementMode::Off)
+                        || plan_allowed_tools.is_empty()
+                        || plan_allowed_tools.iter().any(|t| t == &tc.name);
                 self.gate_ctx.taint_enabled = matches!(self.taint_toggle, TaintToggle::On);
                 self.gate_ctx.taint_mode = self.taint_mode;
                 self.gate_ctx.taint_overall = taint_state.overall;
@@ -851,6 +883,153 @@ impl<P: ModelProvider> Agent<P> {
                     }
                     .to_string(),
                 );
+                if !plan_tool_allowed {
+                    saw_plan_violation = true;
+                    let step_id = plan_constraint
+                        .as_ref()
+                        .map(|c| c.step_id.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let reason = format!(
+                        "tool '{}' is not allowed for plan step {} (allowed: {})",
+                        tc.name,
+                        step_id,
+                        if plan_allowed_tools.is_empty() {
+                            "none".to_string()
+                        } else {
+                            plan_allowed_tools.join(", ")
+                        }
+                    );
+                    self.emit_event(
+                        &run_id,
+                        step as u32,
+                        EventKind::ToolDecision,
+                        serde_json::json!({
+                            "tool_call_id": tc.id,
+                            "name": tc.name,
+                            "decision": "deny",
+                            "reason": reason,
+                            "source": "plan_step_constraint",
+                            "planner_hash_hex": planner_hash_hex.clone(),
+                            "plan_step_id": step_id,
+                            "plan_step_index": active_plan_step_idx,
+                            "plan_allowed_tools": plan_allowed_tools,
+                            "enforcement_mode": format!("{:?}", self.plan_tool_enforcement).to_lowercase()
+                        }),
+                    );
+                    self.gate.record(GateEvent {
+                        run_id: run_id.clone(),
+                        step: step as u32,
+                        tool_call_id: tc.id.clone(),
+                        tool: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                        decision: "deny".to_string(),
+                        decision_reason: Some(reason.clone()),
+                        decision_source: Some("plan_step_constraint".to_string()),
+                        approval_id: None,
+                        approval_key: None,
+                        approval_mode: approval_mode_meta.clone(),
+                        auto_approve_scope: auto_scope_meta.clone(),
+                        approval_key_version: approval_key_version_meta.clone(),
+                        tool_schema_hash_hex: tool_schema_hash_hex.clone(),
+                        hooks_config_hash_hex: hooks_config_hash_hex.clone(),
+                        planner_hash_hex: planner_hash_hex.clone(),
+                        exec_target: decision_exec_target.clone(),
+                        taint_overall: Some(taint_state.overall_str().to_string()),
+                        taint_enforced: false,
+                        escalated: false,
+                        escalation_reason: None,
+                        result_ok: false,
+                        result_content: reason.clone(),
+                        result_input_digest: None,
+                        result_output_digest: None,
+                        result_input_len: None,
+                        result_output_len: None,
+                    });
+                    observed_tool_decisions.push(ToolDecisionRecord {
+                        step: step as u32,
+                        tool_call_id: tc.id.clone(),
+                        tool: tc.name.clone(),
+                        decision: "deny".to_string(),
+                        reason: Some(reason.clone()),
+                        source: Some("plan_step_constraint".to_string()),
+                        taint_overall: Some(taint_state.overall_str().to_string()),
+                        taint_enforced: false,
+                        escalated: false,
+                        escalation_reason: None,
+                    });
+
+                    match self.plan_tool_enforcement {
+                        PlanToolEnforcementMode::Off => {}
+                        PlanToolEnforcementMode::Soft => {
+                            self.emit_event(
+                                &run_id,
+                                step as u32,
+                                EventKind::ToolExecEnd,
+                                serde_json::json!({
+                                    "tool_call_id": tc.id,
+                                    "name": tc.name,
+                                    "ok": false,
+                                    "truncated": false,
+                                    "source": "plan_step_constraint"
+                                }),
+                            );
+                            messages.push(envelope_to_message(to_tool_result_envelope(
+                                tc,
+                                "runtime",
+                                false,
+                                reason,
+                                false,
+                                ToolResultMeta {
+                                    side_effects: tool_side_effects(&tc.name),
+                                    bytes: None,
+                                    exit_code: None,
+                                    stderr_truncated: None,
+                                    stdout_truncated: None,
+                                    source: "runtime".to_string(),
+                                    execution_target: "host".to_string(),
+                                    docker: None,
+                                },
+                            )));
+                            continue;
+                        }
+                        PlanToolEnforcementMode::Hard => {
+                            self.emit_event(
+                                &run_id,
+                                step as u32,
+                                EventKind::RunEnd,
+                                serde_json::json!({"exit_reason":"denied"}),
+                            );
+                            return AgentOutcome {
+                                run_id,
+                                started_at,
+                                finished_at: crate::trust::now_rfc3339(),
+                                exit_reason: AgentExitReason::Denied,
+                                final_output: reason,
+                                error: None,
+                                messages,
+                                tool_calls: observed_tool_calls,
+                                tool_decisions: observed_tool_decisions,
+                                compaction_settings: self.compaction_settings.clone(),
+                                final_prompt_size_chars: request_context_chars,
+                                compaction_report: last_compaction_report,
+                                hook_invocations,
+                                provider_retry_count,
+                                provider_error_count,
+                                token_usage: if saw_token_usage {
+                                    Some(total_token_usage.clone())
+                                } else {
+                                    None
+                                },
+                                taint: taint_record_from_state(
+                                    self.taint_toggle,
+                                    self.taint_mode,
+                                    self.taint_digest_bytes,
+                                    &taint_state,
+                                ),
+                            };
+                        }
+                    }
+                }
                 match self.gate.decide(&self.gate_ctx, tc) {
                     GateDecision::Allow {
                         approval_id,
@@ -1568,6 +1747,13 @@ impl<P: ModelProvider> Agent<P> {
                     }
                 }
             }
+            if !matches!(self.plan_tool_enforcement, PlanToolEnforcementMode::Off)
+                && !saw_plan_violation
+                && !resp.tool_calls.is_empty()
+                && active_plan_step_idx + 1 < self.plan_step_constraints.len()
+            {
+                active_plan_step_idx += 1;
+            }
         }
 
         self.emit_event(
@@ -1770,7 +1956,10 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
-    use super::{sanitize_user_visible_output, Agent};
+    use super::{
+        sanitize_user_visible_output, Agent, AgentExitReason, PlanStepConstraint,
+        PlanToolEnforcementMode,
+    };
     use crate::compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
     use crate::gate::{ApprovalMode, AutoApproveScope, GateContext, NoGate, ProviderKind};
     use crate::hooks::config::HooksMode;
@@ -1899,6 +2088,8 @@ mod tests {
             taint_digest_bytes: 4096,
             run_id_override: None,
             omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            plan_step_constraints: Vec::new(),
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert_eq!(out.final_output, "done");
@@ -1980,6 +2171,8 @@ mod tests {
             taint_digest_bytes: 4096,
             run_id_override: None,
             omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            plan_step_constraints: Vec::new(),
         };
         let mem_msg = Message {
             role: Role::Developer,
@@ -2145,6 +2338,8 @@ mod tests {
             taint_digest_bytes: 4096,
             run_id_override: None,
             omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            plan_step_constraints: Vec::new(),
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert_eq!(out.final_output, "done");
@@ -2158,6 +2353,97 @@ mod tests {
             .position(|e| matches!(e.kind, crate::events::EventKind::ToolExecStart))
             .expect("start event");
         assert!(target_idx < start_idx);
+    }
+
+    #[tokio::test]
+    async fn plan_tool_enforcement_hard_denies_disallowed_tool() {
+        let provider = ToolCallProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut agent = Agent {
+            provider,
+            model: "m".to_string(),
+            tools: vec![crate::types::ToolDef {
+                name: "read_file".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+                side_effects: crate::types::SideEffects::FilesystemRead,
+            }],
+            max_steps: 2,
+            tool_rt: ToolRuntime {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_shell_in_workdir_only: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: Some("plan123".to_string()),
+                taint_enabled: false,
+                taint_mode: crate::taint::TaintMode::Propagate,
+                taint_overall: crate::taint::TaintLevel::Clean,
+                taint_sources: Vec::new(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: None,
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            policy_for_taint: None,
+            taint_toggle: crate::taint::TaintToggle::Off,
+            taint_mode: crate::taint::TaintMode::Propagate,
+            taint_digest_bytes: 4096,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Hard,
+            plan_step_constraints: vec![PlanStepConstraint {
+                step_id: "S1".to_string(),
+                intended_tools: vec!["list_dir".to_string()],
+            }],
+        };
+        let out = agent.run("hi", vec![], Vec::new()).await;
+        assert!(matches!(out.exit_reason, AgentExitReason::Denied));
+        assert!(out.final_output.contains("is not allowed for plan step S1"));
+        assert!(out
+            .tool_decisions
+            .iter()
+            .any(|d| d.source.as_deref() == Some("plan_step_constraint")));
     }
 
     #[test]

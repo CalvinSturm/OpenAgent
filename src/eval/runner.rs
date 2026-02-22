@@ -1044,6 +1044,8 @@ async fn run_single(
         taint_digest_bytes: 4096,
         run_id_override: None,
         omit_tools_field_when_empty: false,
+        plan_tool_enforcement: crate::agent::PlanToolEnforcementMode::Off,
+        plan_step_constraints: Vec::new(),
     };
     let session_messages = Vec::new();
     let outcome = agent.run(&prompt, session_messages, Vec::new()).await;
@@ -1158,6 +1160,7 @@ fn write_run_artifact_for_eval(
         planner_max_steps: None,
         planner_output: None,
         planner_strict: None,
+        enforce_plan_tools: "off".to_string(),
         trust_mode: format!("{:?}", config.trust).to_lowercase(),
         allow_shell: config.allow_shell,
         allow_write: config.allow_write,
@@ -1236,6 +1239,7 @@ fn write_run_artifact_for_eval(
         planner_max_steps: 0,
         planner_output: String::new(),
         planner_strict: false,
+        enforce_plan_tools: "off".to_string(),
         trust_mode: format!("{:?}", config.trust).to_lowercase(),
         state_dir: stable_path_string(&state_paths.state_dir),
         policy_path: stable_path_string(&state_paths.policy_path),

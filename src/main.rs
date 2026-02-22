@@ -28,7 +28,7 @@ use std::time::Duration;
 use crate::mcp::registry::{
     doctor_server as mcp_doctor_server, list_servers as mcp_list_servers, McpRegistry,
 };
-use agent::{Agent, AgentExitReason, PolicyLoadedInfo};
+use agent::{Agent, AgentExitReason, PlanToolEnforcementMode, PolicyLoadedInfo};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand, ValueEnum};
 use compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
@@ -757,6 +757,8 @@ struct RunArgs {
     planner_max_steps: u32,
     #[arg(long, value_enum, default_value_t = planner::PlannerOutput::Json)]
     planner_output: planner::PlannerOutput,
+    #[arg(long, value_enum, default_value_t = PlanToolEnforcementMode::Off)]
+    enforce_plan_tools: PlanToolEnforcementMode,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     planner_strict: bool,
     #[arg(long, default_value_t = false)]
@@ -4906,6 +4908,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
     let mut planner_record: Option<PlannerRunRecord> = None;
     let mut worker_record: Option<WorkerRunRecord> = None;
     let mut planner_injected_message: Option<Message> = None;
+    let mut plan_step_constraints: Vec<agent::PlanStepConstraint> = Vec::new();
 
     if matches!(args.mode, planner::RunMode::PlannerWorker) {
         emit_event(
@@ -5010,6 +5013,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
                         Some(args.planner_max_steps),
                         Some(format!("{:?}", args.planner_output).to_lowercase()),
                         Some(planner_strict_effective),
+                        Some(format!("{:?}", args.enforce_plan_tools).to_lowercase()),
                         &instruction_resolution,
                     );
                     let config_fingerprint =
@@ -5065,6 +5069,25 @@ async fn run_agent_with_ui<P: ModelProvider>(
                     planner::planner_handoff_content(&out.plan_json)?,
                     planner::planner_worker_contract_content(&out.plan_json)?
                 );
+                if matches!(
+                    args.enforce_plan_tools,
+                    PlanToolEnforcementMode::Soft | PlanToolEnforcementMode::Hard
+                ) {
+                    match planner::extract_plan_step_tools(&out.plan_json) {
+                        Ok(steps) => {
+                            plan_step_constraints = steps
+                                .into_iter()
+                                .map(|s| agent::PlanStepConstraint {
+                                    step_id: s.step_id,
+                                    intended_tools: s.intended_tools,
+                                })
+                                .collect();
+                        }
+                        Err(e) => {
+                            eprintln!("WARN: failed to extract plan step constraints: {e}");
+                        }
+                    }
+                }
                 planner_injected_message = Some(Message {
                     role: Role::Developer,
                     content: Some(handoff),
@@ -5162,6 +5185,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
                     Some(args.planner_max_steps),
                     Some(format!("{:?}", args.planner_output).to_lowercase()),
                     Some(planner_strict_effective),
+                    Some(format!("{:?}", args.enforce_plan_tools).to_lowercase()),
                     &instruction_resolution,
                 );
                 let config_fingerprint =
@@ -5248,6 +5272,8 @@ async fn run_agent_with_ui<P: ModelProvider>(
         taint_digest_bytes: args.taint_digest_bytes,
         run_id_override: Some(run_id.clone()),
         omit_tools_field_when_empty: false,
+        plan_tool_enforcement: args.enforce_plan_tools,
+        plan_step_constraints,
     };
 
     let mut outcome = tokio::select! {
@@ -5397,6 +5423,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
         Some(args.planner_max_steps),
         Some(format!("{:?}", args.planner_output).to_lowercase()),
         Some(planner_strict_effective),
+        Some(format!("{:?}", args.enforce_plan_tools).to_lowercase()),
         &instruction_resolution,
     );
     let config_fingerprint = build_config_fingerprint(&cli_config, args, &worker_model, paths);
@@ -6129,6 +6156,7 @@ fn build_run_cli_config(
     planner_max_steps: Option<u32>,
     planner_output: Option<String>,
     planner_strict: Option<bool>,
+    enforce_plan_tools: Option<String>,
     instructions: &InstructionResolution,
 ) -> RunCliConfig {
     RunCliConfig {
@@ -6141,6 +6169,7 @@ fn build_run_cli_config(
         planner_max_steps,
         planner_output,
         planner_strict,
+        enforce_plan_tools: enforce_plan_tools.unwrap_or_else(|| "off".to_string()),
         trust_mode: store::cli_trust_mode(args.trust),
         allow_shell: args.allow_shell,
         allow_write: args.allow_write,
@@ -6236,6 +6265,7 @@ fn build_config_fingerprint(
         planner_max_steps: cli_config.planner_max_steps.unwrap_or_default(),
         planner_output: cli_config.planner_output.clone().unwrap_or_default(),
         planner_strict: cli_config.planner_strict.unwrap_or(false),
+        enforce_plan_tools: cli_config.enforce_plan_tools.clone(),
         trust_mode: store::cli_trust_mode(args.trust),
         state_dir: stable_path_string(&paths.state_dir),
         policy_path: stable_path_string(&paths.policy_path),
@@ -7343,6 +7373,7 @@ rules:
             worker_model: None,
             planner_max_steps: 2,
             planner_output: crate::planner::PlannerOutput::Json,
+            enforce_plan_tools: crate::agent::PlanToolEnforcementMode::Off,
             planner_strict: true,
             no_planner_strict: false,
         }

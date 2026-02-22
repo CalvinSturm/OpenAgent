@@ -9,6 +9,12 @@ pub const PLAN_SCHEMA_VERSION: &str = "openagent.plan.v1";
 pub const PLANNER_HANDOFF_HEADER: &str = "PLANNER HANDOFF (openagent.plan.v1)";
 pub const STEP_RESULT_SCHEMA_VERSION: &str = "openagent.step_result.v1";
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStepTools {
+    pub step_id: String,
+    pub intended_tools: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
@@ -117,6 +123,39 @@ Return final output as JSON only with fields:\n\
   \"notes\": \"optional brief note\"\n\
 }}"
     ))
+}
+
+pub fn extract_plan_step_tools(plan_json: &Value) -> anyhow::Result<Vec<PlanStepTools>> {
+    let steps = plan_json
+        .get("steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("plan_json missing steps array"))?;
+    let mut out = Vec::with_capacity(steps.len());
+    for (idx, step) in steps.iter().enumerate() {
+        let step_obj = step
+            .as_object()
+            .ok_or_else(|| anyhow!("plan step {} must be object", idx + 1))?;
+        let step_id = step_obj
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("plan step {} missing id", idx + 1))?
+            .to_string();
+        let tools = step_obj
+            .get("intended_tools")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.get("name").and_then(Value::as_str))
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        out.push(PlanStepTools {
+            step_id,
+            intended_tools: tools,
+        });
+    }
+    Ok(out)
 }
 
 pub fn normalize_plan_json(raw: &str) -> anyhow::Result<Value> {
