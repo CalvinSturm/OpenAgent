@@ -3842,13 +3842,11 @@ fn truncate_cell(s: &str, max_chars: usize) -> String {
         return String::new();
     }
     let mut out = String::new();
-    let mut count = 0usize;
-    for ch in s.chars() {
+    for (count, ch) in s.chars().enumerate() {
         if count >= max_chars {
             break;
         }
         out.push(ch);
-        count += 1;
     }
     if s.chars().count() > max_chars {
         if max_chars >= 3 {
