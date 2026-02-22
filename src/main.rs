@@ -34,7 +34,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -1547,7 +1547,7 @@ async fn run_startup_bootstrap(
                 );
             })?;
 
-            if event::poll(Duration::from_millis(120))? {
+            if event::poll(Duration::from_millis(16))? {
                 match event::read()? {
                     CEvent::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                         KeyCode::Esc => return Ok(None),
@@ -2574,6 +2574,9 @@ async fn run_chat_tui(
     let mut transcript_scroll: usize = 0;
     let mut follow_output = true;
     let mut compact_tools = true;
+    let mut tools_selected = 0usize;
+    let mut tools_focus = true;
+    let mut show_tool_details = false;
     let palette_items = [
         "toggle tools pane",
         "toggle approvals pane",
@@ -2600,6 +2603,29 @@ async fn run_chat_tui(
 
     let run_result: anyhow::Result<()> = async {
         loop {
+            let tool_row_count = if compact_tools { 20 } else { 12 };
+            let visible_tool_count = ui_state.tool_calls.len().min(tool_row_count);
+            if visible_tool_count == 0 {
+                tools_selected = 0;
+                show_tool_details = false;
+            } else {
+                tools_selected = tools_selected.min(visible_tool_count.saturating_sub(1));
+            }
+            if ui_state.pending_approvals.is_empty() {
+                approvals_selected = 0;
+            } else {
+                approvals_selected =
+                    approvals_selected.min(ui_state.pending_approvals.len().saturating_sub(1));
+            }
+            if show_tools && !show_approvals {
+                tools_focus = true;
+            } else if show_approvals && !show_tools {
+                tools_focus = false;
+            }
+            if !show_tools {
+                show_tool_details = false;
+            }
+
             terminal.draw(|f| {
                 draw_chat_frame(
                     f,
@@ -2611,6 +2637,9 @@ async fn run_chat_tui(
                     &transcript,
                     &streaming_assistant,
                     &ui_state,
+                    tools_selected,
+                    tools_focus,
+                    show_tool_details,
                     approvals_selected,
                     &cwd_label,
                     &input,
@@ -2646,17 +2675,17 @@ async fn run_chat_tui(
 
             if event::poll(Duration::from_millis(base_run.tui_refresh_ms))? {
                 match event::read()? {
-                    CEvent::Mouse(me) => match me.kind {
-                        MouseEventKind::ScrollUp => {
-                            transcript_scroll = transcript_scroll.saturating_sub(3);
+                    CEvent::Mouse(me) => {
+                        if let Some(delta) = mouse_scroll_delta(&me) {
+                            if delta < 0 {
+                                transcript_scroll =
+                                    transcript_scroll.saturating_sub((-delta) as usize);
+                            } else {
+                                transcript_scroll = transcript_scroll.saturating_add(delta as usize);
+                            }
                             follow_output = false;
                         }
-                        MouseEventKind::ScrollDown => {
-                            transcript_scroll = transcript_scroll.saturating_add(3);
-                            follow_output = false;
-                        }
-                        _ => {}
-                    },
+                    }
                     CEvent::Key(key) => {
                     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                         continue;
@@ -2835,6 +2864,11 @@ async fn run_chat_tui(
                         KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             show_logs = !show_logs;
                         }
+                        KeyCode::Tab => {
+                            if show_tools && show_approvals {
+                                tools_focus = !tools_focus;
+                            }
+                        }
                         KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             show_tools = !show_tools;
                         }
@@ -2845,12 +2879,20 @@ async fn run_chat_tui(
                             show_logs = !show_logs;
                         }
                         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if approvals_selected + 1 < ui_state.pending_approvals.len() {
+                            if show_tools && (!show_approvals || tools_focus) {
+                                if tools_selected + 1 < visible_tool_count {
+                                    tools_selected += 1;
+                                }
+                            } else if approvals_selected + 1 < ui_state.pending_approvals.len() {
                                 approvals_selected += 1;
                             }
                         }
                         KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            approvals_selected = approvals_selected.saturating_sub(1);
+                            if show_tools && (!show_approvals || tools_focus) {
+                                tools_selected = tools_selected.saturating_sub(1);
+                            } else {
+                                approvals_selected = approvals_selected.saturating_sub(1);
+                            }
                         }
                         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             if let Err(e) = ui_state.refresh_approvals(&paths.approvals_path) {
@@ -3004,6 +3046,16 @@ async fn run_chat_tui(
                                 continue;
                             }
 
+                            if line.is_empty() && show_tools && (!show_approvals || tools_focus) {
+                                if visible_tool_count > 0 {
+                                    show_tool_details = !show_tool_details;
+                                    if show_tool_details {
+                                        show_logs = false;
+                                    }
+                                }
+                                continue;
+                            }
+
                             prompt_history.push(line.clone());
                             transcript.push(("user".to_string(), line.clone()));
                             if line.starts_with('?') {
@@ -3016,6 +3068,53 @@ async fn run_chat_tui(
                             if follow_output {
                                 transcript_scroll = usize::MAX;
                             }
+                            terminal.draw(|f| {
+                                draw_chat_frame(
+                                    f,
+                                    chat_mode_label(&active_run),
+                                    provider_cli_name(provider_kind),
+                                    provider_connected,
+                                    &model,
+                                    &status,
+                                    &transcript,
+                                    &streaming_assistant,
+                                    &ui_state,
+                                    tools_selected,
+                                    tools_focus,
+                                    show_tool_details,
+                                    approvals_selected,
+                                    &cwd_label,
+                                    &input,
+                                    &logs,
+                                    think_tick,
+                                    base_run.tui_refresh_ms,
+                                    show_tools,
+                                    show_approvals,
+                                    show_logs,
+                                    transcript_scroll,
+                                    compact_tools,
+                                    show_banner,
+                                    ui_tick,
+                                    if palette_open {
+                                        Some(format!(
+                                            "⌘ {}  (Up/Down, Enter, Esc)",
+                                            palette_items[palette_selected]
+                                        ))
+                                    } else if search_mode {
+                                        Some(format!(
+                                            "🔎 {}  (Enter next, Esc close)",
+                                            search_query
+                                        ))
+                                    } else if input.starts_with('/') {
+                                        slash_overlay_text(&input, slash_menu_index)
+                                    } else if input.starts_with('?') {
+                                        keybinds_overlay_text()
+                                    } else {
+                                        None
+                                    },
+                                );
+                            })?;
+                            ui_tick = ui_tick.saturating_add(1);
 
                             let (tx, rx) = std::sync::mpsc::channel::<Event>();
                             let mut turn_args = active_run.clone();
@@ -3139,17 +3238,18 @@ async fn run_chat_tui(
 
                                 while event::poll(Duration::from_millis(0))? {
                                     match event::read()? {
-                                        CEvent::Mouse(me) => match me.kind {
-                                            MouseEventKind::ScrollUp => {
-                                                transcript_scroll = transcript_scroll.saturating_sub(3);
+                                        CEvent::Mouse(me) => {
+                                            if let Some(delta) = mouse_scroll_delta(&me) {
+                                                if delta < 0 {
+                                                    transcript_scroll = transcript_scroll
+                                                        .saturating_sub((-delta) as usize);
+                                                } else {
+                                                    transcript_scroll =
+                                                        transcript_scroll.saturating_add(delta as usize);
+                                                }
                                                 follow_output = false;
                                             }
-                                            MouseEventKind::ScrollDown => {
-                                                transcript_scroll = transcript_scroll.saturating_add(3);
-                                                follow_output = false;
-                                            }
-                                            _ => {}
-                                        },
+                                        }
                                         CEvent::Key(key)
                                             if matches!(
                                                 key.kind,
@@ -3296,6 +3396,9 @@ async fn run_chat_tui(
                                         &transcript,
                                         &streaming_assistant,
                                         &ui_state,
+                                        tools_selected,
+                                        tools_focus,
+                                        show_tool_details,
                                         approvals_selected,
                                         &cwd_label,
                                         &input,
@@ -3434,6 +3537,19 @@ async fn run_chat_tui(
 
 fn is_text_input_mods(mods: KeyModifiers) -> bool {
     mods.is_empty() || mods == KeyModifiers::SHIFT
+}
+
+fn mouse_scroll_delta(me: &MouseEvent) -> Option<isize> {
+    let step = if me.modifiers.contains(KeyModifiers::SHIFT) {
+        12
+    } else {
+        3
+    };
+    match me.kind {
+        MouseEventKind::ScrollUp => Some(-(step as isize)),
+        MouseEventKind::ScrollDown => Some(step as isize),
+        _ => None,
+    }
 }
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -3626,8 +3742,10 @@ fn keybinds_overlay_text() -> Option<String> {
         ("Ctrl+J / Ctrl+K", "approvals selection"),
         ("Ctrl+A / Ctrl+X", "approve / deny selected approval"),
         ("Ctrl+R", "refresh approvals"),
+        ("Tab", "switch tools/approvals focus"),
         ("Ctrl+P", "command palette"),
         ("Ctrl+F", "search transcript"),
+        ("Enter (empty input)", "toggle selected tool details"),
         ("/mode <...>", "switch chat mode (safe/coding/web/custom)"),
         ("/timeout <...>", "adjust request/stream idle timeout"),
         ("/dismiss", "dismiss timeout notification"),
@@ -3657,6 +3775,47 @@ fn localagent_banner(_tick: u64) -> String {
 
 fn horizontal_rule(width: u16) -> String {
     "─".repeat(width as usize)
+}
+
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut total = 0usize;
+    for line in text.split('\n') {
+        let chars = line.chars().count();
+        let line_count = if chars == 0 {
+            1
+        } else {
+            (chars - 1) / width + 1
+        };
+        total = total.saturating_add(line_count);
+    }
+    total.max(1)
+}
+
+fn truncate_cell(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut count = 0usize;
+    for ch in s.chars() {
+        if count >= max_chars {
+            break;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    if s.chars().count() > max_chars {
+        if max_chars >= 3 {
+            out.truncate(max_chars.saturating_sub(3));
+            out.push_str("...");
+        } else {
+            out.truncate(max_chars);
+        }
+    }
+    out
 }
 
 fn centered_multiline(text: &str, width: u16, top_pad: usize) -> String {
@@ -3760,6 +3919,9 @@ fn draw_chat_frame(
     transcript: &[(String, String)],
     streaming_assistant: &str,
     ui_state: &UiState,
+    tools_selected: usize,
+    tools_focus: bool,
+    show_tool_details: bool,
     approvals_selected: usize,
     cwd_label: &str,
     input: &str,
@@ -3775,6 +3937,15 @@ fn draw_chat_frame(
     ui_tick: u64,
     overlay_hint: Option<String>,
 ) {
+    let input_display = format!("> {input}");
+    let input_chars = input.chars().count();
+    let input_width = f.area().width.saturating_sub(2).max(1) as usize;
+    let input_total_lines = wrapped_line_count(&input_display, input_width);
+    let max_input_lines = usize::from(f.area().height.saturating_sub(12)).clamp(1, 8);
+    let input_visible_lines = input_total_lines.min(max_input_lines).max(1);
+    let input_scroll = input_total_lines.saturating_sub(input_visible_lines);
+    let input_section_height = (input_visible_lines as u16).saturating_add(2);
+
     let bottom_overlay_height = if overlay_hint.is_some() {
         8
     } else if show_logs {
@@ -3789,7 +3960,7 @@ fn draw_chat_frame(
             Constraint::Length(1),
             Constraint::Min(8),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(input_section_height),
             Constraint::Length(1),
             Constraint::Length(bottom_overlay_height),
         ])
@@ -3896,11 +4067,27 @@ fn draw_chat_frame(
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
                     .split(mid[1]);
-                draw_tools_pane(f, right[0], ui_state, compact_tools);
-                draw_approvals_pane(f, right[1], ui_state, approvals_selected);
+                draw_tools_pane(
+                    f,
+                    right[0],
+                    ui_state,
+                    compact_tools,
+                    tools_selected,
+                    tools_focus,
+                    show_tool_details,
+                );
+                draw_approvals_pane(f, right[1], ui_state, approvals_selected, !tools_focus);
             }
-            (true, false) => draw_tools_pane(f, mid[1], ui_state, compact_tools),
-            (false, true) => draw_approvals_pane(f, mid[1], ui_state, approvals_selected),
+            (true, false) => draw_tools_pane(
+                f,
+                mid[1],
+                ui_state,
+                compact_tools,
+                tools_selected,
+                true,
+                show_tool_details,
+            ),
+            (false, true) => draw_approvals_pane(f, mid[1], ui_state, approvals_selected, true),
             (false, false) => {}
         }
     }
@@ -3976,7 +4163,7 @@ fn draw_chat_frame(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(input_visible_lines as u16),
             Constraint::Length(1),
         ])
         .split(outer[4]);
@@ -3985,16 +4172,31 @@ fn draw_chat_frame(
             .style(Style::default().fg(Color::DarkGray)),
         input_box[0],
     );
-    let input_line = Line::from(vec![
-        Span::styled(">", Style::default().fg(Color::Yellow)),
-        Span::raw(" "),
-        Span::raw(input),
-    ]);
-    f.render_widget(Paragraph::new(input_line), input_box[1]);
+    f.render_widget(
+        Paragraph::new(input_display)
+            .wrap(Wrap { trim: false })
+            .scroll((input_scroll as u16, 0)),
+        input_box[1],
+    );
     f.render_widget(
         Paragraph::new(horizontal_rule(input_box[2].width))
             .style(Style::default().fg(Color::DarkGray)),
         input_box[2],
+    );
+    let input_count_text = format!("[{input_chars} chars]");
+    let input_count_width = input_count_text.chars().count() as u16;
+    let input_count_x = outer[4]
+        .x
+        .saturating_add(outer[4].width.saturating_sub(input_count_width));
+    let input_count_y = input_box[0].y;
+    f.render_widget(
+        Paragraph::new(input_count_text).style(Style::default().fg(Color::DarkGray)),
+        ratatui::layout::Rect {
+            x: input_count_x,
+            y: input_count_y,
+            width: input_count_width.min(outer[4].width),
+            height: 1,
+        },
     );
 
     let footer_left = format!("cwd: {cwd_label}");
@@ -4048,33 +4250,121 @@ fn draw_tools_pane(
     area: ratatui::layout::Rect,
     ui_state: &UiState,
     compact_tools: bool,
+    tools_selected: usize,
+    focused: bool,
+    show_details: bool,
 ) {
     let row_count = if compact_tools { 20 } else { 12 };
-    let tool_rows = ui_state.tool_calls.iter().rev().take(row_count).map(|t| {
+    let rows: Vec<&crate::tui::state::ToolRow> =
+        ui_state.tool_calls.iter().rev().take(row_count).collect();
+    let selected = rows.get(tools_selected).copied();
+    let summary = format!(
+        "Tools {}  rows:{}  selected:{}/{}",
+        if focused { "[focused]" } else { "" },
+        rows.len(),
+        if rows.is_empty() {
+            0
+        } else {
+            tools_selected + 1
+        },
+        rows.len()
+    );
+
+    let layout = if show_details && selected.is_some() {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(4),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(0),
+            ])
+            .split(area)
+    };
+
+    f.render_widget(
+        Paragraph::new(summary).style(Style::default().fg(Color::DarkGray)),
+        layout[0],
+    );
+
+    let total_w = layout[1].width.max(12);
+    let tool_w = ((total_w as usize * 44) / 100).max(10) as u16;
+    let status_w = ((total_w as usize * 17) / 100).max(8) as u16;
+    let decision_w = ((total_w as usize * 27) / 100).max(9) as u16;
+    let fixed = tool_w.saturating_add(status_w).saturating_add(decision_w);
+    let ok_w = total_w.saturating_sub(fixed).max(4);
+
+    let tool_rows = rows.iter().enumerate().map(|(idx, t)| {
+        let is_selected = idx == tools_selected;
+        let style = if is_selected {
+            if focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Gray)
+            }
+        } else {
+            Style::default()
+        };
         Row::new(vec![
-            Cell::from(t.tool_name.clone()),
-            Cell::from(t.status.clone()),
-            Cell::from(t.decision.clone().unwrap_or_default()),
+            Cell::from(truncate_cell(
+                &t.tool_name,
+                tool_w.saturating_sub(1) as usize,
+            )),
+            Cell::from(truncate_cell(
+                &t.status,
+                status_w.saturating_sub(1) as usize,
+            )),
+            Cell::from(truncate_cell(
+                t.decision.as_deref().unwrap_or("-"),
+                decision_w.saturating_sub(1) as usize,
+            )),
             Cell::from(
                 t.ok.map(|v| if v { "ok" } else { "fail" })
                     .unwrap_or("-")
                     .to_string(),
             ),
         ])
+        .style(style)
     });
     f.render_widget(
         Table::new(
             tool_rows,
             [
-                Constraint::Length(20),
-                Constraint::Length(10),
-                Constraint::Length(12),
-                Constraint::Length(6),
+                Constraint::Length(tool_w),
+                Constraint::Length(status_w),
+                Constraint::Length(decision_w),
+                Constraint::Length(ok_w),
             ],
         )
         .header(Row::new(vec!["Tool", "Status", "Decision", "OK"])),
-        area,
+        layout[1],
     );
+
+    if show_details {
+        if let Some(t) = selected {
+            let detail = format!(
+                "id: {}\nside_effects: {}\nreason: {}\nresult: {}",
+                truncate_cell(&t.tool_call_id, 72),
+                truncate_cell(&t.side_effects, 72),
+                truncate_cell(t.decision_reason.as_deref().unwrap_or("-"), 72),
+                truncate_cell(&t.short_result, 72),
+            );
+            f.render_widget(
+                Paragraph::new(detail)
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(Color::DarkGray)),
+                layout[2],
+            );
+        }
+    }
 }
 
 fn draw_approvals_pane(
@@ -4082,17 +4372,44 @@ fn draw_approvals_pane(
     area: ratatui::layout::Rect,
     ui_state: &UiState,
     approvals_selected: usize,
+    focused: bool,
 ) {
+    let summary = format!(
+        "Approvals {}  pending:{}",
+        if focused { "[focused]" } else { "" },
+        ui_state.pending_approvals.len()
+    );
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(area);
+    f.render_widget(
+        Paragraph::new(summary).style(Style::default().fg(Color::DarkGray)),
+        layout[0],
+    );
+
+    let total_w = layout[1].width.max(12);
+    let id_w = ((total_w as usize * 36) / 100).max(10) as u16;
+    let status_w = ((total_w as usize * 19) / 100).max(8) as u16;
+    let tool_w = total_w.saturating_sub(id_w).saturating_sub(status_w).max(8);
+
     let approval_rows = ui_state.pending_approvals.iter().enumerate().map(|(i, a)| {
         let style = if i == approvals_selected {
-            Style::default().fg(Color::Yellow)
+            if focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Gray)
+            }
         } else {
             Style::default()
         };
         Row::new(vec![
-            Cell::from(a.id.clone()),
-            Cell::from(a.status.clone()),
-            Cell::from(a.tool.clone()),
+            Cell::from(truncate_cell(&a.id, id_w.saturating_sub(1) as usize)),
+            Cell::from(truncate_cell(
+                &a.status,
+                status_w.saturating_sub(1) as usize,
+            )),
+            Cell::from(truncate_cell(&a.tool, tool_w.saturating_sub(1) as usize)),
         ])
         .style(style)
     });
@@ -4100,13 +4417,13 @@ fn draw_approvals_pane(
         Table::new(
             approval_rows,
             [
-                Constraint::Length(16),
-                Constraint::Length(10),
-                Constraint::Length(18),
+                Constraint::Length(id_w),
+                Constraint::Length(status_w),
+                Constraint::Length(tool_w),
             ],
         )
         .header(Row::new(vec!["Approval", "Status", "Tool"])),
-        area,
+        layout[1],
     );
 }
 async fn run_agent<P: ModelProvider>(
