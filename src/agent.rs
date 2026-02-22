@@ -156,6 +156,41 @@ pub struct PlanStepConstraint {
     pub intended_tools: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolFailureClass {
+    Schema,
+    Policy,
+    TimeoutTransient,
+    SelectorAmbiguous,
+    NetworkTransient,
+    NonIdempotent,
+    Other,
+}
+
+impl ToolFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Schema => "E_SCHEMA",
+            Self::Policy => "E_POLICY",
+            Self::TimeoutTransient => "E_TIMEOUT_TRANSIENT",
+            Self::SelectorAmbiguous => "E_SELECTOR_AMBIGUOUS",
+            Self::NetworkTransient => "E_NETWORK_TRANSIENT",
+            Self::NonIdempotent => "E_NON_IDEMPOTENT",
+            Self::Other => "E_OTHER",
+        }
+    }
+
+    fn retry_limit(self) -> u32 {
+        match self {
+            Self::Schema => 1,
+            Self::TimeoutTransient => 1,
+            Self::SelectorAmbiguous => 1,
+            Self::NetworkTransient => 1,
+            Self::Policy | Self::NonIdempotent | Self::Other => 0,
+        }
+    }
+}
+
 pub struct Agent<P: ModelProvider> {
     pub provider: P,
     pub model: String,
@@ -1088,52 +1123,53 @@ impl<P: ModelProvider> Agent<P> {
                         );
                         let mut tool_msg = if let Some(err) = &invalid_args_error {
                             make_invalid_args_tool_message(tc, err, self.tool_rt.exec_target_kind)
-                        } else if tc.name.starts_with("mcp.") {
-                            match &self.mcp_registry {
-                                Some(reg) => match reg
-                                    .call_namespaced_tool(tc, self.tool_rt.tool_args_strict)
-                                    .await
-                                {
-                                    Ok(msg) => msg,
-                                    Err(e) => envelope_to_message(to_tool_result_envelope(
-                                        tc,
-                                        "mcp",
-                                        false,
-                                        format!("mcp call failed: {e}"),
-                                        false,
-                                        ToolResultMeta {
-                                            side_effects: tool_side_effects(&tc.name),
-                                            bytes: None,
-                                            exit_code: None,
-                                            stderr_truncated: None,
-                                            stdout_truncated: None,
-                                            source: "mcp".to_string(),
-                                            execution_target: "host".to_string(),
-                                            docker: None,
-                                        },
-                                    )),
-                                },
-                                None => envelope_to_message(to_tool_result_envelope(
-                                    tc,
-                                    "mcp",
-                                    false,
-                                    "mcp registry not available".to_string(),
-                                    false,
-                                    ToolResultMeta {
-                                        side_effects: tool_side_effects(&tc.name),
-                                        bytes: None,
-                                        exit_code: None,
-                                        stderr_truncated: None,
-                                        stdout_truncated: None,
-                                        source: "mcp".to_string(),
-                                        execution_target: "host".to_string(),
-                                        docker: None,
-                                    },
-                                )),
-                            }
                         } else {
-                            execute_tool(&self.tool_rt, tc).await
+                            run_tool_once(&self.tool_rt, tc, self.mcp_registry.as_ref()).await
                         };
+                        let mut tool_retry_count = 0u32;
+                        if invalid_args_error.is_none() {
+                            loop {
+                                let current_content = tool_msg.content.clone().unwrap_or_default();
+                                if !tool_result_has_error(&current_content) {
+                                    break;
+                                }
+                                let class = classify_tool_failure(tc, &current_content, false);
+                                let max_retries = class.retry_limit();
+                                if tool_retry_count >= max_retries {
+                                    self.emit_event(
+                                        &run_id,
+                                        step as u32,
+                                        EventKind::ToolRetry,
+                                        serde_json::json!({
+                                            "tool_call_id": tc.id,
+                                            "name": tc.name,
+                                            "attempt": tool_retry_count,
+                                            "max_retries": max_retries,
+                                            "failure_class": class.as_str(),
+                                            "action": "stop"
+                                        }),
+                                    );
+                                    break;
+                                }
+                                self.emit_event(
+                                    &run_id,
+                                    step as u32,
+                                    EventKind::ToolRetry,
+                                    serde_json::json!({
+                                        "tool_call_id": tc.id,
+                                        "name": tc.name,
+                                        "attempt": tool_retry_count + 1,
+                                        "max_retries": max_retries,
+                                        "failure_class": class.as_str(),
+                                        "action": "retry"
+                                    }),
+                                );
+                                tool_retry_count = tool_retry_count.saturating_add(1);
+                                tool_msg =
+                                    run_tool_once(&self.tool_rt, tc, self.mcp_registry.as_ref())
+                                        .await;
+                            }
+                        }
                         let original_content = tool_msg.content.clone().unwrap_or_default();
                         let mut input_digest = sha256_hex(original_content.as_bytes());
                         let mut output_digest = input_digest.clone();
@@ -1311,6 +1347,15 @@ impl<P: ModelProvider> Agent<P> {
                         }
 
                         let content = tool_msg.content.clone().unwrap_or_default();
+                        let final_failure_class = if tool_result_has_error(&content) {
+                            Some(classify_tool_failure(
+                                tc,
+                                &content,
+                                invalid_args_error.is_some(),
+                            ))
+                        } else {
+                            None
+                        };
                         if matches!(self.taint_toggle, TaintToggle::On) {
                             let spans = compute_taint_spans_for_tool(
                                 tc,
@@ -1386,7 +1431,9 @@ impl<P: ModelProvider> Agent<P> {
                                 "tool_call_id": tc.id,
                                 "name": tc.name,
                                 "ok": !tool_result_has_error(&tool_msg.content.clone().unwrap_or_default()),
-                                "truncated": final_truncated
+                                "truncated": final_truncated,
+                                "retry_count": tool_retry_count,
+                                "failure_class": final_failure_class.map(|c| c.as_str())
                             }),
                         );
                         messages.push(tool_msg);
@@ -1791,6 +1838,116 @@ impl<P: ModelProvider> Agent<P> {
                 &taint_state,
             ),
         }
+    }
+}
+
+async fn run_tool_once(
+    tool_rt: &ToolRuntime,
+    tc: &ToolCall,
+    mcp_registry: Option<&std::sync::Arc<McpRegistry>>,
+) -> Message {
+    if tc.name.starts_with("mcp.") {
+        match mcp_registry {
+            Some(reg) => match reg.call_namespaced_tool(tc, tool_rt.tool_args_strict).await {
+                Ok(msg) => msg,
+                Err(e) => envelope_to_message(to_tool_result_envelope(
+                    tc,
+                    "mcp",
+                    false,
+                    format!("mcp call failed: {e}"),
+                    false,
+                    ToolResultMeta {
+                        side_effects: tool_side_effects(&tc.name),
+                        bytes: None,
+                        exit_code: None,
+                        stderr_truncated: None,
+                        stdout_truncated: None,
+                        source: "mcp".to_string(),
+                        execution_target: "host".to_string(),
+                        docker: None,
+                    },
+                )),
+            },
+            None => envelope_to_message(to_tool_result_envelope(
+                tc,
+                "mcp",
+                false,
+                "mcp registry not available".to_string(),
+                false,
+                ToolResultMeta {
+                    side_effects: tool_side_effects(&tc.name),
+                    bytes: None,
+                    exit_code: None,
+                    stderr_truncated: None,
+                    stdout_truncated: None,
+                    source: "mcp".to_string(),
+                    execution_target: "host".to_string(),
+                    docker: None,
+                },
+            )),
+        }
+    } else {
+        execute_tool(tool_rt, tc).await
+    }
+}
+
+fn classify_tool_failure(
+    tc: &ToolCall,
+    raw_content: &str,
+    invalid_args_error: bool,
+) -> ToolFailureClass {
+    let text = tool_result_text(raw_content).to_ascii_lowercase();
+    if invalid_args_error
+        || text.contains("invalid tool arguments")
+        || text.contains("missing required field")
+        || text.contains("unknown field not allowed")
+        || text.contains("must be a ")
+        || text.contains("has invalid type")
+    {
+        return ToolFailureClass::Schema;
+    }
+    if text.contains("denied") || text.contains("not allowed") || text.contains("approval required")
+    {
+        return ToolFailureClass::Policy;
+    }
+    if text.contains("strict mode violation")
+        || (text.contains("locator") && text.contains("multiple"))
+        || (text.contains("selector") && text.contains("ambiguous"))
+    {
+        return ToolFailureClass::SelectorAmbiguous;
+    }
+    if text.contains("timed out") || text.contains("timeout") || text.contains("stream idle") {
+        return ToolFailureClass::TimeoutTransient;
+    }
+    if text.contains("mcp call failed")
+        || text.contains("connection refused")
+        || text.contains("response channel closed")
+        || text.contains("failed to spawn mcp")
+        || text.contains("temporarily unavailable")
+    {
+        return ToolFailureClass::NetworkTransient;
+    }
+    let side_effects = tool_side_effects(&tc.name);
+    if matches!(
+        side_effects,
+        crate::types::SideEffects::FilesystemWrite
+            | crate::types::SideEffects::ShellExec
+            | crate::types::SideEffects::Browser
+            | crate::types::SideEffects::Network
+    ) {
+        return ToolFailureClass::NonIdempotent;
+    }
+    ToolFailureClass::Other
+}
+
+fn tool_result_text(raw: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => v
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or(raw)
+            .to_string(),
+        Err(_) => raw.to_string(),
     }
 }
 fn tool_result_has_error(content: &str) -> bool {
@@ -2202,6 +2359,41 @@ mod tests {
         assert!(!super::tool_result_has_error(
             &json!({"ok":true}).to_string()
         ));
+    }
+
+    #[test]
+    fn tool_failure_classification_schema_and_network() {
+        let tc_read = crate::types::ToolCall {
+            id: "tc-schema".to_string(),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path":"a.txt"}),
+        };
+        let schema_msg = json!({
+            "schema_version":"openagent.tool_result.v1",
+            "ok":false,
+            "content":"invalid tool arguments: missing required field: path"
+        })
+        .to_string();
+        assert_eq!(
+            super::classify_tool_failure(&tc_read, &schema_msg, false).as_str(),
+            "E_SCHEMA"
+        );
+
+        let tc_mcp = crate::types::ToolCall {
+            id: "tc-net".to_string(),
+            name: "mcp.playwright.browser_snapshot".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let net_msg = json!({
+            "schema_version":"openagent.tool_result.v1",
+            "ok":false,
+            "content":"mcp call failed: connection refused"
+        })
+        .to_string();
+        assert_eq!(
+            super::classify_tool_failure(&tc_mcp, &net_msg, false).as_str(),
+            "E_NETWORK_TRANSIENT"
+        );
     }
 
     struct EventCaptureSink {

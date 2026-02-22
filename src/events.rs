@@ -18,6 +18,7 @@ pub enum EventKind {
     ToolExecTarget,
     ToolExecStart,
     ToolExecEnd,
+    ToolRetry,
     TaintUpdated,
     CompactionPerformed,
     PolicyLoaded,

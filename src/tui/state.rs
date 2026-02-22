@@ -223,6 +223,32 @@ impl UiState {
                     "provider_retry: attempt {attempt}/{max_attempts} kind={kind} backoff_ms={backoff_ms}"
                 ));
             }
+            EventKind::ToolRetry => {
+                let tool = ev
+                    .data
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool");
+                let attempt = ev.data.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
+                let max_retries = ev
+                    .data
+                    .get("max_retries")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let class = ev
+                    .data
+                    .get("failure_class")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("E_OTHER");
+                let action = ev
+                    .data
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("stop");
+                self.push_log(format!(
+                    "tool_retry: {tool} class={class} attempt={attempt}/{max_retries} action={action}"
+                ));
+            }
             EventKind::Error => {
                 let msg = ev
                     .data
