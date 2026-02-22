@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod compaction;
+pub mod diagnostics;
 pub mod eval;
 pub mod events;
 pub mod gate;
