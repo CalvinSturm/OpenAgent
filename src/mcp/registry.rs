@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context};
 use serde_json::json;
@@ -20,6 +21,19 @@ pub struct McpRegistry {
     tool_schema_map: BTreeMap<String, Option<serde_json::Value>>,
     tool_defs: Vec<ToolDef>,
     timeout: Duration,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct McpCallMeta {
+    pub progress_ticks: u32,
+    pub elapsed_ms: u64,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpCallOutcome {
+    pub message: Message,
+    pub meta: McpCallMeta,
 }
 
 impl McpRegistry {
@@ -115,7 +129,7 @@ impl McpRegistry {
         &self,
         tc: &ToolCall,
         strict: ToolArgsStrict,
-    ) -> anyhow::Result<Message> {
+    ) -> anyhow::Result<McpCallOutcome> {
         let (server, tool) = self
             .tool_map
             .get(&tc.name)
@@ -123,15 +137,93 @@ impl McpRegistry {
             .ok_or_else(|| anyhow!("unknown MCP tool '{}'", tc.name))?;
         let schema = self.tool_schema_map.get(&tc.name).and_then(|s| s.as_ref());
         if let Err(e) = validate_schema_args(&tc.arguments, schema, strict) {
-            return Ok(envelope_to_message(to_tool_result_envelope(
+            return Ok(McpCallOutcome {
+                message: envelope_to_message(to_tool_result_envelope(
+                    tc,
+                    "mcp",
+                    false,
+                    format!("invalid tool arguments: {e}"),
+                    false,
+                    ToolResultMeta {
+                        side_effects: tool_side_effects(&tc.name),
+                        bytes: None,
+                        exit_code: None,
+                        stderr_truncated: None,
+                        stdout_truncated: None,
+                        source: "mcp".to_string(),
+                        execution_target: "host".to_string(),
+                        docker: None,
+                    },
+                )),
+                meta: McpCallMeta::default(),
+            });
+        }
+        let client = self
+            .clients
+            .get(&server)
+            .ok_or_else(|| anyhow!("MCP server '{}' not active", server))?;
+
+        let mut meta = McpCallMeta::default();
+        let started = Instant::now();
+        let mut interval = tokio::time::interval(Duration::from_millis(750));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        let call_fut = client.tools_call(&tool, tc.arguments.clone(), self.timeout);
+        tokio::pin!(call_fut);
+        let result = loop {
+            tokio::select! {
+                result = &mut call_fut => break result,
+                _ = interval.tick() => {
+                    meta.progress_ticks = meta.progress_ticks.saturating_add(1);
+                }
+            }
+        };
+        meta.elapsed_ms = started.elapsed().as_millis() as u64;
+
+        let result = match result {
+            Ok(value) => value,
+            Err(e) => {
+                let err = e.to_string();
+                if err.to_ascii_lowercase().contains("timed out") {
+                    meta.cancelled = true;
+                }
+                return Ok(McpCallOutcome {
+                    message: envelope_to_message(to_tool_result_envelope(
+                        tc,
+                        "mcp",
+                        false,
+                        format!("mcp call failed: {err}"),
+                        false,
+                        ToolResultMeta {
+                            side_effects: tool_side_effects(&tc.name),
+                            bytes: None,
+                            exit_code: None,
+                            stderr_truncated: None,
+                            stdout_truncated: None,
+                            source: "mcp".to_string(),
+                            execution_target: "host".to_string(),
+                            docker: None,
+                        },
+                    )),
+                    meta,
+                });
+            }
+        };
+        let result_str = match result {
+            serde_json::Value::String(s) => s,
+            other => serde_json::to_string(&other)
+                .unwrap_or_else(|e| format!("mcp result serialization failed: {e}")),
+        };
+        Ok(McpCallOutcome {
+            message: envelope_to_message(to_tool_result_envelope(
                 tc,
                 "mcp",
-                false,
-                format!("invalid tool arguments: {e}"),
+                true,
+                result_str.clone(),
                 false,
                 ToolResultMeta {
                     side_effects: tool_side_effects(&tc.name),
-                    bytes: None,
+                    bytes: Some(result_str.len() as u64),
                     exit_code: None,
                     stderr_truncated: None,
                     stdout_truncated: None,
@@ -139,37 +231,9 @@ impl McpRegistry {
                     execution_target: "host".to_string(),
                     docker: None,
                 },
-            )));
-        }
-        let client = self
-            .clients
-            .get(&server)
-            .ok_or_else(|| anyhow!("MCP server '{}' not active", server))?;
-        let result = client
-            .tools_call(&tool, tc.arguments.clone(), self.timeout)
-            .await?;
-        let result_str = match result {
-            serde_json::Value::String(s) => s,
-            other => serde_json::to_string(&other)
-                .unwrap_or_else(|e| format!("mcp result serialization failed: {e}")),
-        };
-        Ok(envelope_to_message(to_tool_result_envelope(
-            tc,
-            "mcp",
-            true,
-            result_str.clone(),
-            false,
-            ToolResultMeta {
-                side_effects: tool_side_effects(&tc.name),
-                bytes: Some(result_str.len() as u64),
-                exit_code: None,
-                stderr_truncated: None,
-                stdout_truncated: None,
-                source: "mcp".to_string(),
-                execution_target: "host".to_string(),
-                docker: None,
-            },
-        )))
+            )),
+            meta,
+        })
     }
 }
 

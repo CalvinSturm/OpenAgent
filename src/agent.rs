@@ -2046,7 +2046,38 @@ impl<P: ModelProvider> Agent<P> {
                         let mut tool_msg = if let Some(err) = &invalid_args_error {
                             make_invalid_args_tool_message(tc, err, self.tool_rt.exec_target_kind)
                         } else {
-                            run_tool_once(&self.tool_rt, tc, self.mcp_registry.as_ref()).await
+                            let outcome =
+                                run_tool_once(&self.tool_rt, tc, self.mcp_registry.as_ref()).await;
+                            if let Some(meta) = outcome.mcp_meta {
+                                if meta.progress_ticks > 0 {
+                                    self.emit_event(
+                                        &run_id,
+                                        step as u32,
+                                        EventKind::McpProgress,
+                                        serde_json::json!({
+                                            "tool_call_id": tc.id,
+                                            "name": tc.name,
+                                            "progress_ticks": meta.progress_ticks,
+                                            "elapsed_ms": meta.elapsed_ms,
+                                            "phase": "await_result"
+                                        }),
+                                    );
+                                }
+                                if meta.cancelled {
+                                    self.emit_event(
+                                        &run_id,
+                                        step as u32,
+                                        EventKind::McpCancelled,
+                                        serde_json::json!({
+                                            "tool_call_id": tc.id,
+                                            "name": tc.name,
+                                            "reason": "timeout",
+                                            "elapsed_ms": meta.elapsed_ms
+                                        }),
+                                    );
+                                }
+                            }
+                            outcome.message
                         };
                         let mut tool_retry_count = 0u32;
                         if invalid_args_error.is_none() {
@@ -2187,9 +2218,39 @@ impl<P: ModelProvider> Agent<P> {
                                         ),
                                     };
                                 }
-                                tool_msg =
+                                let outcome =
                                     run_tool_once(&self.tool_rt, tc, self.mcp_registry.as_ref())
                                         .await;
+                                if let Some(meta) = outcome.mcp_meta {
+                                    if meta.progress_ticks > 0 {
+                                        self.emit_event(
+                                            &run_id,
+                                            step as u32,
+                                            EventKind::McpProgress,
+                                            serde_json::json!({
+                                                "tool_call_id": tc.id,
+                                                "name": tc.name,
+                                                "progress_ticks": meta.progress_ticks,
+                                                "elapsed_ms": meta.elapsed_ms,
+                                                "phase": "retry_await_result"
+                                            }),
+                                        );
+                                    }
+                                    if meta.cancelled {
+                                        self.emit_event(
+                                            &run_id,
+                                            step as u32,
+                                            EventKind::McpCancelled,
+                                            serde_json::json!({
+                                                "tool_call_id": tc.id,
+                                                "name": tc.name,
+                                                "reason": "timeout",
+                                                "elapsed_ms": meta.elapsed_ms
+                                            }),
+                                        );
+                                    }
+                                }
+                                tool_msg = outcome.message;
                             }
                         }
                         let original_content = tool_msg.content.clone().unwrap_or_default();
@@ -2860,16 +2921,41 @@ async fn run_tool_once(
     tool_rt: &ToolRuntime,
     tc: &ToolCall,
     mcp_registry: Option<&std::sync::Arc<McpRegistry>>,
-) -> Message {
+) -> ToolRunOutcome {
     if tc.name.starts_with("mcp.") {
         match mcp_registry {
             Some(reg) => match reg.call_namespaced_tool(tc, tool_rt.tool_args_strict).await {
-                Ok(msg) => msg,
-                Err(e) => envelope_to_message(to_tool_result_envelope(
+                Ok(outcome) => ToolRunOutcome {
+                    message: outcome.message,
+                    mcp_meta: Some(outcome.meta),
+                },
+                Err(e) => ToolRunOutcome {
+                    message: envelope_to_message(to_tool_result_envelope(
+                        tc,
+                        "mcp",
+                        false,
+                        format!("mcp call failed: {e}"),
+                        false,
+                        ToolResultMeta {
+                            side_effects: tool_side_effects(&tc.name),
+                            bytes: None,
+                            exit_code: None,
+                            stderr_truncated: None,
+                            stdout_truncated: None,
+                            source: "mcp".to_string(),
+                            execution_target: "host".to_string(),
+                            docker: None,
+                        },
+                    )),
+                    mcp_meta: None,
+                },
+            },
+            None => ToolRunOutcome {
+                message: envelope_to_message(to_tool_result_envelope(
                     tc,
                     "mcp",
                     false,
-                    format!("mcp call failed: {e}"),
+                    "mcp registry not available".to_string(),
                     false,
                     ToolResultMeta {
                         side_effects: tool_side_effects(&tc.name),
@@ -2882,28 +2968,20 @@ async fn run_tool_once(
                         docker: None,
                     },
                 )),
+                mcp_meta: None,
             },
-            None => envelope_to_message(to_tool_result_envelope(
-                tc,
-                "mcp",
-                false,
-                "mcp registry not available".to_string(),
-                false,
-                ToolResultMeta {
-                    side_effects: tool_side_effects(&tc.name),
-                    bytes: None,
-                    exit_code: None,
-                    stderr_truncated: None,
-                    stdout_truncated: None,
-                    source: "mcp".to_string(),
-                    execution_target: "host".to_string(),
-                    docker: None,
-                },
-            )),
         }
     } else {
-        execute_tool(tool_rt, tc).await
+        ToolRunOutcome {
+            message: execute_tool(tool_rt, tc).await,
+            mcp_meta: None,
+        }
     }
+}
+
+struct ToolRunOutcome {
+    message: Message,
+    mcp_meta: Option<crate::mcp::registry::McpCallMeta>,
 }
 
 fn parse_worker_step_status(

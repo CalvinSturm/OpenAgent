@@ -41,6 +41,8 @@ pub enum EventKind {
     ReproSnapshot,
     McpServerStart,
     McpServerStop,
+    McpProgress,
+    McpCancelled,
     McpDrift,
     Error,
 }

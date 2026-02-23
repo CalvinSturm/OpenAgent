@@ -144,6 +144,8 @@ impl McpClient {
             Err(_) => {
                 let mut map = self.pending.lock().await;
                 map.remove(&id);
+                drop(map);
+                self.send_cancel_notification(id, "timeout").await;
                 return Err(anyhow!("MCP call timed out for method '{method}'"));
             }
         };
@@ -152,6 +154,22 @@ impl McpClient {
             return Err(anyhow!("MCP error for method '{}': {}", method, err));
         }
         Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn send_cancel_notification(&self, request_id: u64, reason: &str) {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {
+                "requestId": request_id,
+                "reason": reason
+            }
+        });
+        if let Ok(line) = serde_json::to_string(&payload) {
+            let mut stdin = self.stdin.lock().await;
+            let _ = stdin.write_all(format!("{line}\n").as_bytes()).await;
+            let _ = stdin.flush().await;
+        }
     }
 }
 

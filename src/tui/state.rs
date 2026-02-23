@@ -495,6 +495,51 @@ impl UiState {
                         .unwrap_or("mcp.tool")
                 ));
             }
+            EventKind::McpProgress => {
+                let ticks = ev
+                    .data
+                    .get("progress_ticks")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let elapsed_ms = ev
+                    .data
+                    .get("elapsed_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                self.mcp_lifecycle = "WAIT:TASK".to_string();
+                self.mcp_running_for_ms = elapsed_ms;
+                self.mcp_stalled = false;
+                self.mcp_stall_notice_emitted = false;
+                self.push_log(format!(
+                    "mcp_progress: tool={} ticks={} elapsed_ms={}",
+                    ev.data
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("mcp.tool"),
+                    ticks,
+                    elapsed_ms
+                ));
+            }
+            EventKind::McpCancelled => {
+                let reason = ev
+                    .data
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("cancelled");
+                self.mcp_lifecycle = "CANCELLED".to_string();
+                self.mcp_running_for_ms = 0;
+                self.mcp_stalled = false;
+                self.mcp_stall_notice_emitted = false;
+                self.next_hint = "cancelled".to_string();
+                self.push_log(format!(
+                    "mcp_cancelled: tool={} reason={}",
+                    ev.data
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("mcp.tool"),
+                    reason
+                ));
+            }
             EventKind::Error => {
                 let msg = ev
                     .data
@@ -996,5 +1041,38 @@ mod tests {
             }),
         ));
         assert_eq!(s.mcp_lifecycle, "DRIFT");
+    }
+
+    #[test]
+    fn mcp_progress_event_updates_lifecycle() {
+        let mut s = UiState::new(10);
+        s.apply_event(&Event::new(
+            "r1".to_string(),
+            1,
+            EventKind::McpProgress,
+            serde_json::json!({
+                "name":"mcp.playwright.browser_snapshot",
+                "progress_ticks":2,
+                "elapsed_ms":1500
+            }),
+        ));
+        assert_eq!(s.mcp_lifecycle, "WAIT:TASK");
+        assert_eq!(s.mcp_running_for_ms, 1500);
+    }
+
+    #[test]
+    fn mcp_cancelled_event_sets_cancelled_lifecycle() {
+        let mut s = UiState::new(10);
+        s.apply_event(&Event::new(
+            "r1".to_string(),
+            1,
+            EventKind::McpCancelled,
+            serde_json::json!({
+                "name":"mcp.playwright.browser_snapshot",
+                "reason":"timeout"
+            }),
+        ));
+        assert_eq!(s.mcp_lifecycle, "CANCELLED");
+        assert_eq!(s.next_hint, "cancelled");
     }
 }

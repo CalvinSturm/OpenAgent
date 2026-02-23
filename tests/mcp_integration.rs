@@ -94,7 +94,7 @@ async fn mcp_call_routing_returns_wrapped_result() {
         .call_namespaced_tool(&tc, ToolArgsStrict::On)
         .await
         .expect("call");
-    let content = msg.content.unwrap_or_default();
+    let content = msg.message.content.unwrap_or_default();
     assert!(content.contains("\"schema_version\":\"openagent.tool_result.v1\""));
     assert!(content.contains("\"tool_name\":\"mcp.stub.echo\""));
     assert!(content.contains("\"ok\":true"));
@@ -140,7 +140,7 @@ async fn mcp_schema_validation_blocks_invalid_args_before_call() {
         .call_namespaced_tool(&tc, ToolArgsStrict::On)
         .await
         .expect("result");
-    let content = msg.content.unwrap_or_default();
+    let content = msg.message.content.unwrap_or_default();
     assert!(content.contains("invalid tool arguments"));
     assert!(!call_count.exists());
 }
