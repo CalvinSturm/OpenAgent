@@ -397,17 +397,27 @@ pub fn verify_run_record(record: &RunRecord, strict: bool) -> anyhow::Result<Rep
             .startup_live_catalog_hash_hex
             .clone()
             .unwrap_or_else(|| "unavailable".to_string());
-        let ok = if pin.pinned {
+        let enforcement = if pin.enforcement.is_empty() {
+            record.cli.mcp_pin_enforcement.as_str()
+        } else {
+            pin.enforcement.as_str()
+        };
+        let must_match = matches!(enforcement, "hard");
+        let ok = if must_match {
             !expected.is_empty() && expected == actual
         } else {
             true
         };
         checks.push(ReplayVerifyCheck {
             name: "mcp_pin_snapshot".to_string(),
-            expected: format!("enforcement={} configured={}", pin.enforcement, expected),
+            expected: format!("enforcement={} configured={}", enforcement, expected),
             actual: format!("startup_live={} pinned={}", actual, pin.pinned),
             ok,
-            severity: "warn".to_string(),
+            severity: if must_match {
+                "error".to_string()
+            } else {
+                "warn".to_string()
+            },
             note: pin
                 .mcp_config_hash_hex
                 .as_ref()

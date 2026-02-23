@@ -28,7 +28,10 @@ use std::time::Duration;
 use crate::mcp::registry::{
     doctor_server as mcp_doctor_server, list_servers as mcp_list_servers, McpRegistry,
 };
-use agent::{Agent, AgentExitReason, PlanToolEnforcementMode, PolicyLoadedInfo, ToolCallBudget};
+use agent::{
+    Agent, AgentExitReason, McpPinEnforcementMode, PlanToolEnforcementMode, PolicyLoadedInfo,
+    ToolCallBudget,
+};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand, ValueEnum};
 use compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
@@ -779,6 +782,8 @@ struct RunArgs {
     planner_output: planner::PlannerOutput,
     #[arg(long, value_enum, default_value_t = PlanToolEnforcementMode::Off)]
     enforce_plan_tools: PlanToolEnforcementMode,
+    #[arg(long, value_enum, default_value_t = McpPinEnforcementMode::Hard)]
+    mcp_pin_enforcement: McpPinEnforcementMode,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     planner_strict: bool,
     #[arg(long, default_value_t = false)]
@@ -4915,6 +4920,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
         (None, _) => true,
         _ => false,
     };
+    let mcp_pin_enforcement = format!("{:?}", args.mcp_pin_enforcement).to_lowercase();
     let hooks_config_path = resolved_hooks_config_path(args, &paths.state_dir);
     let tool_schema_hash_hex_map = store::tool_schema_hash_hex_map(&all_tools);
     gate_ctx.tool_schema_hashes = tool_schema_hash_hex_map.clone();
@@ -4987,7 +4993,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
     let mcp_pin_snapshot =
         if mcp_tool_catalog_hash_hex.is_some() || mcp_startup_live_catalog_hash_hex.is_some() {
             Some(store::McpPinSnapshotRecord {
-                enforcement: "hard".to_string(),
+                enforcement: mcp_pin_enforcement.clone(),
                 configured_catalog_hash_hex: mcp_tool_catalog_hash_hex.clone().unwrap_or_default(),
                 startup_live_catalog_hash_hex: mcp_startup_live_catalog_hash_hex.clone(),
                 mcp_config_hash_hex: mcp_config_hash_hex.clone(),
@@ -5002,7 +5008,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
         0,
         EventKind::McpPinned,
         serde_json::json!({
-            "enforcement": "hard",
+            "enforcement": mcp_pin_enforcement,
             "configured_hash_hex": mcp_tool_catalog_hash_hex,
             "startup_live_hash_hex": mcp_startup_live_catalog_hash_hex,
             "mcp_config_hash_hex": mcp_config_hash_hex,
@@ -5385,6 +5391,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
         run_id_override: Some(run_id.clone()),
         omit_tools_field_when_empty: false,
         plan_tool_enforcement: effective_plan_tool_enforcement,
+        mcp_pin_enforcement: args.mcp_pin_enforcement,
         plan_step_constraints,
         tool_call_budget: ToolCallBudget {
             max_wall_time_ms: if args.no_limits {
@@ -6502,6 +6509,7 @@ fn build_run_cli_config(
         planner_output,
         planner_strict,
         enforce_plan_tools: enforce_plan_tools.unwrap_or_else(|| "off".to_string()),
+        mcp_pin_enforcement: format!("{:?}", args.mcp_pin_enforcement).to_lowercase(),
         trust_mode: store::cli_trust_mode(args.trust),
         allow_shell: args.allow_shell,
         allow_write: args.allow_write,
@@ -6618,6 +6626,7 @@ fn build_config_fingerprint(
         planner_output: cli_config.planner_output.clone().unwrap_or_default(),
         planner_strict: cli_config.planner_strict.unwrap_or(false),
         enforce_plan_tools: cli_config.enforce_plan_tools.clone(),
+        mcp_pin_enforcement: cli_config.mcp_pin_enforcement.clone(),
         trust_mode: store::cli_trust_mode(args.trust),
         state_dir: stable_path_string(&paths.state_dir),
         policy_path: stable_path_string(&paths.policy_path),
@@ -7811,6 +7820,7 @@ rules:
             planner_max_steps: 2,
             planner_output: crate::planner::PlannerOutput::Json,
             enforce_plan_tools: crate::agent::PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: crate::agent::McpPinEnforcementMode::Hard,
             planner_strict: true,
             no_planner_strict: false,
         }

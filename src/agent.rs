@@ -180,6 +180,16 @@ pub enum PlanToolEnforcementMode {
     Hard,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum McpPinEnforcementMode {
+    Off,
+    Warn,
+    Hard,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlanStepConstraint {
     pub step_id: String,
@@ -259,6 +269,7 @@ pub struct Agent<P: ModelProvider> {
     pub run_id_override: Option<String>,
     pub omit_tools_field_when_empty: bool,
     pub plan_tool_enforcement: PlanToolEnforcementMode,
+    pub mcp_pin_enforcement: McpPinEnforcementMode,
     pub plan_step_constraints: Vec<PlanStepConstraint>,
     pub tool_call_budget: ToolCallBudget,
     pub mcp_runtime_trace: Vec<McpRuntimeTraceEntry>,
@@ -1698,7 +1709,9 @@ impl<P: ModelProvider> Agent<P> {
                     }),
                 );
                 if tc.name.starts_with("mcp.") {
-                    if let (Some(registry), Some(expected_hash)) = (
+                    if matches!(self.mcp_pin_enforcement, McpPinEnforcementMode::Off) {
+                        // Drift probing disabled by configuration.
+                    } else if let (Some(registry), Some(expected_hash)) = (
                         self.mcp_registry.as_ref(),
                         expected_mcp_catalog_hash_hex.as_ref(),
                     ) {
@@ -1719,23 +1732,84 @@ impl<P: ModelProvider> Agent<P> {
                                         "actual_hash_hex": actual_hash
                                     }),
                                 );
-                                self.emit_event(
-                                    &run_id,
-                                    step as u32,
-                                    EventKind::StepBlocked,
-                                    serde_json::json!({
-                                        "tool_call_id": tc.id,
-                                        "name": tc.name,
-                                        "reason": "mcp_drift"
-                                    }),
-                                );
+                                if matches!(self.mcp_pin_enforcement, McpPinEnforcementMode::Hard) {
+                                    self.emit_event(
+                                        &run_id,
+                                        step as u32,
+                                        EventKind::StepBlocked,
+                                        serde_json::json!({
+                                            "tool_call_id": tc.id,
+                                            "name": tc.name,
+                                            "reason": "mcp_drift"
+                                        }),
+                                    );
+                                    observed_tool_decisions.push(ToolDecisionRecord {
+                                        step: step as u32,
+                                        tool_call_id: tc.id.clone(),
+                                        tool: tc.name.clone(),
+                                        decision: "deny".to_string(),
+                                        reason: Some(reason.clone()),
+                                        source: Some("mcp_drift".to_string()),
+                                        taint_overall: Some(taint_state.overall_str().to_string()),
+                                        taint_enforced: false,
+                                        escalated: false,
+                                        escalation_reason: None,
+                                    });
+                                    self.emit_event(
+                                        &run_id,
+                                        step as u32,
+                                        EventKind::ToolDecision,
+                                        serde_json::json!({
+                                            "tool_call_id": tc.id,
+                                            "name": tc.name,
+                                            "decision": "deny",
+                                            "reason": reason,
+                                            "source": "mcp_drift",
+                                            "side_effects": tool_side_effects(&tc.name)
+                                        }),
+                                    );
+                                    self.emit_event(
+                                        &run_id,
+                                        step as u32,
+                                        EventKind::RunEnd,
+                                        serde_json::json!({"exit_reason":"denied"}),
+                                    );
+                                    return AgentOutcome {
+                                        run_id,
+                                        started_at,
+                                        finished_at: crate::trust::now_rfc3339(),
+                                        exit_reason: AgentExitReason::Denied,
+                                        final_output: reason.clone(),
+                                        error: Some(reason),
+                                        messages,
+                                        tool_calls: observed_tool_calls,
+                                        tool_decisions: observed_tool_decisions,
+                                        compaction_settings: self.compaction_settings.clone(),
+                                        final_prompt_size_chars: request_context_chars,
+                                        compaction_report: last_compaction_report,
+                                        hook_invocations,
+                                        provider_retry_count,
+                                        provider_error_count,
+                                        token_usage: if saw_token_usage {
+                                            Some(total_token_usage.clone())
+                                        } else {
+                                            None
+                                        },
+                                        taint: taint_record_from_state(
+                                            self.taint_toggle,
+                                            self.taint_mode,
+                                            self.taint_digest_bytes,
+                                            &taint_state,
+                                        ),
+                                    };
+                                }
                                 observed_tool_decisions.push(ToolDecisionRecord {
                                     step: step as u32,
                                     tool_call_id: tc.id.clone(),
                                     tool: tc.name.clone(),
-                                    decision: "deny".to_string(),
+                                    decision: "allow".to_string(),
                                     reason: Some(reason.clone()),
-                                    source: Some("mcp_drift".to_string()),
+                                    source: Some("mcp_drift_warn".to_string()),
                                     taint_overall: Some(taint_state.overall_str().to_string()),
                                     taint_enforced: false,
                                     escalated: false,
@@ -1748,46 +1822,12 @@ impl<P: ModelProvider> Agent<P> {
                                     serde_json::json!({
                                         "tool_call_id": tc.id,
                                         "name": tc.name,
-                                        "decision": "deny",
+                                        "decision": "allow",
                                         "reason": reason,
-                                        "source": "mcp_drift",
+                                        "source": "mcp_drift_warn",
                                         "side_effects": tool_side_effects(&tc.name)
                                     }),
                                 );
-                                self.emit_event(
-                                    &run_id,
-                                    step as u32,
-                                    EventKind::RunEnd,
-                                    serde_json::json!({"exit_reason":"denied"}),
-                                );
-                                return AgentOutcome {
-                                    run_id,
-                                    started_at,
-                                    finished_at: crate::trust::now_rfc3339(),
-                                    exit_reason: AgentExitReason::Denied,
-                                    final_output: reason.clone(),
-                                    error: Some(reason),
-                                    messages,
-                                    tool_calls: observed_tool_calls,
-                                    tool_decisions: observed_tool_decisions,
-                                    compaction_settings: self.compaction_settings.clone(),
-                                    final_prompt_size_chars: request_context_chars,
-                                    compaction_report: last_compaction_report,
-                                    hook_invocations,
-                                    provider_retry_count,
-                                    provider_error_count,
-                                    token_usage: if saw_token_usage {
-                                        Some(total_token_usage.clone())
-                                    } else {
-                                        None
-                                    },
-                                    taint: taint_record_from_state(
-                                        self.taint_toggle,
-                                        self.taint_mode,
-                                        self.taint_digest_bytes,
-                                        &taint_state,
-                                    ),
-                                };
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -1805,23 +1845,84 @@ impl<P: ModelProvider> Agent<P> {
                                         "error": e.to_string()
                                     }),
                                 );
-                                self.emit_event(
-                                    &run_id,
-                                    step as u32,
-                                    EventKind::StepBlocked,
-                                    serde_json::json!({
-                                        "tool_call_id": tc.id,
-                                        "name": tc.name,
-                                        "reason": "mcp_drift_probe_failed"
-                                    }),
-                                );
+                                if matches!(self.mcp_pin_enforcement, McpPinEnforcementMode::Hard) {
+                                    self.emit_event(
+                                        &run_id,
+                                        step as u32,
+                                        EventKind::StepBlocked,
+                                        serde_json::json!({
+                                            "tool_call_id": tc.id,
+                                            "name": tc.name,
+                                            "reason": "mcp_drift_probe_failed"
+                                        }),
+                                    );
+                                    observed_tool_decisions.push(ToolDecisionRecord {
+                                        step: step as u32,
+                                        tool_call_id: tc.id.clone(),
+                                        tool: tc.name.clone(),
+                                        decision: "deny".to_string(),
+                                        reason: Some(reason.clone()),
+                                        source: Some("mcp_drift".to_string()),
+                                        taint_overall: Some(taint_state.overall_str().to_string()),
+                                        taint_enforced: false,
+                                        escalated: false,
+                                        escalation_reason: None,
+                                    });
+                                    self.emit_event(
+                                        &run_id,
+                                        step as u32,
+                                        EventKind::ToolDecision,
+                                        serde_json::json!({
+                                            "tool_call_id": tc.id,
+                                            "name": tc.name,
+                                            "decision": "deny",
+                                            "reason": reason,
+                                            "source": "mcp_drift",
+                                            "side_effects": tool_side_effects(&tc.name)
+                                        }),
+                                    );
+                                    self.emit_event(
+                                        &run_id,
+                                        step as u32,
+                                        EventKind::RunEnd,
+                                        serde_json::json!({"exit_reason":"denied"}),
+                                    );
+                                    return AgentOutcome {
+                                        run_id,
+                                        started_at,
+                                        finished_at: crate::trust::now_rfc3339(),
+                                        exit_reason: AgentExitReason::Denied,
+                                        final_output: reason.clone(),
+                                        error: Some(reason),
+                                        messages,
+                                        tool_calls: observed_tool_calls,
+                                        tool_decisions: observed_tool_decisions,
+                                        compaction_settings: self.compaction_settings.clone(),
+                                        final_prompt_size_chars: request_context_chars,
+                                        compaction_report: last_compaction_report,
+                                        hook_invocations,
+                                        provider_retry_count,
+                                        provider_error_count,
+                                        token_usage: if saw_token_usage {
+                                            Some(total_token_usage.clone())
+                                        } else {
+                                            None
+                                        },
+                                        taint: taint_record_from_state(
+                                            self.taint_toggle,
+                                            self.taint_mode,
+                                            self.taint_digest_bytes,
+                                            &taint_state,
+                                        ),
+                                    };
+                                }
                                 observed_tool_decisions.push(ToolDecisionRecord {
                                     step: step as u32,
                                     tool_call_id: tc.id.clone(),
                                     tool: tc.name.clone(),
-                                    decision: "deny".to_string(),
+                                    decision: "allow".to_string(),
                                     reason: Some(reason.clone()),
-                                    source: Some("mcp_drift".to_string()),
+                                    source: Some("mcp_drift_warn".to_string()),
                                     taint_overall: Some(taint_state.overall_str().to_string()),
                                     taint_enforced: false,
                                     escalated: false,
@@ -1834,46 +1935,12 @@ impl<P: ModelProvider> Agent<P> {
                                     serde_json::json!({
                                         "tool_call_id": tc.id,
                                         "name": tc.name,
-                                        "decision": "deny",
+                                        "decision": "allow",
                                         "reason": reason,
-                                        "source": "mcp_drift",
+                                        "source": "mcp_drift_warn",
                                         "side_effects": tool_side_effects(&tc.name)
                                     }),
                                 );
-                                self.emit_event(
-                                    &run_id,
-                                    step as u32,
-                                    EventKind::RunEnd,
-                                    serde_json::json!({"exit_reason":"denied"}),
-                                );
-                                return AgentOutcome {
-                                    run_id,
-                                    started_at,
-                                    finished_at: crate::trust::now_rfc3339(),
-                                    exit_reason: AgentExitReason::Denied,
-                                    final_output: reason.clone(),
-                                    error: Some(reason),
-                                    messages,
-                                    tool_calls: observed_tool_calls,
-                                    tool_decisions: observed_tool_decisions,
-                                    compaction_settings: self.compaction_settings.clone(),
-                                    final_prompt_size_chars: request_context_chars,
-                                    compaction_report: last_compaction_report,
-                                    hook_invocations,
-                                    provider_retry_count,
-                                    provider_error_count,
-                                    token_usage: if saw_token_usage {
-                                        Some(total_token_usage.clone())
-                                    } else {
-                                        None
-                                    },
-                                    taint: taint_record_from_state(
-                                        self.taint_toggle,
-                                        self.taint_mode,
-                                        self.taint_digest_bytes,
-                                        &taint_state,
-                                    ),
-                                };
                             }
                         }
                     }
@@ -3665,7 +3732,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        sanitize_user_visible_output, Agent, AgentExitReason, PlanStepConstraint,
+        sanitize_user_visible_output, Agent, AgentExitReason, McpPinEnforcementMode,
+        PlanStepConstraint,
         PlanToolEnforcementMode, ToolCallBudget,
     };
     use crate::compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
@@ -3797,6 +3865,7 @@ mod tests {
             run_id_override: None,
             omit_tools_field_when_empty: false,
             plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
@@ -3882,6 +3951,7 @@ mod tests {
             run_id_override: None,
             omit_tools_field_when_empty: false,
             plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
@@ -4229,6 +4299,7 @@ mod tests {
             run_id_override: None,
             omit_tools_field_when_empty: false,
             plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
@@ -4324,6 +4395,7 @@ mod tests {
             run_id_override: None,
             omit_tools_field_when_empty: false,
             plan_tool_enforcement: PlanToolEnforcementMode::Hard,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
             plan_step_constraints: vec![PlanStepConstraint {
                 step_id: "S1".to_string(),
                 intended_tools: vec!["list_dir".to_string()],
@@ -4414,6 +4486,7 @@ mod tests {
             run_id_override: None,
             omit_tools_field_when_empty: false,
             plan_tool_enforcement: PlanToolEnforcementMode::Hard,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
             plan_step_constraints: vec![PlanStepConstraint {
                 step_id: "S1".to_string(),
                 intended_tools: vec!["read_file".to_string()],
@@ -4504,6 +4577,7 @@ mod tests {
             run_id_override: None,
             omit_tools_field_when_empty: false,
             plan_tool_enforcement: PlanToolEnforcementMode::Hard,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
             plan_step_constraints: vec![PlanStepConstraint {
                 step_id: "S1".to_string(),
                 intended_tools: vec!["read_file".to_string()],
@@ -4600,6 +4674,7 @@ mod tests {
             run_id_override: None,
             omit_tools_field_when_empty: false,
             plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget {
                 max_total_tool_calls: 1,
@@ -4692,6 +4767,7 @@ mod tests {
             run_id_override: None,
             omit_tools_field_when_empty: false,
             plan_tool_enforcement: PlanToolEnforcementMode::Hard,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
             plan_step_constraints: vec![PlanStepConstraint {
                 step_id: "S1".to_string(),
                 intended_tools: vec!["read_file".to_string()],
@@ -4793,6 +4869,7 @@ mod tests {
             run_id_override: None,
             omit_tools_field_when_empty: false,
             plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
@@ -4892,6 +4969,7 @@ mod tests {
             run_id_override: None,
             omit_tools_field_when_empty: false,
             plan_tool_enforcement: PlanToolEnforcementMode::Hard,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
             plan_step_constraints: vec![
                 PlanStepConstraint {
                     step_id: "S1".to_string(),
