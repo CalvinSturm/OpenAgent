@@ -5276,15 +5276,19 @@ async fn run_agent_with_ui<P: ModelProvider>(
         plan_step_constraints,
     };
 
+    let base_instruction_messages = instruction_resolution.messages.clone();
+    let base_task_memory = task_memory.clone();
+    let initial_injected_messages = merge_injected_messages(
+        base_instruction_messages.clone(),
+        base_task_memory.clone(),
+        planner_injected_message.clone(),
+    );
+
     let mut outcome = tokio::select! {
         out = agent.run(
             prompt,
-            session_messages,
-            merge_injected_messages(
-                instruction_resolution.messages.clone(),
-                task_memory,
-                planner_injected_message,
-            ),
+            session_messages.clone(),
+            initial_injected_messages,
         ) => out,
         _ = tokio::signal::ctrl_c() => {
             agent::AgentOutcome {
@@ -5341,6 +5345,198 @@ async fn run_agent_with_ui<P: ModelProvider>(
             }
         }
     };
+
+    if matches!(args.mode, planner::RunMode::PlannerWorker)
+        && matches!(outcome.exit_reason, AgentExitReason::PlannerError)
+        && outcome
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("worker requested replan transition")
+    {
+        let replanner_reason = outcome
+            .error
+            .clone()
+            .unwrap_or_else(|| "worker requested replan transition".to_string());
+        emit_event(
+            &mut agent.event_sink,
+            &run_id,
+            0,
+            EventKind::PlannerStart,
+            serde_json::json!({
+                "phase": "replan",
+                "reason": replanner_reason
+            }),
+        );
+        let prior_plan_json = planner_record
+            .as_ref()
+            .map(|p| p.plan_json.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let prior_plan_hash = planner_record
+            .as_ref()
+            .map(|p| p.plan_hash_hex.clone())
+            .unwrap_or_default();
+        let prior_plan_text =
+            serde_json::to_string_pretty(&prior_plan_json).unwrap_or_else(|_| "{}".to_string());
+        let replan_prompt = format!(
+            "{prompt}\n\nREPLAN CONTEXT\nPrevious plan hash: {prior_plan_hash}\nPrevious normalized plan:\n{prior_plan_text}\n\nRuntime requested a replan because: {replanner_reason}\nReturn an updated openagent.plan.v1 JSON plan for remaining work only."
+        );
+        match run_planner_phase(
+            &agent.provider,
+            &run_id,
+            &planner_model,
+            &replan_prompt,
+            args.planner_max_steps,
+            args.planner_output,
+            planner_strict_effective,
+            &mut agent.event_sink,
+        )
+        .await
+        {
+            Ok(replan_out) if !planner_strict_effective || replan_out.ok => {
+                emit_event(
+                    &mut agent.event_sink,
+                    &run_id,
+                    0,
+                    EventKind::PlannerEnd,
+                    serde_json::json!({
+                        "phase": "replan",
+                        "ok": replan_out.ok,
+                        "planner_hash_hex": replan_out.plan_hash_hex,
+                        "lineage_parent_plan_hash_hex": prior_plan_hash
+                    }),
+                );
+                let replan_handoff = format!(
+                    "{}\n\n{}",
+                    planner::planner_handoff_content(&replan_out.plan_json)?,
+                    planner::planner_worker_contract_content(&replan_out.plan_json)?
+                );
+                if matches!(
+                    args.enforce_plan_tools,
+                    PlanToolEnforcementMode::Soft | PlanToolEnforcementMode::Hard
+                ) {
+                    if let Ok(steps) = planner::extract_plan_step_tools(&replan_out.plan_json) {
+                        agent.plan_step_constraints = steps
+                            .into_iter()
+                            .map(|s| agent::PlanStepConstraint {
+                                step_id: s.step_id,
+                                intended_tools: s.intended_tools,
+                            })
+                            .collect();
+                    }
+                }
+                planner_record = Some(PlannerRunRecord {
+                    model: planner_model.clone(),
+                    max_steps: args.planner_max_steps,
+                    strict: planner_strict_effective,
+                    output_format: format!("{:?}", args.planner_output).to_lowercase(),
+                    plan_json: replan_out.plan_json.clone(),
+                    plan_hash_hex: replan_out.plan_hash_hex.clone(),
+                    ok: replan_out.ok,
+                    raw_output: replan_out.raw_output,
+                    error: replan_out.error,
+                });
+                agent.gate_ctx.planner_hash_hex = Some(replan_out.plan_hash_hex.clone());
+                if let Some(worker) = worker_record.as_mut() {
+                    worker.injected_planner_hash_hex = Some(replan_out.plan_hash_hex.clone());
+                }
+                emit_event(
+                    &mut agent.event_sink,
+                    &run_id,
+                    0,
+                    EventKind::WorkerStart,
+                    serde_json::json!({
+                        "phase": "replan_resume",
+                        "worker_model": worker_model,
+                        "planner_hash_hex": replan_out.plan_hash_hex
+                    }),
+                );
+                let resume_session_messages = extract_session_messages(&outcome.messages);
+                let replan_injected = merge_injected_messages(
+                    base_instruction_messages.clone(),
+                    base_task_memory.clone(),
+                    Some(Message {
+                        role: Role::Developer,
+                        content: Some(replan_handoff),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    }),
+                );
+                outcome = tokio::select! {
+                    out = agent.run(prompt, resume_session_messages, replan_injected) => out,
+                    _ = tokio::signal::ctrl_c() => {
+                        agent::AgentOutcome {
+                            run_id: uuid::Uuid::new_v4().to_string(),
+                            started_at: trust::now_rfc3339(),
+                            finished_at: trust::now_rfc3339(),
+                            exit_reason: AgentExitReason::Cancelled,
+                            final_output: String::new(),
+                            error: Some("cancelled".to_string()),
+                            messages: Vec::new(),
+                            tool_calls: Vec::new(),
+                            tool_decisions: Vec::new(),
+                            compaction_settings: CompactionSettings {
+                                max_context_chars: resolved_settings.max_context_chars,
+                                mode: resolved_settings.compaction_mode,
+                                keep_last: resolved_settings.compaction_keep_last,
+                                tool_result_persist: resolved_settings.tool_result_persist,
+                            },
+                            final_prompt_size_chars: 0,
+                            compaction_report: None,
+                            hook_invocations: Vec::new(),
+                            provider_retry_count: 0,
+                            provider_error_count: 0,
+                            token_usage: None,
+                            taint: None,
+                        }
+                    },
+                    _ = async {
+                        let _ = cancel_rx.changed().await;
+                    } => {
+                        agent::AgentOutcome {
+                            run_id: uuid::Uuid::new_v4().to_string(),
+                            started_at: trust::now_rfc3339(),
+                            finished_at: trust::now_rfc3339(),
+                            exit_reason: AgentExitReason::Cancelled,
+                            final_output: String::new(),
+                            error: Some("cancelled".to_string()),
+                            messages: Vec::new(),
+                            tool_calls: Vec::new(),
+                            tool_decisions: Vec::new(),
+                            compaction_settings: CompactionSettings {
+                                max_context_chars: resolved_settings.max_context_chars,
+                                mode: resolved_settings.compaction_mode,
+                                keep_last: resolved_settings.compaction_keep_last,
+                                tool_result_persist: resolved_settings.tool_result_persist,
+                            },
+                            final_prompt_size_chars: 0,
+                            compaction_report: None,
+                            hook_invocations: Vec::new(),
+                            provider_retry_count: 0,
+                            provider_error_count: 0,
+                            token_usage: None,
+                            taint: None,
+                        }
+                    }
+                };
+            }
+            Ok(replan_out) => {
+                outcome.exit_reason = AgentExitReason::PlannerError;
+                outcome.error = Some(format!(
+                    "replan failed strict validation: {}",
+                    replan_out
+                        .error
+                        .unwrap_or_else(|| "planner validation failed".to_string())
+                ));
+            }
+            Err(e) => {
+                outcome.exit_reason = AgentExitReason::PlannerError;
+                outcome.error = Some(format!("replan failed: {e}"));
+            }
+        }
+    }
+
     if matches!(outcome.exit_reason, AgentExitReason::Cancelled) {
         if let Some(sink) = &mut agent.event_sink {
             if let Err(e) = sink.emit(Event::new(
