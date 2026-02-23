@@ -43,6 +43,7 @@ pub enum EventKind {
     McpServerStop,
     McpProgress,
     McpCancelled,
+    McpPinned,
     McpDrift,
     Error,
 }

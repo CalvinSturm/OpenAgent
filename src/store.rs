@@ -62,6 +62,8 @@ pub struct RunRecord {
     #[serde(default)]
     pub mcp_runtime_trace: Vec<crate::agent::McpRuntimeTraceEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_pin_snapshot: Option<McpPinSnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub taint: Option<crate::agent::AgentTaintRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repro: Option<crate::repro::RunReproRecord>,
@@ -107,6 +109,17 @@ pub struct ToolCatalogEntry {
 pub struct McpToolSnapshotEntry {
     pub name: String,
     pub parameters: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPinSnapshotRecord {
+    pub enforcement: String,
+    pub configured_catalog_hash_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_live_catalog_hash_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_config_hash_hex: Option<String>,
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,6 +421,7 @@ pub fn write_run_record(
     config_fingerprint: Option<ConfigFingerprintV1>,
     repro: Option<crate::repro::RunReproRecord>,
     mcp_runtime_trace: Vec<crate::agent::McpRuntimeTraceEntry>,
+    mcp_pin_snapshot: Option<McpPinSnapshotRecord>,
 ) -> anyhow::Result<PathBuf> {
     ensure_dir(&paths.runs_dir)?;
     let run_path = paths.runs_dir.join(format!("{}.json", outcome.run_id));
@@ -449,6 +463,7 @@ pub fn write_run_record(
         hook_report: outcome.hook_invocations.clone(),
         tool_catalog,
         mcp_runtime_trace,
+        mcp_pin_snapshot,
         taint: outcome.taint.clone(),
         repro,
         final_output: outcome.final_output.clone(),
@@ -932,6 +947,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .expect("write run");
         let loaded = load_run_record(&paths.state_dir, "run_1").expect("load run");
@@ -1103,6 +1119,7 @@ mod tests {
             hook_report: Vec::new(),
             tool_catalog: Vec::new(),
             mcp_runtime_trace: Vec::new(),
+            mcp_pin_snapshot: None,
             taint: None,
             repro: None,
             final_output: String::new(),

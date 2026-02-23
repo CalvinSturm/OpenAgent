@@ -18,7 +18,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
         .split(frame.area());
 
     let top = Line::from(format!(
-        "MODE:{} AUTH:{} PLAN:{} BUD:T{}/- W{} A{} MCP:{} SCHEMA:{} NET:{} CANCEL:{} run={} step={} provider={} model={} policy={} exit={}",
+        "MODE:{} AUTH:{} PLAN:{} BUD:T{}/- W{} A{} MCP:{} PIN:{} SCHEMA:{} NET:{} CANCEL:{} run={} step={} provider={} model={} policy={} exit={}",
         state.mode_label,
         state.authority_label,
         state.enforce_plan_tools_effective.to_ascii_uppercase(),
@@ -26,6 +26,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
         state.filesystem_write_execs,
         state.pending_approvals.len(),
         state.mcp_status_compact(),
+        state.mcp_pin_state,
         if state.schema_repair_seen { "FIX" } else { "OK" },
         state.net_status,
         state.cancel_lifecycle,
@@ -80,10 +81,11 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
 
     if state.show_details {
         let diag = format!(
-            "effective_plan_enf={}\nauthority={}\ncancel={}\nmcp_lifecycle={}\nmcp_running_for_ms={}\nmcp_stalled={}\nschema_repair={}\nlast_failure_class={}\nlast_retry_count={}\nlast_tool={}\nstep_allowed={}\nusage:r={} w={} sh={} net={} br={}",
+            "effective_plan_enf={}\nauthority={}\ncancel={}\nmcp_pin={}\nmcp_lifecycle={}\nmcp_running_for_ms={}\nmcp_stalled={}\nschema_repair={}\nlast_failure_class={}\nlast_retry_count={}\nlast_tool={}\nstep_allowed={}\nusage:r={} w={} sh={} net={} br={}",
             state.enforce_plan_tools_effective,
             state.authority_label,
             state.cancel_lifecycle,
+            state.mcp_pin_state,
             state.mcp_lifecycle,
             state.mcp_running_for_ms,
             if state.mcp_stalled { "yes" } else { "no" },

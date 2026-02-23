@@ -1420,6 +1420,7 @@ fn write_run_artifact_for_eval(
         Some(fingerprint.clone()),
         None,
         Vec::new(),
+        None,
     )?;
     Ok(())
 }

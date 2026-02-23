@@ -4893,6 +4893,28 @@ async fn run_agent_with_ui<P: ModelProvider>(
     } else {
         Some(store::mcp_tool_snapshot_hash_hex(&mcp_tool_snapshot)?)
     };
+    let mcp_config_hash_hex = if args.mcp.is_empty() {
+        None
+    } else {
+        std::fs::read(&mcp_config_path)
+            .ok()
+            .map(|bytes| store::sha256_hex(&bytes))
+    };
+    let mcp_startup_live_catalog_hash_hex = if let (Some(reg), Some(_expected_hash)) =
+        (mcp_registry.as_ref(), mcp_tool_catalog_hash_hex.as_ref())
+    {
+        reg.live_tool_catalog_hash_hex().await.ok()
+    } else {
+        None
+    };
+    let mcp_snapshot_pinned = match (
+        mcp_tool_catalog_hash_hex.as_ref(),
+        mcp_startup_live_catalog_hash_hex.as_ref(),
+    ) {
+        (Some(expected), Some(actual)) => expected == actual,
+        (None, _) => true,
+        _ => false,
+    };
     let hooks_config_path = resolved_hooks_config_path(args, &paths.state_dir);
     let tool_schema_hash_hex_map = store::tool_schema_hash_hex_map(&all_tools);
     gate_ctx.tool_schema_hashes = tool_schema_hash_hex_map.clone();
@@ -4962,6 +4984,31 @@ async fn run_agent_with_ui<P: ModelProvider>(
     let mut worker_record: Option<WorkerRunRecord> = None;
     let mut planner_injected_message: Option<Message> = None;
     let mut plan_step_constraints: Vec<agent::PlanStepConstraint> = Vec::new();
+    let mcp_pin_snapshot =
+        if mcp_tool_catalog_hash_hex.is_some() || mcp_startup_live_catalog_hash_hex.is_some() {
+            Some(store::McpPinSnapshotRecord {
+                enforcement: "hard".to_string(),
+                configured_catalog_hash_hex: mcp_tool_catalog_hash_hex.clone().unwrap_or_default(),
+                startup_live_catalog_hash_hex: mcp_startup_live_catalog_hash_hex.clone(),
+                mcp_config_hash_hex: mcp_config_hash_hex.clone(),
+                pinned: mcp_snapshot_pinned,
+            })
+        } else {
+            None
+        };
+    emit_event(
+        &mut event_sink,
+        &run_id,
+        0,
+        EventKind::McpPinned,
+        serde_json::json!({
+            "enforcement": "hard",
+            "configured_hash_hex": mcp_tool_catalog_hash_hex,
+            "startup_live_hash_hex": mcp_startup_live_catalog_hash_hex,
+            "mcp_config_hash_hex": mcp_config_hash_hex,
+            "pinned": mcp_snapshot_pinned
+        }),
+    );
 
     if matches!(args.mode, planner::RunMode::PlannerWorker) {
         emit_event(
@@ -5096,6 +5143,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
                         Some(config_fingerprint.clone()),
                         None,
                         Vec::new(),
+                        mcp_pin_snapshot.clone(),
                     ) {
                         Ok(p) => Some(p),
                         Err(write_err) => {
@@ -5273,6 +5321,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
                     Some(config_fingerprint.clone()),
                     None,
                     Vec::new(),
+                    mcp_pin_snapshot.clone(),
                 ) {
                     Ok(p) => Some(p),
                     Err(write_err) => {
@@ -5786,6 +5835,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
         Some(config_fingerprint.clone()),
         repro_record,
         agent.mcp_runtime_trace.clone(),
+        mcp_pin_snapshot,
     ) {
         Ok(p) => Some(p),
         Err(e) => {

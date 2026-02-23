@@ -391,6 +391,29 @@ pub fn verify_run_record(record: &RunRecord, strict: bool) -> anyhow::Result<Rep
         severity: "warn".to_string(),
         note: mcp_live_snapshot_note,
     });
+    if let Some(pin) = &record.mcp_pin_snapshot {
+        let expected = pin.configured_catalog_hash_hex.clone();
+        let actual = pin
+            .startup_live_catalog_hash_hex
+            .clone()
+            .unwrap_or_else(|| "unavailable".to_string());
+        let ok = if pin.pinned {
+            !expected.is_empty() && expected == actual
+        } else {
+            true
+        };
+        checks.push(ReplayVerifyCheck {
+            name: "mcp_pin_snapshot".to_string(),
+            expected: format!("enforcement={} configured={}", pin.enforcement, expected),
+            actual: format!("startup_live={} pinned={}", actual, pin.pinned),
+            ok,
+            severity: "warn".to_string(),
+            note: pin
+                .mcp_config_hash_hex
+                .as_ref()
+                .map(|h| format!("mcp_config_hash={}", h)),
+        });
+    }
 
     let mut schema_ok = true;
     let mut actual_map = BTreeMap::new();

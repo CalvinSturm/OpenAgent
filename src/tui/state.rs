@@ -39,6 +39,7 @@ pub struct UiState {
     pub caps_source: String,
     pub policy_hash: String,
     pub mcp_catalog_hash: String,
+    pub mcp_pin_state: String,
     pub mcp_lifecycle: String,
     pub mcp_running_for_ms: u64,
     pub mcp_stalled: bool,
@@ -80,6 +81,7 @@ impl UiState {
             caps_source: String::new(),
             policy_hash: String::new(),
             mcp_catalog_hash: String::new(),
+            mcp_pin_state: "-".to_string(),
             mcp_lifecycle: "IDLE".to_string(),
             mcp_running_for_ms: 0,
             mcp_stalled: false,
@@ -132,6 +134,7 @@ impl UiState {
                 }
                 self.net_status = "OK".to_string();
                 self.mcp_lifecycle = "IDLE".to_string();
+                self.mcp_pin_state = "-".to_string();
                 self.mcp_running_for_ms = 0;
                 self.mcp_stalled = false;
                 self.mcp_stall_notice_emitted = false;
@@ -483,6 +486,7 @@ impl UiState {
                     .and_then(|v| v.as_str())
                     .unwrap_or("-");
                 self.mcp_lifecycle = "DRIFT".to_string();
+                self.mcp_pin_state = "DRIFT".to_string();
                 self.mcp_stalled = false;
                 self.mcp_running_for_ms = 0;
                 self.push_log(format!(
@@ -538,6 +542,28 @@ impl UiState {
                         .and_then(|v| v.as_str())
                         .unwrap_or("mcp.tool"),
                     reason
+                ));
+            }
+            EventKind::McpPinned => {
+                let pinned = ev
+                    .data
+                    .get("pinned")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.mcp_pin_state = if pinned { "PINNED" } else { "UNPINNED" }.to_string();
+                self.push_log(format!(
+                    "mcp_pinned: configured={} startup_live={} pinned={}",
+                    ev.data
+                        .get("configured_hash_hex")
+                        .and_then(|v| v.as_str())
+                        .map(|s| truncate_chars(s, 12))
+                        .unwrap_or_else(|| "-".to_string()),
+                    ev.data
+                        .get("startup_live_hash_hex")
+                        .and_then(|v| v.as_str())
+                        .map(|s| truncate_chars(s, 12))
+                        .unwrap_or_else(|| "-".to_string()),
+                    pinned
                 ));
             }
             EventKind::Error => {
@@ -1041,6 +1067,22 @@ mod tests {
             }),
         ));
         assert_eq!(s.mcp_lifecycle, "DRIFT");
+    }
+
+    #[test]
+    fn mcp_pinned_event_sets_pin_state() {
+        let mut s = UiState::new(10);
+        s.apply_event(&Event::new(
+            "r".to_string(),
+            1,
+            EventKind::McpPinned,
+            serde_json::json!({
+                "configured_hash_hex":"abc",
+                "startup_live_hash_hex":"abc",
+                "pinned":true
+            }),
+        ));
+        assert_eq!(s.mcp_pin_state, "PINNED");
     }
 
     #[test]

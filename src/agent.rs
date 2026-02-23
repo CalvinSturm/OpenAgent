@@ -454,6 +454,7 @@ impl<P: ModelProvider> Agent<P> {
             }
             EventKind::McpProgress => push("wait_task"),
             EventKind::McpCancelled => push("cancelled"),
+            EventKind::McpPinned => push("pinned"),
             EventKind::McpDrift => push("drift"),
             _ => {}
         }
