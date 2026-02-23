@@ -80,10 +80,13 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
 
     if state.show_details {
         let diag = format!(
-            "effective_plan_enf={}\nauthority={}\ncancel={}\nschema_repair={}\nlast_failure_class={}\nlast_retry_count={}\nlast_tool={}\nstep_allowed={}\nusage:r={} w={} sh={} net={} br={}",
+            "effective_plan_enf={}\nauthority={}\ncancel={}\nmcp_lifecycle={}\nmcp_running_for_ms={}\nmcp_stalled={}\nschema_repair={}\nlast_failure_class={}\nlast_retry_count={}\nlast_tool={}\nstep_allowed={}\nusage:r={} w={} sh={} net={} br={}",
             state.enforce_plan_tools_effective,
             state.authority_label,
             state.cancel_lifecycle,
+            state.mcp_lifecycle,
+            state.mcp_running_for_ms,
+            if state.mcp_stalled { "yes" } else { "no" },
             if state.schema_repair_seen {
                 "on"
             } else {

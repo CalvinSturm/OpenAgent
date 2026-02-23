@@ -78,6 +78,7 @@ pub fn run_live(
         while let Ok(ev) = rx.try_recv() {
             state.apply_event(&ev);
         }
+        state.on_tick(Instant::now());
         if last_refresh.elapsed() >= Duration::from_millis(400) {
             if let Err(e) = state.refresh_approvals(&approvals_path) {
                 state.push_log(format!("approvals refresh failed: {e}"));

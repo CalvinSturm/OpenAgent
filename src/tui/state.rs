@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::events::{Event, EventKind};
 use crate::trust::approvals::{ApprovalsStore, StoredStatus};
@@ -13,6 +14,8 @@ pub struct ToolRow {
     pub reason_token: String,
     pub decision_reason: Option<String>,
     pub status: String,
+    pub running_since: Option<Instant>,
+    pub running_for_ms: u64,
     pub ok: Option<bool>,
     pub short_result: String,
 }
@@ -37,6 +40,9 @@ pub struct UiState {
     pub policy_hash: String,
     pub mcp_catalog_hash: String,
     pub mcp_lifecycle: String,
+    pub mcp_running_for_ms: u64,
+    pub mcp_stalled: bool,
+    mcp_stall_notice_emitted: bool,
     pub cancel_lifecycle: String,
     pub net_status: String,
     pub assistant_text: String,
@@ -75,6 +81,9 @@ impl UiState {
             policy_hash: String::new(),
             mcp_catalog_hash: String::new(),
             mcp_lifecycle: "IDLE".to_string(),
+            mcp_running_for_ms: 0,
+            mcp_stalled: false,
+            mcp_stall_notice_emitted: false,
             cancel_lifecycle: "NONE".to_string(),
             net_status: "OK".to_string(),
             assistant_text: String::new(),
@@ -123,6 +132,9 @@ impl UiState {
                 }
                 self.net_status = "OK".to_string();
                 self.mcp_lifecycle = "IDLE".to_string();
+                self.mcp_running_for_ms = 0;
+                self.mcp_stalled = false;
+                self.mcp_stall_notice_emitted = false;
                 self.cancel_lifecycle = "NONE".to_string();
             }
             EventKind::RunEnd => {
@@ -138,20 +150,25 @@ impl UiState {
                     self.cancel_lifecycle = "COMPLETE".to_string();
                 }
                 if exit_reason.as_deref() == Some("cancelled") {
-                    if self
-                        .tool_calls
-                        .iter()
-                        .any(|t| is_mcp_tool(&t.tool_name) && t.status == "running")
-                    {
+                    if self.tool_calls.iter().any(|t| {
+                        is_mcp_tool(&t.tool_name) && (t.status == "running" || t.status == "STALL")
+                    }) {
                         self.mcp_lifecycle = "CANCELLED".to_string();
                     }
                     for row in &mut self.tool_calls {
-                        if is_mcp_tool(&row.tool_name) && row.status == "running" {
+                        if is_mcp_tool(&row.tool_name)
+                            && (row.status == "running" || row.status == "STALL")
+                        {
                             row.status = "CANCEL:user".to_string();
                             row.reason_token = "user".to_string();
+                            row.running_since = None;
+                            row.running_for_ms = 0;
                             row.ok = Some(false);
                         }
                     }
+                    self.mcp_running_for_ms = 0;
+                    self.mcp_stalled = false;
+                    self.mcp_stall_notice_emitted = false;
                 }
                 self.next_hint = "done".to_string();
             }
@@ -289,6 +306,9 @@ impl UiState {
                         .unwrap_or_default(),
                 ) {
                     self.mcp_lifecycle = "RUNNING".to_string();
+                    self.mcp_running_for_ms = 0;
+                    self.mcp_stalled = false;
+                    self.mcp_stall_notice_emitted = false;
                 }
             }
             EventKind::ToolExecEnd => {
@@ -319,6 +339,8 @@ impl UiState {
                     let row = self.upsert_tool(id, name, String::new(), "done");
                     row.ok = ok;
                     row.short_result = truncate_chars(result, 200);
+                    row.running_since = None;
+                    row.running_for_ms = 0;
                     if matches!(ok, Some(false)) {
                         row.status = format!("FAIL:{}", class_to_reason_token(failure_class));
                         row.reason_token = class_to_reason_token(failure_class).to_string();
@@ -335,6 +357,9 @@ impl UiState {
                             .unwrap_or_default(),
                     ) {
                         self.mcp_lifecycle = "DONE".to_string();
+                        self.mcp_running_for_ms = 0;
+                        self.mcp_stalled = false;
+                        self.mcp_stall_notice_emitted = false;
                     }
                 } else if is_mcp_tool(
                     ev.data
@@ -343,6 +368,9 @@ impl UiState {
                         .unwrap_or_default(),
                 ) {
                     self.mcp_lifecycle = "FAIL".to_string();
+                    self.mcp_running_for_ms = 0;
+                    self.mcp_stalled = false;
+                    self.mcp_stall_notice_emitted = false;
                 }
                 self.last_tool_retry_count = ev
                     .data
@@ -529,6 +557,10 @@ impl UiState {
         {
             let row = &mut self.tool_calls[idx];
             row.status = status.to_string();
+            if status == "running" && row.running_since.is_none() {
+                row.running_since = Some(Instant::now());
+                row.running_for_ms = 0;
+            }
             if !tool_name.is_empty() {
                 row.tool_name = tool_name;
             }
@@ -546,6 +578,12 @@ impl UiState {
             reason_token: "-".to_string(),
             decision_reason: None,
             status: status.to_string(),
+            running_since: if status == "running" {
+                Some(Instant::now())
+            } else {
+                None
+            },
+            running_for_ms: 0,
             ok: None,
             short_result: String::new(),
         });
@@ -643,6 +681,13 @@ impl UiState {
     pub fn mcp_status_compact(&self) -> String {
         if self.mcp_catalog_hash.is_empty() {
             "-".to_string()
+        } else if self.mcp_running_for_ms > 0 {
+            format!(
+                "{}:{}:{}s",
+                self.mcp_hash_short(),
+                self.mcp_lifecycle,
+                self.mcp_running_for_ms / 1000
+            )
         } else {
             format!("{}:{}", self.mcp_hash_short(), self.mcp_lifecycle)
         }
@@ -660,6 +705,52 @@ impl UiState {
     pub fn cancel_requested(&self) -> bool {
         self.cancel_lifecycle == "REQUESTED"
     }
+
+    pub fn on_tick(&mut self, now: Instant) {
+        const MCP_STALL_THRESHOLD: Duration = Duration::from_secs(10);
+        let mut has_mcp_running = false;
+        let mut max_mcp_elapsed_ms = 0u64;
+        let mut stall_notice: Option<String> = None;
+        for row in &mut self.tool_calls {
+            if row.status != "running" && row.status != "STALL" {
+                continue;
+            }
+            let Some(since) = row.running_since else {
+                continue;
+            };
+            let elapsed = now.duration_since(since);
+            row.running_for_ms = elapsed.as_millis() as u64;
+            if is_mcp_tool(&row.tool_name) {
+                has_mcp_running = true;
+                max_mcp_elapsed_ms = max_mcp_elapsed_ms.max(row.running_for_ms);
+                if elapsed >= MCP_STALL_THRESHOLD {
+                    row.status = "STALL".to_string();
+                    row.reason_token = "net".to_string();
+                    if !self.mcp_stall_notice_emitted {
+                        stall_notice = Some(format!(
+                            "mcp_stall: tool={} running_for={}s",
+                            row.tool_name,
+                            row.running_for_ms / 1000
+                        ));
+                        self.mcp_stall_notice_emitted = true;
+                    }
+                }
+            }
+        }
+        if let Some(line) = stall_notice {
+            self.push_log(line);
+        }
+        if has_mcp_running {
+            self.mcp_running_for_ms = max_mcp_elapsed_ms;
+            if max_mcp_elapsed_ms >= MCP_STALL_THRESHOLD.as_millis() as u64 {
+                self.mcp_lifecycle = "STALL".to_string();
+                self.mcp_stalled = true;
+            } else {
+                self.mcp_lifecycle = "RUNNING".to_string();
+                self.mcp_stalled = false;
+            }
+        }
+    }
 }
 
 fn is_mcp_tool(name: &str) -> bool {
@@ -675,6 +766,8 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use tempfile::tempdir;
 
     use crate::events::{Event, EventKind};
@@ -845,5 +938,23 @@ mod tests {
             serde_json::json!({"exit_reason":"ok"}),
         ));
         assert_eq!(s.cancel_lifecycle, "COMPLETE");
+    }
+
+    #[test]
+    fn on_tick_marks_long_running_mcp_as_stalled() {
+        let mut s = UiState::new(10);
+        s.mcp_catalog_hash = "abcdef123456".to_string();
+        s.apply_event(&Event::new(
+            "r1".to_string(),
+            1,
+            EventKind::ToolExecStart,
+            serde_json::json!({"tool_call_id":"tc1","name":"mcp.playwright.browser_snapshot","side_effects":"browser"}),
+        ));
+        s.tool_calls[0].running_since = Some(Instant::now() - Duration::from_secs(12));
+        s.on_tick(Instant::now());
+        assert_eq!(s.mcp_lifecycle, "STALL");
+        assert!(s.mcp_stalled);
+        assert!(s.mcp_running_for_ms >= 12_000);
+        assert_eq!(s.tool_calls[0].status, "STALL");
     }
 }
