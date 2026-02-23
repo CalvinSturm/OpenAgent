@@ -414,7 +414,28 @@ impl<P: ModelProvider> Agent<P> {
         let mut schema_repair_attempts: std::collections::BTreeMap<String, u32> =
             std::collections::BTreeMap::new();
         let mut tool_budget_usage = ToolCallBudgetUsage::default();
+        let mut announced_plan_step_id: Option<String> = None;
         'agent_steps: for step in 0..self.max_steps {
+            if !matches!(self.plan_tool_enforcement, PlanToolEnforcementMode::Off)
+                && !self.plan_step_constraints.is_empty()
+                && active_plan_step_idx < self.plan_step_constraints.len()
+            {
+                let step_constraint = self.plan_step_constraints[active_plan_step_idx].clone();
+                if announced_plan_step_id.as_deref() != Some(step_constraint.step_id.as_str()) {
+                    self.emit_event(
+                        &run_id,
+                        step as u32,
+                        EventKind::StepStarted,
+                        serde_json::json!({
+                            "step_id": step_constraint.step_id,
+                            "step_index": active_plan_step_idx,
+                            "allowed_tools": step_constraint.intended_tools,
+                            "enforcement_mode": format!("{:?}", self.plan_tool_enforcement).to_lowercase()
+                        }),
+                    );
+                    announced_plan_step_id = Some(step_constraint.step_id.clone());
+                }
+            }
             let compacted = match maybe_compact(&messages, &self.compaction_settings) {
                 Ok(c) => c,
                 Err(e) => {
@@ -951,6 +972,16 @@ impl<P: ModelProvider> Agent<P> {
                             self.emit_event(
                                 &run_id,
                                 step as u32,
+                                EventKind::StepBlocked,
+                                serde_json::json!({
+                                    "step_id": step_status.step_id,
+                                    "expected_step_id": current_step_id,
+                                    "reason": "invalid_done_transition"
+                                }),
+                            );
+                            self.emit_event(
+                                &run_id,
+                                step as u32,
                                 EventKind::RunEnd,
                                 serde_json::json!({"exit_reason":"planner_error"}),
                             );
@@ -986,6 +1017,16 @@ impl<P: ModelProvider> Agent<P> {
                                 ),
                             };
                         }
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::StepVerified,
+                            serde_json::json!({
+                                "step_id": step_status.step_id,
+                                "next_step_id": step_status.next_step_id,
+                                "status": step_status.status
+                            }),
+                        );
                         blocked_halt_count = 0;
                         step_retry_counts.remove(&current_step_id);
                         if let Some(next) = &step_status.next_step_id {
@@ -998,6 +1039,16 @@ impl<P: ModelProvider> Agent<P> {
                             {
                                 active_plan_step_idx = next_idx;
                             } else {
+                                self.emit_event(
+                                    &run_id,
+                                    step as u32,
+                                    EventKind::StepBlocked,
+                                    serde_json::json!({
+                                        "step_id": step_status.step_id,
+                                        "next_step_id": next,
+                                        "reason": "invalid_next_step_id"
+                                    }),
+                                );
                                 self.emit_event(
                                     &run_id,
                                     step as u32,
@@ -1041,11 +1092,70 @@ impl<P: ModelProvider> Agent<P> {
                         }
                     }
                     "retry" => {
+                        if step_status.step_id != current_step_id {
+                            self.emit_event(
+                                &run_id,
+                                step as u32,
+                                EventKind::StepBlocked,
+                                serde_json::json!({
+                                    "step_id": step_status.step_id,
+                                    "expected_step_id": current_step_id,
+                                    "reason": "invalid_retry_transition"
+                                }),
+                            );
+                            self.emit_event(
+                                &run_id,
+                                step as u32,
+                                EventKind::RunEnd,
+                                serde_json::json!({"exit_reason":"planner_error"}),
+                            );
+                            return AgentOutcome {
+                                run_id,
+                                started_at,
+                                finished_at: crate::trust::now_rfc3339(),
+                                exit_reason: AgentExitReason::PlannerError,
+                                final_output: String::new(),
+                                error: Some(format!(
+                                    "invalid retry transition: got retry for {}, expected {}",
+                                    step_status.step_id, current_step_id
+                                )),
+                                messages,
+                                tool_calls: observed_tool_calls,
+                                tool_decisions: observed_tool_decisions,
+                                compaction_settings: self.compaction_settings.clone(),
+                                final_prompt_size_chars: request_context_chars,
+                                compaction_report: last_compaction_report,
+                                hook_invocations,
+                                provider_retry_count,
+                                provider_error_count,
+                                token_usage: if saw_token_usage {
+                                    Some(total_token_usage.clone())
+                                } else {
+                                    None
+                                },
+                                taint: taint_record_from_state(
+                                    self.taint_toggle,
+                                    self.taint_mode,
+                                    self.taint_digest_bytes,
+                                    &taint_state,
+                                ),
+                            };
+                        }
                         let entry = step_retry_counts
                             .entry(step_status.step_id.clone())
                             .or_insert(0);
                         *entry = entry.saturating_add(1);
                         if *entry > 2 {
+                            self.emit_event(
+                                &run_id,
+                                step as u32,
+                                EventKind::StepBlocked,
+                                serde_json::json!({
+                                    "step_id": step_status.step_id,
+                                    "reason": "retry_limit_exceeded",
+                                    "retry_count": *entry
+                                }),
+                            );
                             self.emit_event(
                                 &run_id,
                                 step as u32,
@@ -1085,7 +1195,64 @@ impl<P: ModelProvider> Agent<P> {
                             };
                         }
                     }
-                    "replan" | "fail" => {
+                    "replan" => {
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::StepReplanned,
+                            serde_json::json!({
+                                "step_id": step_status.step_id,
+                                "status": step_status.status
+                            }),
+                        );
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::RunEnd,
+                            serde_json::json!({"exit_reason":"planner_error"}),
+                        );
+                        return AgentOutcome {
+                            run_id,
+                            started_at,
+                            finished_at: crate::trust::now_rfc3339(),
+                            exit_reason: AgentExitReason::PlannerError,
+                            final_output: String::new(),
+                            error: Some(format!(
+                                "worker requested {} transition for step {}",
+                                step_status.status, step_status.step_id
+                            )),
+                            messages,
+                            tool_calls: observed_tool_calls,
+                            tool_decisions: observed_tool_decisions,
+                            compaction_settings: self.compaction_settings.clone(),
+                            final_prompt_size_chars: request_context_chars,
+                            compaction_report: last_compaction_report,
+                            hook_invocations,
+                            provider_retry_count,
+                            provider_error_count,
+                            token_usage: if saw_token_usage {
+                                Some(total_token_usage.clone())
+                            } else {
+                                None
+                            },
+                            taint: taint_record_from_state(
+                                self.taint_toggle,
+                                self.taint_mode,
+                                self.taint_digest_bytes,
+                                &taint_state,
+                            ),
+                        };
+                    }
+                    "fail" => {
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::StepBlocked,
+                            serde_json::json!({
+                                "step_id": step_status.step_id,
+                                "reason": "worker_fail_transition"
+                            }),
+                        );
                         self.emit_event(
                             &run_id,
                             step as u32,
@@ -1154,6 +1321,16 @@ impl<P: ModelProvider> Agent<P> {
                         serde_json::json!({
                             "error": reason,
                             "source": "plan_halt_guard",
+                            "blocked_halt_count": blocked_halt_count
+                        }),
+                    );
+                    self.emit_event(
+                        &run_id,
+                        step as u32,
+                        EventKind::StepBlocked,
+                        serde_json::json!({
+                            "step_id": step_constraint.step_id,
+                            "reason": "premature_finalization_blocked",
                             "blocked_halt_count": blocked_halt_count
                         }),
                     );
@@ -1260,6 +1437,18 @@ impl<P: ModelProvider> Agent<P> {
                         "tool_args_strict": if self.tool_rt.tool_args_strict.is_enabled() { "on" } else { "off" }
                     }),
                 );
+                let plan_constraint = self
+                    .plan_step_constraints
+                    .get(active_plan_step_idx)
+                    .cloned();
+                let plan_allowed_tools = plan_constraint
+                    .as_ref()
+                    .map(|c| c.intended_tools.clone())
+                    .unwrap_or_default();
+                let plan_tool_allowed =
+                    matches!(self.plan_tool_enforcement, PlanToolEnforcementMode::Off)
+                        || plan_allowed_tools.is_empty()
+                        || plan_allowed_tools.iter().any(|t| t == &tc.name);
                 let invalid_args_error = if tc.name.starts_with("mcp.") {
                     self.mcp_registry.as_ref().and_then(|reg| {
                         reg.validate_namespaced_tool_args(tc, self.tool_rt.tool_args_strict)
@@ -1279,7 +1468,7 @@ impl<P: ModelProvider> Agent<P> {
                         .entry(repair_key)
                         .and_modify(|n| *n = n.saturating_add(1))
                         .or_insert(1);
-                    if *attempts <= 1 {
+                    if *attempts <= 1 && plan_tool_allowed {
                         self.emit_event(
                             &run_id,
                             step as u32,
@@ -1336,18 +1525,6 @@ impl<P: ModelProvider> Agent<P> {
                 let tool_schema_hash_hex = self.gate_ctx.tool_schema_hashes.get(&tc.name).cloned();
                 let hooks_config_hash_hex = self.gate_ctx.hooks_config_hash_hex.clone();
                 let planner_hash_hex = self.gate_ctx.planner_hash_hex.clone();
-                let plan_constraint = self
-                    .plan_step_constraints
-                    .get(active_plan_step_idx)
-                    .cloned();
-                let plan_allowed_tools = plan_constraint
-                    .as_ref()
-                    .map(|c| c.intended_tools.clone())
-                    .unwrap_or_default();
-                let plan_tool_allowed =
-                    matches!(self.plan_tool_enforcement, PlanToolEnforcementMode::Off)
-                        || plan_allowed_tools.is_empty()
-                        || plan_allowed_tools.iter().any(|t| t == &tc.name);
                 self.gate_ctx.taint_enabled = matches!(self.taint_toggle, TaintToggle::On);
                 self.gate_ctx.taint_mode = self.taint_mode;
                 self.gate_ctx.taint_overall = taint_state.overall;
@@ -1373,6 +1550,17 @@ impl<P: ModelProvider> Agent<P> {
                         } else {
                             plan_allowed_tools.join(", ")
                         }
+                    );
+                    self.emit_event(
+                        &run_id,
+                        step as u32,
+                        EventKind::StepBlocked,
+                        serde_json::json!({
+                            "step_id": step_id.clone(),
+                            "tool": tc.name,
+                            "reason": "tool_not_allowed_by_plan",
+                            "allowed_tools": plan_allowed_tools.clone()
+                        }),
                     );
                     self.emit_event(
                         &run_id,
@@ -3597,6 +3785,100 @@ mod tests {
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert!(matches!(out.exit_reason, AgentExitReason::PlannerError));
         assert!(out.error.as_deref().unwrap_or_default().contains("halt"));
+    }
+
+    #[tokio::test]
+    async fn emits_step_lifecycle_events_for_pending_plan_halt() {
+        let events = Arc::new(Mutex::new(Vec::<crate::events::Event>::new()));
+        let mut agent = Agent {
+            provider: NoToolProvider,
+            model: "m".to_string(),
+            tools: vec![crate::types::ToolDef {
+                name: "read_file".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+                side_effects: crate::types::SideEffects::FilesystemRead,
+            }],
+            max_steps: 2,
+            tool_rt: ToolRuntime {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_shell_in_workdir_only: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: Some("plan123".to_string()),
+                taint_enabled: false,
+                taint_mode: crate::taint::TaintMode::Propagate,
+                taint_overall: crate::taint::TaintLevel::Clean,
+                taint_sources: Vec::new(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: Some(Box::new(EventCaptureSink {
+                events: events.clone(),
+            })),
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            policy_for_taint: None,
+            taint_toggle: crate::taint::TaintToggle::Off,
+            taint_mode: crate::taint::TaintMode::Propagate,
+            taint_digest_bytes: 4096,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Hard,
+            plan_step_constraints: vec![PlanStepConstraint {
+                step_id: "S1".to_string(),
+                intended_tools: vec!["read_file".to_string()],
+            }],
+            tool_call_budget: ToolCallBudget::default(),
+        };
+        let out = agent.run("hi", vec![], Vec::new()).await;
+        assert!(matches!(out.exit_reason, AgentExitReason::PlannerError));
+        let evs = events.lock().expect("lock");
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e.kind, crate::events::EventKind::StepStarted)));
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e.kind, crate::events::EventKind::StepBlocked)));
     }
 
     #[tokio::test]
