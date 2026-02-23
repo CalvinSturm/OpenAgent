@@ -175,6 +175,7 @@ struct WorkerStepStatus {
     step_id: String,
     status: String,
     next_step_id: Option<String>,
+    user_output: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,6 +432,8 @@ impl<P: ModelProvider> Agent<P> {
         let mut taint_state = TaintState::new();
         let mut active_plan_step_idx: usize = 0;
         let mut blocked_halt_count: u32 = 0;
+        let mut blocked_control_envelope_count: u32 = 0;
+        let mut last_user_output: Option<String> = None;
         let mut step_retry_counts: std::collections::BTreeMap<String, u32> =
             std::collections::BTreeMap::new();
         let mut schema_repair_attempts: std::collections::BTreeMap<String, u32> =
@@ -1042,7 +1045,80 @@ impl<P: ModelProvider> Agent<P> {
                 } else {
                     None
                 };
+            if !matches!(self.plan_tool_enforcement, PlanToolEnforcementMode::Off)
+                && !self.plan_step_constraints.is_empty()
+                && worker_step_status.is_none()
+                && resp.tool_calls.is_empty()
+            {
+                blocked_control_envelope_count = blocked_control_envelope_count.saturating_add(1);
+                self.emit_event(
+                    &run_id,
+                    step as u32,
+                    EventKind::StepBlocked,
+                    serde_json::json!({
+                        "reason": "invalid_control_envelope",
+                        "required_schema_version": crate::planner::STEP_RESULT_SCHEMA_VERSION,
+                        "blocked_count": blocked_control_envelope_count
+                    }),
+                );
+                if blocked_control_envelope_count >= 2 {
+                    self.emit_event(
+                        &run_id,
+                        step as u32,
+                        EventKind::RunEnd,
+                        serde_json::json!({"exit_reason":"planner_error"}),
+                    );
+                    return AgentOutcome {
+                        run_id,
+                        started_at,
+                        finished_at: crate::trust::now_rfc3339(),
+                        exit_reason: AgentExitReason::PlannerError,
+                        final_output: String::new(),
+                        error: Some(
+                            "worker response missing control envelope for planner-enforced mode"
+                                .to_string(),
+                        ),
+                        messages,
+                        tool_calls: observed_tool_calls,
+                        tool_decisions: observed_tool_decisions,
+                        compaction_settings: self.compaction_settings.clone(),
+                        final_prompt_size_chars: request_context_chars,
+                        compaction_report: last_compaction_report,
+                        hook_invocations,
+                        provider_retry_count,
+                        provider_error_count,
+                        token_usage: if saw_token_usage {
+                            Some(total_token_usage.clone())
+                        } else {
+                            None
+                        },
+                        taint: taint_record_from_state(
+                            self.taint_toggle,
+                            self.taint_mode,
+                            self.taint_digest_bytes,
+                            &taint_state,
+                        ),
+                    };
+                }
+                messages.push(Message {
+                    role: Role::Developer,
+                    content: Some(format!(
+                        "Return control JSON only using schema_version '{}'. Include step_id, status, and optional user_output for final response.",
+                        crate::planner::STEP_RESULT_SCHEMA_VERSION
+                    )),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                });
+                continue;
+            }
             if let Some(step_status) = worker_step_status.as_ref() {
+                blocked_control_envelope_count = 0;
+                if let Some(user_output) = step_status.user_output.as_ref() {
+                    if !user_output.trim().is_empty() {
+                        last_user_output = Some(user_output.trim().to_string());
+                    }
+                }
                 let current_step_id = self
                     .plan_step_constraints
                     .get(active_plan_step_idx)
@@ -1480,7 +1556,15 @@ impl<P: ModelProvider> Agent<P> {
                     started_at,
                     finished_at: crate::trust::now_rfc3339(),
                     exit_reason: AgentExitReason::Ok,
-                    final_output: assistant.content.unwrap_or_default(),
+                    final_output: if !matches!(
+                        self.plan_tool_enforcement,
+                        PlanToolEnforcementMode::Off
+                    ) && !self.plan_step_constraints.is_empty()
+                    {
+                        last_user_output.unwrap_or_default()
+                    } else {
+                        assistant.content.unwrap_or_default()
+                    },
                     error: None,
                     messages,
                     tool_calls: observed_tool_calls,
@@ -3194,10 +3278,15 @@ fn parse_worker_step_status(
         .get("next_step_id")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let user_output = obj
+        .get("user_output")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     Some(WorkerStepStatus {
         step_id,
         status,
         next_step_id,
+        user_output,
     })
 }
 
@@ -4235,7 +4324,8 @@ mod tests {
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert!(matches!(out.exit_reason, AgentExitReason::PlannerError));
-        assert!(out.error.as_deref().unwrap_or_default().contains("halt"));
+        let err = out.error.as_deref().unwrap_or_default();
+        assert!(err.contains("halt") || err.contains("control envelope"));
     }
 
     #[tokio::test]
@@ -4422,6 +4512,94 @@ mod tests {
             .tool_decisions
             .iter()
             .any(|d| d.source.as_deref() == Some("runtime_budget")));
+    }
+
+    #[tokio::test]
+    async fn planner_enforced_final_output_uses_user_output_field() {
+        let provider = StaticContentProvider {
+            content: r#"{"schema_version":"openagent.step_result.v1","step_id":"S1","status":"done","next_step_id":"final","user_output":"all checks passed"}"#.to_string(),
+        };
+        let mut agent = Agent {
+            provider,
+            model: "m".to_string(),
+            tools: vec![crate::types::ToolDef {
+                name: "read_file".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+                side_effects: crate::types::SideEffects::FilesystemRead,
+            }],
+            max_steps: 2,
+            tool_rt: ToolRuntime {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_shell_in_workdir_only: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: Some("plan123".to_string()),
+                taint_enabled: false,
+                taint_mode: crate::taint::TaintMode::Propagate,
+                taint_overall: crate::taint::TaintLevel::Clean,
+                taint_sources: Vec::new(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: None,
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            policy_for_taint: None,
+            taint_toggle: crate::taint::TaintToggle::Off,
+            taint_mode: crate::taint::TaintMode::Propagate,
+            taint_digest_bytes: 4096,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Hard,
+            plan_step_constraints: vec![PlanStepConstraint {
+                step_id: "S1".to_string(),
+                intended_tools: vec!["read_file".to_string()],
+            }],
+            tool_call_budget: ToolCallBudget::default(),
+        };
+        let out = agent.run("hi", vec![], Vec::new()).await;
+        assert!(matches!(out.exit_reason, AgentExitReason::Ok));
+        assert_eq!(out.final_output, "all checks passed");
     }
 
     #[tokio::test]

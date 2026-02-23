@@ -120,7 +120,8 @@ Return final output as JSON only with fields:\n\
   \"status\": \"done|retry|replan|fail\",\n\
   \"evidence\": [\"short factual observations\"],\n\
   \"next_step_id\": \"optional next step id\",\n\
-  \"notes\": \"optional brief note\"\n\
+  \"notes\": \"optional brief note\",\n\
+  \"user_output\": \"optional final user-facing response text\"\n\
 }}"
     ))
 }
