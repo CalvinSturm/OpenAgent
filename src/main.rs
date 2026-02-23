@@ -4802,6 +4802,12 @@ async fn run_agent_with_ui<P: ModelProvider>(
         .worker_model
         .clone()
         .unwrap_or_else(|| default_model.to_string());
+    let plan_enforcement_explicit = has_explicit_plan_tool_enforcement_flag();
+    let effective_plan_tool_enforcement = resolve_plan_tool_enforcement(
+        args.mode,
+        args.enforce_plan_tools,
+        plan_enforcement_explicit,
+    );
     gate_ctx.model = worker_model.clone();
 
     let session_path = paths.sessions_dir.join(format!("{}.json", args.session));
@@ -4946,7 +4952,8 @@ async fn run_agent_with_ui<P: ModelProvider>(
                 "planner_model": planner_model,
                 "planner_max_steps": args.planner_max_steps,
                 "planner_output": format!("{:?}", args.planner_output).to_lowercase(),
-                "planner_strict": planner_strict_effective
+                "planner_strict": planner_strict_effective,
+                "enforce_plan_tools_effective": format!("{:?}", effective_plan_tool_enforcement).to_lowercase()
             }),
         );
         let planner_out = run_planner_phase(
@@ -5042,7 +5049,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
                         Some(args.planner_max_steps),
                         Some(format!("{:?}", args.planner_output).to_lowercase()),
                         Some(planner_strict_effective),
-                        Some(format!("{:?}", args.enforce_plan_tools).to_lowercase()),
+                        Some(format!("{:?}", effective_plan_tool_enforcement).to_lowercase()),
                         &instruction_resolution,
                     );
                     let config_fingerprint =
@@ -5099,7 +5106,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
                     planner::planner_worker_contract_content(&out.plan_json)?
                 );
                 if matches!(
-                    args.enforce_plan_tools,
+                    effective_plan_tool_enforcement,
                     PlanToolEnforcementMode::Soft | PlanToolEnforcementMode::Hard
                 ) {
                     match planner::extract_plan_step_tools(&out.plan_json) {
@@ -5150,7 +5157,8 @@ async fn run_agent_with_ui<P: ModelProvider>(
                     EventKind::WorkerStart,
                     serde_json::json!({
                         "worker_model": worker_model,
-                        "planner_hash_hex": planner_record.as_ref().map(|p| p.plan_hash_hex.clone()).unwrap_or_default()
+                        "planner_hash_hex": planner_record.as_ref().map(|p| p.plan_hash_hex.clone()).unwrap_or_default(),
+                        "enforce_plan_tools_effective": format!("{:?}", effective_plan_tool_enforcement).to_lowercase()
                     }),
                 );
             }
@@ -5217,7 +5225,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
                     Some(args.planner_max_steps),
                     Some(format!("{:?}", args.planner_output).to_lowercase()),
                     Some(planner_strict_effective),
-                    Some(format!("{:?}", args.enforce_plan_tools).to_lowercase()),
+                    Some(format!("{:?}", effective_plan_tool_enforcement).to_lowercase()),
                     &instruction_resolution,
                 );
                 let config_fingerprint =
@@ -5304,7 +5312,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
         taint_digest_bytes: args.taint_digest_bytes,
         run_id_override: Some(run_id.clone()),
         omit_tools_field_when_empty: false,
-        plan_tool_enforcement: args.enforce_plan_tools,
+        plan_tool_enforcement: effective_plan_tool_enforcement,
         plan_step_constraints,
         tool_call_budget: ToolCallBudget {
             max_total_tool_calls: args.max_total_tool_calls,
@@ -5452,7 +5460,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
                     planner::planner_worker_contract_content(&replan_out.plan_json)?
                 );
                 if matches!(
-                    args.enforce_plan_tools,
+                    effective_plan_tool_enforcement,
                     PlanToolEnforcementMode::Soft | PlanToolEnforcementMode::Hard
                 ) {
                     if let Ok(steps) = planner::extract_plan_step_tools(&replan_out.plan_json) {
@@ -5488,7 +5496,8 @@ async fn run_agent_with_ui<P: ModelProvider>(
                     serde_json::json!({
                         "phase": "replan_resume",
                         "worker_model": worker_model,
-                        "planner_hash_hex": replan_out.plan_hash_hex
+                        "planner_hash_hex": replan_out.plan_hash_hex,
+                        "enforce_plan_tools_effective": format!("{:?}", effective_plan_tool_enforcement).to_lowercase()
                     }),
                 );
                 let resume_session_messages = extract_session_messages(&outcome.messages);
@@ -5662,7 +5671,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
         Some(args.planner_max_steps),
         Some(format!("{:?}", args.planner_output).to_lowercase()),
         Some(planner_strict_effective),
-        Some(format!("{:?}", args.enforce_plan_tools).to_lowercase()),
+        Some(format!("{:?}", effective_plan_tool_enforcement).to_lowercase()),
         &instruction_resolution,
     );
     let config_fingerprint = build_config_fingerprint(&cli_config, args, &worker_model, paths);
@@ -7287,6 +7296,26 @@ fn parse_explicit_flags() -> ExplicitFlags {
     out
 }
 
+fn has_explicit_plan_tool_enforcement_flag() -> bool {
+    std::env::args()
+        .any(|arg| arg == "--enforce-plan-tools" || arg.starts_with("--enforce-plan-tools="))
+}
+
+fn resolve_plan_tool_enforcement(
+    mode: planner::RunMode,
+    configured: PlanToolEnforcementMode,
+    explicit: bool,
+) -> PlanToolEnforcementMode {
+    if matches!(mode, planner::RunMode::PlannerWorker)
+        && matches!(configured, PlanToolEnforcementMode::Off)
+        && !explicit
+    {
+        PlanToolEnforcementMode::Hard
+    } else {
+        configured
+    }
+}
+
 fn handle_session_command(store: &SessionStore, cmd: &SessionSubcommand) -> anyhow::Result<()> {
     match cmd {
         SessionSubcommand::Info => {
@@ -7564,6 +7593,45 @@ rules:
         let b = super::node_summary_line("N1", "ok", "hello\nworld");
         assert_eq!(a, b);
         assert!(a.contains("output_sha256="));
+    }
+
+    #[test]
+    fn planner_worker_defaults_plan_enforcement_to_hard_when_not_explicit() {
+        let resolved = super::resolve_plan_tool_enforcement(
+            crate::planner::RunMode::PlannerWorker,
+            crate::agent::PlanToolEnforcementMode::Off,
+            false,
+        );
+        assert!(matches!(
+            resolved,
+            crate::agent::PlanToolEnforcementMode::Hard
+        ));
+    }
+
+    #[test]
+    fn planner_worker_respects_explicit_off_override() {
+        let resolved = super::resolve_plan_tool_enforcement(
+            crate::planner::RunMode::PlannerWorker,
+            crate::agent::PlanToolEnforcementMode::Off,
+            true,
+        );
+        assert!(matches!(
+            resolved,
+            crate::agent::PlanToolEnforcementMode::Off
+        ));
+    }
+
+    #[test]
+    fn planner_worker_respects_explicit_soft_override() {
+        let resolved = super::resolve_plan_tool_enforcement(
+            crate::planner::RunMode::PlannerWorker,
+            crate::agent::PlanToolEnforcementMode::Soft,
+            true,
+        );
+        assert!(matches!(
+            resolved,
+            crate::agent::PlanToolEnforcementMode::Soft
+        ));
     }
 
     fn default_run_args() -> super::RunArgs {
