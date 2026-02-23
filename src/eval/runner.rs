@@ -1249,6 +1249,10 @@ fn write_run_artifact_for_eval(
         http_max_response_bytes: config.http.max_response_bytes,
         http_max_line_bytes: config.http.max_line_bytes,
         tool_catalog,
+        mcp_tool_snapshot: Vec::new(),
+        mcp_tool_catalog_hash_hex: None,
+        mcp_servers: Vec::new(),
+        mcp_config_path: None,
         policy_version: policy.version,
         includes_resolved: policy.includes_resolved.clone(),
         mcp_allowlist: policy.mcp_allowlist.clone(),
@@ -1344,6 +1348,9 @@ fn write_run_artifact_for_eval(
             .iter()
             .map(|t| t.name.clone())
             .collect(),
+        mcp_tool_catalog_hash_hex: String::new(),
+        mcp_servers: Vec::new(),
+        mcp_config_path: String::new(),
         policy_version: policy.version,
         includes_resolved: policy.includes_resolved.clone(),
         mcp_allowlist: policy.mcp_allowlist.clone(),

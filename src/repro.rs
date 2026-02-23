@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::ValueEnum;
@@ -348,11 +349,53 @@ pub fn verify_run_record(record: &RunRecord, strict: bool) -> anyhow::Result<Rep
     }
 
     let builtin = builtin_tools_enabled(true);
-    let builtin_map = crate::store::tool_schema_hash_hex_map(&builtin);
+    let mut actual_schema_map = crate::store::tool_schema_hash_hex_map(&builtin);
+    let mut mcp_live_snapshot_note = None;
+    let mut mcp_live_hash = String::from("unavailable");
+    match try_live_mcp_snapshot(record) {
+        Ok(Some((snapshot, hash_hex))) => {
+            for entry in &snapshot {
+                actual_schema_map.insert(
+                    entry.name.clone(),
+                    crate::store::hash_tool_schema(&entry.parameters),
+                );
+            }
+            mcp_live_hash = hash_hex;
+        }
+        Ok(None) => {
+            mcp_live_snapshot_note = Some("MCP live catalog unavailable during verify".to_string());
+        }
+        Err(e) => {
+            mcp_live_snapshot_note = Some(format!("MCP live catalog unavailable: {e}"));
+        }
+    }
+
+    let expected_mcp_hash = record
+        .cli
+        .mcp_tool_catalog_hash_hex
+        .clone()
+        .or_else(|| {
+            if record.cli.mcp_tool_snapshot.is_empty() {
+                None
+            } else {
+                crate::store::mcp_tool_snapshot_hash_hex(&record.cli.mcp_tool_snapshot).ok()
+            }
+        })
+        .unwrap_or_else(|| "-".to_string());
+    let mcp_hash_ok = expected_mcp_hash == "-" || expected_mcp_hash == mcp_live_hash;
+    checks.push(ReplayVerifyCheck {
+        name: "mcp_tool_catalog_hash_hex".to_string(),
+        expected: expected_mcp_hash,
+        actual: mcp_live_hash,
+        ok: mcp_hash_ok,
+        severity: "warn".to_string(),
+        note: mcp_live_snapshot_note,
+    });
+
     let mut schema_ok = true;
     let mut actual_map = BTreeMap::new();
     for (name, expected) in &record.tool_schema_hash_hex_map {
-        if let Some(actual) = builtin_map.get(name) {
+        if let Some(actual) = actual_schema_map.get(name) {
             if actual != expected {
                 schema_ok = false;
             }
@@ -416,6 +459,40 @@ fn unavailable_check(name: &str, note: &str) -> ReplayVerifyCheck {
         severity: "warn".to_string(),
         note: Some(note.to_string()),
     }
+}
+
+fn try_live_mcp_snapshot(
+    record: &RunRecord,
+) -> anyhow::Result<Option<(Vec<crate::store::McpToolSnapshotEntry>, String)>> {
+    if record.cli.mcp_servers.is_empty() {
+        return Ok(None);
+    }
+    let Some(path) = &record.cli.mcp_config_path else {
+        return Ok(None);
+    };
+    let cfg_path = Path::new(path);
+    if !cfg_path.exists() {
+        return Ok(None);
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let registry = rt.block_on(crate::mcp::registry::McpRegistry::from_config_path(
+        cfg_path,
+        &record.cli.mcp_servers,
+        Duration::from_secs(30),
+    ))?;
+    let mut snapshot = registry
+        .tool_defs()
+        .into_iter()
+        .map(|t| crate::store::McpToolSnapshotEntry {
+            name: t.name,
+            parameters: t.parameters,
+        })
+        .collect::<Vec<_>>();
+    snapshot.sort_by(|a, b| a.name.cmp(&b.name));
+    let hash_hex = crate::store::mcp_tool_snapshot_hash_hex(&snapshot)?;
+    Ok(Some((snapshot, hash_hex)))
 }
 
 pub fn render_verify_report(report: &ReplayVerifyReport) -> String {

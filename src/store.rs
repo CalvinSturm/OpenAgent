@@ -102,6 +102,12 @@ pub struct ToolCatalogEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolSnapshotEntry {
+    pub name: String,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunMetadata {
     pub run_id: String,
     pub started_at: String,
@@ -194,6 +200,14 @@ pub struct RunCliConfig {
     pub http_max_line_bytes: usize,
     #[serde(default)]
     pub tool_catalog: Vec<ToolCatalogEntry>,
+    #[serde(default)]
+    pub mcp_tool_snapshot: Vec<McpToolSnapshotEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_catalog_hash_hex: Option<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_config_path: Option<String>,
     pub policy_version: Option<u32>,
     #[serde(default)]
     pub includes_resolved: Vec<String>,
@@ -300,6 +314,12 @@ pub struct ConfigFingerprintV1 {
     pub http_max_response_bytes: usize,
     pub http_max_line_bytes: usize,
     pub tool_catalog_names: Vec<String>,
+    #[serde(default)]
+    pub mcp_tool_catalog_hash_hex: String,
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub mcp_config_path: String,
     pub policy_version: Option<u32>,
     pub includes_resolved: Vec<String>,
     pub mcp_allowlist: Option<McpAllowSummary>,
@@ -588,6 +608,14 @@ pub fn tool_schema_hash_hex_map(tools: &[crate::types::ToolDef]) -> BTreeMap<Str
     out
 }
 
+pub fn mcp_tool_snapshot_hash_hex(snapshot: &[McpToolSnapshotEntry]) -> anyhow::Result<String> {
+    let mut sorted = snapshot.to_vec();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let value = serde_json::to_value(&sorted)?;
+    let canonical = crate::trust::approvals::canonical_json(&value)?;
+    Ok(sha256_hex(canonical.as_bytes()))
+}
+
 pub fn hash_tool_schema(schema: &Value) -> String {
     let canonical = crate::trust::approvals::canonical_json(schema)
         .unwrap_or_else(|_| serde_json::to_string(schema).unwrap_or_else(|_| "null".to_string()));
@@ -854,6 +882,10 @@ mod tests {
                 http_max_response_bytes: 10_000_000,
                 http_max_line_bytes: 200_000,
                 tool_catalog: Vec::new(),
+                mcp_tool_snapshot: Vec::new(),
+                mcp_tool_catalog_hash_hex: None,
+                mcp_servers: Vec::new(),
+                mcp_config_path: None,
                 policy_version: None,
                 includes_resolved: Vec::new(),
                 mcp_allowlist: None,
@@ -1013,6 +1045,10 @@ mod tests {
                 http_max_response_bytes: 10_000_000,
                 http_max_line_bytes: 200_000,
                 tool_catalog: Vec::new(),
+                mcp_tool_snapshot: Vec::new(),
+                mcp_tool_catalog_hash_hex: None,
+                mcp_servers: Vec::new(),
+                mcp_config_path: None,
                 policy_version: None,
                 includes_resolved: Vec::new(),
                 mcp_allowlist: None,
@@ -1144,6 +1180,9 @@ mod tests {
             http_max_response_bytes: 10_000_000,
             http_max_line_bytes: 200_000,
             tool_catalog_names: Vec::new(),
+            mcp_tool_catalog_hash_hex: String::new(),
+            mcp_servers: Vec::new(),
+            mcp_config_path: String::new(),
             policy_version: None,
             includes_resolved: Vec::new(),
             mcp_allowlist: None,

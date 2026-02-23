@@ -4856,13 +4856,27 @@ async fn run_agent_with_ui<P: ModelProvider>(
     };
 
     let mut all_tools = builtin_tools_enabled(args.enable_write_tools);
+    let mut mcp_tool_snapshot: Vec<store::McpToolSnapshotEntry> = Vec::new();
     if let Some(reg) = &mcp_registry {
         let mut mcp_defs = reg.tool_defs();
+        mcp_tool_snapshot = mcp_defs
+            .iter()
+            .map(|t| store::McpToolSnapshotEntry {
+                name: t.name.clone(),
+                parameters: t.parameters.clone(),
+            })
+            .collect();
+        mcp_tool_snapshot.sort_by(|a, b| a.name.cmp(&b.name));
         if let Some(policy) = &gate_build.policy_for_exposure {
             mcp_defs.retain(|t| policy.mcp_tool_allowed(&t.name).is_ok());
         }
         all_tools.extend(mcp_defs);
     }
+    let mcp_tool_catalog_hash_hex = if mcp_tool_snapshot.is_empty() {
+        None
+    } else {
+        Some(store::mcp_tool_snapshot_hash_hex(&mcp_tool_snapshot)?)
+    };
     let hooks_config_path = resolved_hooks_config_path(args, &paths.state_dir);
     let tool_schema_hash_hex_map = store::tool_schema_hash_hex_map(&all_tools);
     gate_ctx.tool_schema_hashes = tool_schema_hash_hex_map.clone();
@@ -5015,7 +5029,10 @@ async fn run_agent_with_ui<P: ModelProvider>(
                         args,
                         &resolved_settings,
                         &hooks_config_path,
+                        &mcp_config_path,
                         tool_catalog.clone(),
+                        mcp_tool_snapshot.clone(),
+                        mcp_tool_catalog_hash_hex.clone(),
                         policy_version,
                         includes_resolved.clone(),
                         mcp_allowlist.clone(),
@@ -5187,7 +5204,10 @@ async fn run_agent_with_ui<P: ModelProvider>(
                     args,
                     &resolved_settings,
                     &hooks_config_path,
+                    &mcp_config_path,
                     tool_catalog.clone(),
+                    mcp_tool_snapshot.clone(),
+                    mcp_tool_catalog_hash_hex.clone(),
                     policy_version,
                     includes_resolved.clone(),
                     mcp_allowlist.clone(),
@@ -5629,7 +5649,10 @@ async fn run_agent_with_ui<P: ModelProvider>(
         args,
         &resolved_settings,
         &hooks_config_path,
+        &mcp_config_path,
         tool_catalog.clone(),
+        mcp_tool_snapshot.clone(),
+        mcp_tool_catalog_hash_hex.clone(),
         policy_version,
         includes_resolved.clone(),
         mcp_allowlist.clone(),
@@ -6362,7 +6385,10 @@ fn build_run_cli_config(
     args: &RunArgs,
     resolved_settings: &session::RunSettingResolution,
     hooks_config_path: &std::path::Path,
+    mcp_config_path: &std::path::Path,
     tool_catalog: Vec<store::ToolCatalogEntry>,
+    mcp_tool_snapshot: Vec<store::McpToolSnapshotEntry>,
+    mcp_tool_catalog_hash_hex: Option<String>,
     policy_version: Option<u32>,
     includes_resolved: Vec<String>,
     mcp_allowlist: Option<McpAllowSummary>,
@@ -6456,6 +6482,14 @@ fn build_run_cli_config(
         tui_refresh_ms: args.tui_refresh_ms,
         tui_max_log_lines: args.tui_max_log_lines,
         tool_catalog,
+        mcp_tool_snapshot,
+        mcp_tool_catalog_hash_hex,
+        mcp_servers: {
+            let mut servers = args.mcp.clone();
+            servers.sort();
+            servers
+        },
+        mcp_config_path: Some(stable_path_string(mcp_config_path)),
         policy_version,
         includes_resolved,
         mcp_allowlist,
@@ -6578,6 +6612,12 @@ fn build_config_fingerprint(
             .iter()
             .map(|t| t.name.clone())
             .collect(),
+        mcp_tool_catalog_hash_hex: cli_config
+            .mcp_tool_catalog_hash_hex
+            .clone()
+            .unwrap_or_default(),
+        mcp_servers: cli_config.mcp_servers.clone(),
+        mcp_config_path: cli_config.mcp_config_path.clone().unwrap_or_default(),
         policy_version: cli_config.policy_version,
         includes_resolved: cli_config.includes_resolved.clone(),
         mcp_allowlist: cli_config.mcp_allowlist.clone(),
