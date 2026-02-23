@@ -124,6 +124,9 @@ pub fn run_live(
                                 }
                             }
                         }
+                        UiAction::ToggleDetails => {
+                            state.show_details = !state.show_details;
+                        }
                         UiAction::Tab => {}
                     }
                 }

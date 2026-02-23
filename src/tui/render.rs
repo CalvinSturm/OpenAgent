@@ -11,6 +11,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(10),
             Constraint::Length(5),
         ])
@@ -44,20 +45,65 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
     ));
     frame.render_widget(Paragraph::new(top), outer[0]);
 
+    let sticky = Line::from(format!(
+        "step={} goal=\"{}\" allow={} next={} view={} (v=toggle)",
+        state.current_step_id,
+        state.current_step_goal,
+        state.step_allowed_tools_compact(),
+        state.next_hint,
+        if state.show_details {
+            "expanded"
+        } else {
+            "compact"
+        }
+    ));
+    frame.render_widget(Paragraph::new(sticky), outer[1]);
+
     let mid = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(outer[1]);
+        .split(outer[2]);
     frame.render_widget(
         Paragraph::new(state.assistant_text.clone())
             .block(Block::default().title("Assistant").borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
         mid[0],
     );
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(mid[1]);
+    let right = if state.show_details {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(7),
+                Constraint::Percentage(48),
+                Constraint::Percentage(52),
+            ])
+            .split(mid[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(mid[1])
+    };
+
+    if state.show_details {
+        let diag = format!(
+            "effective_plan_enf={}\nschema_repair={}\nlast_tool={}\nstep_allowed={}",
+            state.enforce_plan_tools_effective,
+            if state.schema_repair_seen {
+                "on"
+            } else {
+                "off"
+            },
+            state.last_tool_summary(),
+            state.step_allowed_tools_compact()
+        );
+        frame.render_widget(
+            Paragraph::new(diag)
+                .block(Block::default().title("Diagnostics").borders(Borders::ALL))
+                .wrap(Wrap { trim: false }),
+            right[0],
+        );
+    }
 
     let rows = state.tool_calls.iter().map(|t| {
         Row::new(vec![
@@ -89,7 +135,11 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
             "Tool", "Status", "Decision", "OK", "Effects", "Reason",
         ]))
         .block(Block::default().title("Tools").borders(Borders::ALL)),
-        right[0],
+        if state.show_details {
+            right[1]
+        } else {
+            right[0]
+        },
     );
 
     let approv_rows = state.pending_approvals.iter().enumerate().map(|(i, a)| {
@@ -119,10 +169,14 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
         .header(Row::new(vec!["Approval ID", "Status", "Tool", "Created"]))
         .block(
             Block::default()
-                .title("Approvals (a=approve d=deny r=refresh q=quit)")
+                .title("Approvals (a=approve d=deny r=refresh v=details q=quit)")
                 .borders(Borders::ALL),
         ),
-        right[1],
+        if state.show_details {
+            right[2]
+        } else {
+            right[1]
+        },
     );
 
     let logs = state.logs.join("\n");
@@ -130,6 +184,6 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
         Paragraph::new(logs)
             .block(Block::default().title("Logs").borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
-        outer[2],
+        outer[3],
     );
 }

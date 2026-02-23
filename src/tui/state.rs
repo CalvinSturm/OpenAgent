@@ -36,6 +36,11 @@ pub struct UiState {
     pub pending_approvals: Vec<ApprovalRow>,
     pub logs: Vec<String>,
     pub exit_reason: Option<String>,
+    pub show_details: bool,
+    pub current_step_id: String,
+    pub current_step_goal: String,
+    pub current_step_allowed_tools: Vec<String>,
+    pub next_hint: String,
     pub enforce_plan_tools_effective: String,
     pub schema_repair_seen: bool,
     pub total_tool_execs: u64,
@@ -61,6 +66,11 @@ impl UiState {
             pending_approvals: Vec::new(),
             logs: Vec::new(),
             exit_reason: None,
+            show_details: false,
+            current_step_id: "-".to_string(),
+            current_step_goal: "-".to_string(),
+            current_step_allowed_tools: Vec::new(),
+            next_hint: "-".to_string(),
             enforce_plan_tools_effective: "-".to_string(),
             schema_repair_seen: false,
             total_tool_execs: 0,
@@ -100,6 +110,7 @@ impl UiState {
                     .get("exit_reason")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                self.next_hint = "done".to_string();
             }
             EventKind::ModelDelta => {
                 if let Some(delta) = ev.data.get("delta").and_then(|v| v.as_str()) {
@@ -170,13 +181,32 @@ impl UiState {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let row = self.upsert_tool(id, name, side, "decided");
-                row.decision = Some(decision);
-                row.decision_reason = reason;
-                if row.decision.as_deref() == Some("deny") {
-                    row.status = format!("deny:{}", badge_source(&source));
-                } else if row.decision.as_deref() == Some("require_approval") {
-                    row.status = "pending:approval".to_string();
+                let is_deny = decision == "deny";
+                let is_pending = decision == "require_approval";
+                {
+                    let row = self.upsert_tool(id, name, side, "decided");
+                    row.decision = Some(decision);
+                    row.decision_reason = reason;
+                    if is_deny {
+                        row.status = format!("deny:{}", badge_source(&source));
+                    } else if is_pending {
+                        row.status = "pending:approval".to_string();
+                    }
+                }
+                if let Some(step_id) = ev.data.get("plan_step_id").and_then(|v| v.as_str()) {
+                    self.current_step_id = step_id.to_string();
+                }
+                if let Some(allowed) = ev.data.get("plan_allowed_tools").and_then(|v| v.as_array())
+                {
+                    self.current_step_allowed_tools = allowed
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                }
+                if is_deny {
+                    self.next_hint = format!("blocked({})", badge_source(&source));
+                } else if is_pending {
+                    self.next_hint = "pending_approval".to_string();
                 }
             }
             EventKind::ToolExecStart => {
@@ -227,6 +257,7 @@ impl UiState {
                 };
                 if matches!(ok, Some(true)) {
                     self.bump_usage(&side_effects);
+                    self.next_hint = "continue".to_string();
                 }
             }
             EventKind::PolicyLoaded => {
@@ -241,6 +272,9 @@ impl UiState {
                     .and_then(|v| v.as_str())
                 {
                     self.enforce_plan_tools_effective = mode.to_string();
+                }
+                if let Some(step_id) = ev.data.get("plan_step_id").and_then(|v| v.as_str()) {
+                    self.current_step_id = step_id.to_string();
                 }
             }
             EventKind::ProviderError => {
@@ -308,6 +342,15 @@ impl UiState {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error");
                 self.push_log(format!("error: {msg}"));
+                if ev
+                    .data
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    == "plan_halt_guard"
+                {
+                    self.next_hint = "blocked(plan)".to_string();
+                }
             }
             _ => {
                 if matches!(ev.kind, EventKind::CompactionPerformed) {
@@ -397,6 +440,33 @@ impl UiState {
             short_result: String::new(),
         });
         self.tool_calls.last_mut().expect("tool row")
+    }
+
+    pub fn step_allowed_tools_compact(&self) -> String {
+        if self.current_step_allowed_tools.is_empty() {
+            "-".to_string()
+        } else {
+            self.current_step_allowed_tools.join(",")
+        }
+    }
+
+    pub fn last_tool_summary(&self) -> String {
+        if let Some(last) = self.tool_calls.last() {
+            let outcome = last.decision.clone().unwrap_or_else(|| last.status.clone());
+            let reason = last.decision_reason.clone().unwrap_or_default();
+            if reason.is_empty() {
+                format!("{} {}", last.tool_name, outcome)
+            } else {
+                format!(
+                    "{} {} {}",
+                    last.tool_name,
+                    outcome,
+                    truncate_chars(&reason, 60)
+                )
+            }
+        } else {
+            "-".to_string()
+        }
     }
 }
 

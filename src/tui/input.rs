@@ -9,6 +9,7 @@ pub enum UiAction {
     Deny,
     Refresh,
     Tab,
+    ToggleDetails,
 }
 
 pub fn map_key(key: KeyEvent) -> Option<UiAction> {
@@ -22,6 +23,7 @@ pub fn map_key(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('a') => Some(UiAction::Approve),
         KeyCode::Char('d') => Some(UiAction::Deny),
         KeyCode::Char('r') => Some(UiAction::Refresh),
+        KeyCode::Char('v') => Some(UiAction::ToggleDetails),
         KeyCode::Tab => Some(UiAction::Tab),
         _ => None,
     }
