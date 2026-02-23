@@ -25,6 +25,10 @@ pub struct TaskExpectation {
     pub min_pass_rate: Option<f64>,
     #[serde(default)]
     pub max_fail_rate: Option<f64>,
+    #[serde(default)]
+    pub dominant_tool_sequence: Vec<String>,
+    #[serde(default)]
+    pub max_avg_tool_sequence_distance: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -37,6 +41,8 @@ pub struct SummaryExpectation {
     pub max_avg_tool_retries: Option<f64>,
     #[serde(default)]
     pub max_avg_tool_failures_by_class: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub max_avg_step_invariant_violations: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,11 +122,15 @@ pub fn create_baseline_from_results(
 
     let mut task_expectations = BTreeMap::new();
     for (task_id, stats) in aggregate_task_rates(&results) {
+        let dominant = dominant_tool_sequence_for_task(&results, &task_id);
+        let avg_dist = avg_tool_sequence_distance_for_task(&results, &task_id, &dominant);
         task_expectations.insert(
             task_id,
             TaskExpectation {
                 min_pass_rate: Some(stats.0),
                 max_fail_rate: Some(stats.1),
+                dominant_tool_sequence: dominant,
+                max_avg_tool_sequence_distance: Some(avg_dist),
             },
         );
     }
@@ -136,6 +146,7 @@ pub fn create_baseline_from_results(
             max_avg_steps: Some(avg_steps(&results)),
             max_avg_tool_retries: Some(avg_tool_retries(&results)),
             max_avg_tool_failures_by_class: avg_tool_failures_by_class(&results),
+            max_avg_step_invariant_violations: Some(avg_step_invariant_violations(&results)),
         },
         task_expectations,
     };
@@ -195,6 +206,20 @@ pub fn compare_results(baseline: &EvalBaseline, results: &EvalResults) -> Regres
             });
         }
     }
+    if let Some(max_avg) = baseline
+        .summary_expectations
+        .max_avg_step_invariant_violations
+    {
+        let avg = avg_step_invariant_violations(results);
+        if avg > max_avg {
+            failures.push(RegressionFailure {
+                scope: "summary".to_string(),
+                key: "avg_step_invariant_violations".to_string(),
+                expected: format!("<= {max_avg:.4}"),
+                actual: format!("{avg:.4}"),
+            });
+        }
+    }
 
     let task_rates = aggregate_task_rates(results);
     for (task, exp) in &baseline.task_expectations {
@@ -217,6 +242,20 @@ pub fn compare_results(baseline: &EvalBaseline, results: &EvalResults) -> Regres
                     expected: format!("fail_rate <= {max:.4}"),
                     actual: format!("{fail_rate:.4}"),
                 });
+            }
+        }
+        if !exp.dominant_tool_sequence.is_empty() {
+            let avg_dist =
+                avg_tool_sequence_distance_for_task(results, task, &exp.dominant_tool_sequence);
+            if let Some(max_dist) = exp.max_avg_tool_sequence_distance {
+                if avg_dist > max_dist {
+                    failures.push(RegressionFailure {
+                        scope: "task".to_string(),
+                        key: format!("{task}.avg_tool_sequence_distance"),
+                        expected: format!("<= {max_dist:.4}"),
+                        actual: format!("{avg_dist:.4}"),
+                    });
+                }
             }
         }
     }
@@ -285,6 +324,97 @@ pub fn avg_tool_failures_by_class(results: &EvalResults) -> BTreeMap<String, f64
         .into_iter()
         .map(|(class, total)| (class, total as f64 / count as f64))
         .collect()
+}
+
+pub fn avg_step_invariant_violations(results: &EvalResults) -> f64 {
+    let mut total = 0u64;
+    let mut count = 0u64;
+    for run in &results.runs {
+        if run.status == "skipped" {
+            continue;
+        }
+        count = count.saturating_add(1);
+        if let Some(metrics) = &run.metrics {
+            total = total.saturating_add(metrics.step_invariant_violations as u64);
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        total as f64 / count as f64
+    }
+}
+
+fn dominant_tool_sequence_for_task(results: &EvalResults, task: &str) -> Vec<String> {
+    let mut counts: BTreeMap<String, (u64, Vec<String>)> = BTreeMap::new();
+    for run in &results.runs {
+        if run.status == "skipped" || run.task_id != task {
+            continue;
+        }
+        let seq = run
+            .metrics
+            .as_ref()
+            .map(|m| m.tool_sequence.clone())
+            .unwrap_or_default();
+        let key = seq.join("|");
+        let entry = counts.entry(key).or_insert((0, seq));
+        entry.0 = entry.0.saturating_add(1);
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, (count, _))| *count)
+        .map(|(_, (_, seq))| seq)
+        .unwrap_or_default()
+}
+
+fn avg_tool_sequence_distance_for_task(
+    results: &EvalResults,
+    task: &str,
+    dominant: &[String],
+) -> f64 {
+    let mut total = 0f64;
+    let mut count = 0u64;
+    for run in &results.runs {
+        if run.status == "skipped" || run.task_id != task {
+            continue;
+        }
+        let seq = run
+            .metrics
+            .as_ref()
+            .map(|m| m.tool_sequence.clone())
+            .unwrap_or_default();
+        total += normalized_sequence_distance(&seq, dominant);
+        count = count.saturating_add(1);
+    }
+    if count == 0 {
+        0.0
+    } else {
+        total / count as f64
+    }
+}
+
+fn normalized_sequence_distance(a: &[String], b: &[String]) -> f64 {
+    let n = a.len();
+    let m = b.len();
+    if n == 0 && m == 0 {
+        return 0.0;
+    }
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in dp.iter_mut().enumerate().take(n + 1) {
+        row[0] = i;
+    }
+    for (j, cell) in dp[0].iter_mut().enumerate().take(m + 1) {
+        *cell = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[n][m] as f64 / n.max(m) as f64
 }
 
 fn aggregate_task_rates(results: &EvalResults) -> BTreeMap<String, (f64, f64)> {
@@ -444,5 +574,89 @@ mod tests {
             .failures
             .iter()
             .any(|f| f.key == "avg_tool_failures_by_class.E_TIMEOUT_TRANSIENT"));
+    }
+
+    #[test]
+    fn compare_results_flags_step_invariant_regression() {
+        let mut baseline_results = sample_results();
+        baseline_results.runs[0].metrics = Some(EvalRunMetrics {
+            step_invariant_violations: 0,
+            ..Default::default()
+        });
+        baseline_results.runs[1].metrics = Some(EvalRunMetrics {
+            step_invariant_violations: 0,
+            ..Default::default()
+        });
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let rp = td.path().join("results.json");
+        fs::write(
+            &rp,
+            serde_json::to_vec_pretty(&baseline_results).expect("serialize"),
+        )
+        .expect("write");
+        let _ = create_baseline_from_results(td.path(), "b1", &rp).expect("create");
+        let mut bl = load_baseline(td.path(), "b1").expect("load");
+        bl.summary_expectations.max_avg_step_invariant_violations = Some(0.0);
+
+        let mut current = baseline_results;
+        current.runs[0].metrics = Some(EvalRunMetrics {
+            step_invariant_violations: 1,
+            ..Default::default()
+        });
+        current.runs[1].metrics = Some(EvalRunMetrics {
+            step_invariant_violations: 2,
+            ..Default::default()
+        });
+        let reg = compare_results(&bl, &current);
+        assert!(!reg.passed);
+        assert!(
+            reg.failures
+                .iter()
+                .any(|f| f.key == "avg_step_invariant_violations")
+        );
+    }
+
+    #[test]
+    fn compare_results_flags_tool_sequence_distance_regression() {
+        let mut baseline_results = sample_results();
+        baseline_results.runs[0].metrics = Some(EvalRunMetrics {
+            tool_sequence: vec!["read_file".to_string(), "write_file".to_string()],
+            ..Default::default()
+        });
+        baseline_results.runs[1].metrics = Some(EvalRunMetrics {
+            tool_sequence: vec!["read_file".to_string(), "write_file".to_string()],
+            ..Default::default()
+        });
+
+        let td = tempfile::tempdir().expect("tempdir");
+        let rp = td.path().join("results.json");
+        fs::write(
+            &rp,
+            serde_json::to_vec_pretty(&baseline_results).expect("serialize"),
+        )
+        .expect("write");
+        let _ = create_baseline_from_results(td.path(), "b1", &rp).expect("create");
+        let mut bl = load_baseline(td.path(), "b1").expect("load");
+        if let Some(exp) = bl.task_expectations.get_mut("C1") {
+            exp.max_avg_tool_sequence_distance = Some(0.0);
+        }
+
+        let mut current = baseline_results;
+        current.runs[0].metrics = Some(EvalRunMetrics {
+            tool_sequence: vec!["read_file".to_string(), "shell".to_string()],
+            ..Default::default()
+        });
+        current.runs[1].metrics = Some(EvalRunMetrics {
+            tool_sequence: vec!["read_file".to_string(), "shell".to_string()],
+            ..Default::default()
+        });
+        let reg = compare_results(&bl, &current);
+        assert!(!reg.passed);
+        assert!(
+            reg.failures
+                .iter()
+                .any(|f| f.key == "C1.avg_tool_sequence_distance")
+        );
     }
 }

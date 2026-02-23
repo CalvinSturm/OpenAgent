@@ -321,6 +321,8 @@ pub struct EvalRunStats {
 pub struct EvalRunMetrics {
     pub steps: u32,
     pub tool_calls: u32,
+    #[serde(default)]
+    pub tool_sequence: Vec<String>,
     pub tool_calls_by_side_effects: BTreeMap<String, u32>,
     pub bytes_read: u64,
     pub bytes_written: u64,
@@ -330,6 +332,8 @@ pub struct EvalRunMetrics {
     pub tool_retries: u32,
     #[serde(default)]
     pub tool_failures_by_class: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub step_invariant_violations: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -366,6 +370,7 @@ pub struct EvalAggregateMetrics {
     pub skip_rate: f64,
     pub avg_provider_retries: f64,
     pub avg_tool_retries: f64,
+    pub avg_step_invariant_violations: f64,
 }
 
 struct EvalEventCaptureSink {
@@ -1087,6 +1092,8 @@ async fn run_single(
     let tool_calls_by_side_effects = count_tool_calls_by_side_effects(&outcome.tool_calls);
     let (tool_retries, tool_failures_by_class) =
         derive_tool_retry_metrics(&captured_events.lock().expect("event lock"));
+    let step_invariant_violations =
+        derive_step_invariant_violations(&captured_events.lock().expect("event lock"));
     let (bytes_read, bytes_written) = derive_io_bytes_from_messages(&outcome.messages);
     let tokens = Some(match outcome.token_usage.clone() {
         Some(t) => EvalTokenMetrics {
@@ -1109,6 +1116,7 @@ async fn run_single(
     let run_metrics = EvalRunMetrics {
         steps: steps as u32,
         tool_calls: tool_calls as u32,
+        tool_sequence: outcome.tool_calls.iter().map(|t| t.name.clone()).collect(),
         tool_calls_by_side_effects,
         bytes_read,
         bytes_written,
@@ -1120,6 +1128,7 @@ async fn run_single(
         },
         tool_retries,
         tool_failures_by_class,
+        step_invariant_violations,
     };
 
     write_run_artifact_for_eval(
@@ -1447,6 +1456,19 @@ fn derive_tool_retry_metrics(events: &[Event]) -> (u32, BTreeMap<String, u32>) {
     (retries, failures_by_class)
 }
 
+fn derive_step_invariant_violations(events: &[Event]) -> u32 {
+    let mut violations = 0u32;
+    for ev in events {
+        match ev.kind {
+            EventKind::StepBlocked | EventKind::StepReplanned => {
+                violations = violations.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    violations
+}
+
 fn derive_io_bytes_from_messages(messages: &[crate::types::Message]) -> (u64, u64) {
     let mut bytes_read = 0u64;
     let mut bytes_written = 0u64;
@@ -1517,6 +1539,7 @@ fn aggregate_rows(rows: &[&EvalRunRow]) -> EvalAggregateMetrics {
     let mut wall_sum = 0f64;
     let mut retry_sum = 0f64;
     let mut tool_retry_sum = 0f64;
+    let mut step_violation_sum = 0f64;
     let mut non_skip = 0usize;
     for r in rows {
         match r.status.as_str() {
@@ -1532,6 +1555,7 @@ fn aggregate_rows(rows: &[&EvalRunRow]) -> EvalAggregateMetrics {
                 wall_sum += m.wall_time_ms as f64;
                 retry_sum += m.provider.http_retries as f64;
                 tool_retry_sum += m.tool_retries as f64;
+                step_violation_sum += m.step_invariant_violations as f64;
             } else {
                 steps_sum += r.stats.steps as f64;
                 tools_sum += r.stats.tool_calls as f64;
@@ -1549,6 +1573,7 @@ fn aggregate_rows(rows: &[&EvalRunRow]) -> EvalAggregateMetrics {
         skip_rate: skip as f64 / total,
         avg_provider_retries: retry_sum / denom,
         avg_tool_retries: tool_retry_sum / denom,
+        avg_step_invariant_violations: step_violation_sum / denom,
     }
 }
 
@@ -1939,6 +1964,7 @@ mod tests {
                 metrics: Some(EvalRunMetrics {
                     steps: 2,
                     tool_calls: 2,
+                    tool_sequence: vec![],
                     tool_calls_by_side_effects: by,
                     bytes_read: 10,
                     bytes_written: 20,
@@ -1947,6 +1973,7 @@ mod tests {
                     provider: Default::default(),
                     tool_retries: 0,
                     tool_failures_by_class: BTreeMap::new(),
+                    step_invariant_violations: 0,
                 }),
                 tokens: None,
                 estimated_cost_usd: None,
