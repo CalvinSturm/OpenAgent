@@ -402,8 +402,10 @@ impl<P: ModelProvider> Agent<P> {
         let mut blocked_halt_count: u32 = 0;
         let mut step_retry_counts: std::collections::BTreeMap<String, u32> =
             std::collections::BTreeMap::new();
+        let mut schema_repair_attempts: std::collections::BTreeMap<String, u32> =
+            std::collections::BTreeMap::new();
         let mut tool_budget_usage = ToolCallBudgetUsage::default();
-        for step in 0..self.max_steps {
+        'agent_steps: for step in 0..self.max_steps {
             let compacted = match maybe_compact(&messages, &self.compaction_settings) {
                 Ok(c) => c,
                 Err(e) => {
@@ -1262,6 +1264,47 @@ impl<P: ModelProvider> Agent<P> {
                     )
                     .err()
                 };
+                if let Some(err) = &invalid_args_error {
+                    let repair_key = format!("{}|{}", tc.name, err);
+                    let attempts = schema_repair_attempts
+                        .entry(repair_key)
+                        .and_modify(|n| *n = n.saturating_add(1))
+                        .or_insert(1);
+                    if *attempts <= 1 {
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::ToolRetry,
+                            serde_json::json!({
+                                "tool_call_id": tc.id,
+                                "name": tc.name,
+                                "attempt": *attempts,
+                                "max_retries": 1,
+                                "failure_class": "E_SCHEMA",
+                                "action": "repair"
+                            }),
+                        );
+                        let tool_msg =
+                            make_invalid_args_tool_message(tc, err, self.tool_rt.exec_target_kind);
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::ToolExecEnd,
+                            serde_json::json!({
+                                "tool_call_id": tc.id,
+                                "name": tc.name,
+                                "ok": false,
+                                "truncated": false,
+                                "retry_count": 0,
+                                "failure_class": "E_SCHEMA",
+                                "source": "schema_repair"
+                            }),
+                        );
+                        messages.push(tool_msg);
+                        messages.push(schema_repair_instruction_message(tc, err));
+                        continue 'agent_steps;
+                    }
+                }
                 let approval_mode_meta =
                     if matches!(self.gate_ctx.approval_mode, ApprovalMode::Auto) {
                         Some("auto".to_string())
@@ -2673,6 +2716,19 @@ fn make_invalid_args_tool_message(
     ))
 }
 
+fn schema_repair_instruction_message(tc: &ToolCall, err: &str) -> Message {
+    Message {
+        role: Role::Developer,
+        content: Some(format!(
+            "Schema repair required for tool '{}': {}. Re-emit exactly one corrected tool call for '{}' with valid arguments only.",
+            tc.name, err, tc.name
+        )),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: None,
+    }
+}
+
 fn provider_name(provider: crate::gate::ProviderKind) -> &'static str {
     match provider {
         crate::gate::ProviderKind::Lmstudio => "lmstudio",
@@ -3183,6 +3239,60 @@ mod tests {
         }
     }
 
+    struct InvalidThenValidProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for InvalidThenValidProvider {
+        async fn generate(&self, _req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => Ok(GenerateResponse {
+                    assistant: Message {
+                        role: Role::Assistant,
+                        content: Some(String::new()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    },
+                    tool_calls: vec![crate::types::ToolCall {
+                        id: "tc_bad".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: None,
+                }),
+                1 => Ok(GenerateResponse {
+                    assistant: Message {
+                        role: Role::Assistant,
+                        content: Some(String::new()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    },
+                    tool_calls: vec![crate::types::ToolCall {
+                        id: "tc_good".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({"path":"a.txt"}),
+                    }],
+                    usage: None,
+                }),
+                _ => Ok(GenerateResponse {
+                    assistant: Message {
+                        role: Role::Assistant,
+                        content: Some("done".to_string()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    },
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn emits_tool_exec_target_before_exec_start() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -3551,6 +3661,117 @@ mod tests {
             .tool_decisions
             .iter()
             .any(|d| d.source.as_deref() == Some("runtime_budget")));
+    }
+
+    #[tokio::test]
+    async fn schema_repair_retry_happens_before_execution() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        tokio::fs::write(tmp.path().join("a.txt"), "x")
+            .await
+            .expect("write");
+        let events = Arc::new(Mutex::new(Vec::<crate::events::Event>::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = InvalidThenValidProvider {
+            calls: calls.clone(),
+        };
+        let mut agent = Agent {
+            provider,
+            model: "m".to_string(),
+            tools: vec![crate::types::ToolDef {
+                name: "read_file".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties":{"path":{"type":"string"}},
+                    "required":["path"]
+                }),
+                side_effects: crate::types::SideEffects::FilesystemRead,
+            }],
+            max_steps: 4,
+            tool_rt: ToolRuntime {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_shell_in_workdir_only: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: None,
+                taint_enabled: false,
+                taint_mode: crate::taint::TaintMode::Propagate,
+                taint_overall: crate::taint::TaintLevel::Clean,
+                taint_sources: Vec::new(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: Some(Box::new(EventCaptureSink {
+                events: events.clone(),
+            })),
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            policy_for_taint: None,
+            taint_toggle: crate::taint::TaintToggle::Off,
+            taint_mode: crate::taint::TaintMode::Propagate,
+            taint_digest_bytes: 4096,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            plan_step_constraints: Vec::new(),
+            tool_call_budget: ToolCallBudget::default(),
+        };
+        let out = agent.run("hi", vec![], Vec::new()).await;
+        assert!(matches!(out.exit_reason, AgentExitReason::Ok));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let evs = events.lock().expect("lock");
+        assert!(evs.iter().any(|e| {
+            matches!(e.kind, crate::events::EventKind::ToolRetry)
+                && e.data
+                    .get("failure_class")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    == "E_SCHEMA"
+                && e.data
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    == "repair"
+        }));
     }
 
     #[tokio::test]
