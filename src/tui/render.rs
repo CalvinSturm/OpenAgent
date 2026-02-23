@@ -18,29 +18,21 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
         .split(frame.area());
 
     let top = Line::from(format!(
-        "run={} step={} provider={} model={} caps={} policy={} plan={} schema_repair={} tools={} r={} w={} sh={} net={} br={} exit={}",
-        state.run_id,
+        "MODE:{} AUTH:{} PLAN:{} BUD:T{}/- W{} A{} MCP:{} SCHEMA:{} NET:{} run={} step={} provider={} model={} policy={} exit={}",
+        state.mode_label,
+        state.authority_label,
+        state.enforce_plan_tools_effective.to_ascii_uppercase(),
+        state.total_tool_execs,
+        state.filesystem_write_execs,
+        state.pending_approvals.len(),
+        state.mcp_hash_short(),
+        if state.schema_repair_seen { "FIX" } else { "OK" },
+        state.net_status,
+        if state.run_id.is_empty() { "-" } else { &state.run_id },
         state.step,
         state.provider,
         state.model,
-        if state.caps_source.is_empty() {
-            "-"
-        } else {
-            &state.caps_source
-        },
-        if state.policy_hash.is_empty() {
-            "-"
-        } else {
-            &state.policy_hash
-        },
-        state.enforce_plan_tools_effective.as_str(),
-        if state.schema_repair_seen { "on" } else { "off" },
-        state.total_tool_execs,
-        state.filesystem_read_execs,
-        state.filesystem_write_execs,
-        state.shell_execs,
-        state.network_execs,
-        state.browser_execs,
+        state.policy_hash_short(),
         state.exit_reason.as_deref().unwrap_or("-")
     ));
     frame.render_widget(Paragraph::new(top), outer[0]);
@@ -87,8 +79,9 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
 
     if state.show_details {
         let diag = format!(
-            "effective_plan_enf={}\nschema_repair={}\nlast_failure_class={}\nlast_retry_count={}\nlast_tool={}\nstep_allowed={}",
+            "effective_plan_enf={}\nauthority={}\nschema_repair={}\nlast_failure_class={}\nlast_retry_count={}\nlast_tool={}\nstep_allowed={}\nusage:r={} w={} sh={} net={} br={}",
             state.enforce_plan_tools_effective,
+            state.authority_label,
             if state.schema_repair_seen {
                 "on"
             } else {
@@ -97,7 +90,12 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
             state.last_failure_class,
             state.last_tool_retry_count,
             state.last_tool_summary(),
-            state.step_allowed_tools_compact()
+            state.step_allowed_tools_compact(),
+            state.filesystem_read_execs,
+            state.filesystem_write_execs,
+            state.shell_execs,
+            state.network_execs,
+            state.browser_execs
         );
         frame.render_widget(
             Paragraph::new(diag)
@@ -111,14 +109,18 @@ pub fn draw(frame: &mut Frame<'_>, state: &UiState, approvals_selected: usize) {
         Row::new(vec![
             Cell::from(t.tool_name.clone()),
             Cell::from(t.status.clone()),
-            Cell::from(t.decision.clone().unwrap_or_default()),
+            Cell::from(t.decision.as_deref().unwrap_or("-").to_ascii_uppercase()),
             Cell::from(
                 t.ok.map(|v| if v { "ok" } else { "fail" })
                     .unwrap_or("-")
                     .to_string(),
             ),
             Cell::from(t.side_effects.clone()),
-            Cell::from(t.decision_reason.clone().unwrap_or_default()),
+            Cell::from(if t.reason_token == "-" {
+                t.decision_reason.clone().unwrap_or_default()
+            } else {
+                t.reason_token.clone()
+            }),
         ])
     });
     frame.render_widget(

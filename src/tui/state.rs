@@ -9,6 +9,8 @@ pub struct ToolRow {
     pub tool_name: String,
     pub side_effects: String,
     pub decision: Option<String>,
+    pub decision_source: Option<String>,
+    pub reason_token: String,
     pub decision_reason: Option<String>,
     pub status: String,
     pub ok: Option<bool>,
@@ -29,8 +31,12 @@ pub struct UiState {
     pub step: u32,
     pub provider: String,
     pub model: String,
+    pub mode_label: String,
+    pub authority_label: String,
     pub caps_source: String,
     pub policy_hash: String,
+    pub mcp_catalog_hash: String,
+    pub net_status: String,
     pub assistant_text: String,
     pub tool_calls: Vec<ToolRow>,
     pub pending_approvals: Vec<ApprovalRow>,
@@ -61,8 +67,12 @@ impl UiState {
             step: 0,
             provider: String::new(),
             model: String::new(),
+            mode_label: "SAFE".to_string(),
+            authority_label: "VETO".to_string(),
             caps_source: String::new(),
             policy_hash: String::new(),
+            mcp_catalog_hash: String::new(),
+            net_status: "OK".to_string(),
             assistant_text: String::new(),
             tool_calls: Vec::new(),
             pending_approvals: Vec::new(),
@@ -107,6 +117,7 @@ impl UiState {
                 {
                     self.enforce_plan_tools_effective = mode.to_string();
                 }
+                self.net_status = "OK".to_string();
             }
             EventKind::RunEnd => {
                 self.exit_reason = ev
@@ -190,11 +201,13 @@ impl UiState {
                 {
                     let row = self.upsert_tool(id, name, side, "decided");
                     row.decision = Some(decision);
+                    row.decision_source = Some(source.clone());
+                    row.reason_token = reason_token(&source, reason.as_deref()).to_string();
                     row.decision_reason = reason;
                     if is_deny {
-                        row.status = format!("deny:{}", badge_source(&source));
+                        row.status = format!("DENY:{}", row.reason_token);
                     } else if is_pending {
-                        row.status = "pending:approval".to_string();
+                        row.status = "PEND:approval".to_string();
                     }
                 }
                 if let Some(step_id) = ev.data.get("plan_step_id").and_then(|v| v.as_str()) {
@@ -208,7 +221,7 @@ impl UiState {
                         .collect();
                 }
                 if is_deny {
-                    self.next_hint = format!("blocked({})", badge_source(&source));
+                    self.next_hint = format!("blocked({})", reason_token(&source, None));
                 } else if is_pending {
                     self.next_hint = "pending_approval".to_string();
                 }
@@ -253,10 +266,19 @@ impl UiState {
                     .get("content")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
+                let failure_class = ev
+                    .data
+                    .get("failure_class")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("E_OTHER");
                 let side_effects = {
                     let row = self.upsert_tool(id, name, String::new(), "done");
                     row.ok = ok;
                     row.short_result = truncate_chars(result, 200);
+                    if matches!(ok, Some(false)) {
+                        row.status = format!("FAIL:{}", class_to_reason_token(failure_class));
+                        row.reason_token = class_to_reason_token(failure_class).to_string();
+                    }
                     row.side_effects.clone()
                 };
                 if matches!(ok, Some(true)) {
@@ -300,6 +322,7 @@ impl UiState {
                     .and_then(|v| v.as_str())
                     .unwrap_or("provider error");
                 self.push_log(format!("provider_error: {msg}"));
+                self.net_status = "DISC".to_string();
             }
             EventKind::ProviderRetry => {
                 let attempt = ev.data.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -321,6 +344,7 @@ impl UiState {
                 self.push_log(format!(
                     "provider_retry: attempt {attempt}/{max_attempts} kind={kind} backoff_ms={backoff_ms}"
                 ));
+                self.net_status = "SLOW".to_string();
             }
             EventKind::ToolRetry => {
                 let tool = ev
@@ -452,6 +476,8 @@ impl UiState {
             tool_name,
             side_effects,
             decision: None,
+            decision_source: None,
+            reason_token: "-".to_string(),
             decision_reason: None,
             status: status.to_string(),
             ok: None,
@@ -488,13 +514,64 @@ impl UiState {
     }
 }
 
-fn badge_source(source: &str) -> &str {
+fn reason_token(source: &str, reason: Option<&str>) -> &'static str {
     match source {
         "plan_step_constraint" => "plan",
         "runtime_budget" => "budget",
         "policy" => "policy",
         "approval_store" => "approval",
+        _ => {
+            let lower = reason.unwrap_or_default().to_ascii_lowercase();
+            if lower.contains("invalid tool arguments")
+                || lower.contains("missing required field")
+                || lower.contains("schema")
+            {
+                "schema"
+            } else if lower.contains("timeout")
+                || lower.contains("timed out")
+                || lower.contains("connection refused")
+                || lower.contains("network")
+            {
+                "net"
+            } else if lower.contains("user denied")
+                || lower.contains("cancelled")
+                || lower.contains("canceled")
+            {
+                "user"
+            } else if lower.is_empty() {
+                "other"
+            } else {
+                "tool"
+            }
+        }
+    }
+}
+
+fn class_to_reason_token(class: &str) -> &'static str {
+    match class {
+        "E_SCHEMA" => "schema",
+        "E_POLICY" => "policy",
+        "E_TIMEOUT_TRANSIENT" | "E_NETWORK_TRANSIENT" => "net",
+        "E_SELECTOR_AMBIGUOUS" | "E_NON_IDEMPOTENT" | "E_OTHER" => "tool",
         _ => "other",
+    }
+}
+
+fn short_hash(s: &str) -> String {
+    if s.is_empty() {
+        "-".to_string()
+    } else {
+        s.chars().take(8).collect()
+    }
+}
+
+impl UiState {
+    pub fn policy_hash_short(&self) -> String {
+        short_hash(&self.policy_hash)
+    }
+
+    pub fn mcp_hash_short(&self) -> String {
+        short_hash(&self.mcp_catalog_hash)
     }
 }
 

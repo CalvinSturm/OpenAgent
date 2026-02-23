@@ -44,8 +44,11 @@ pub struct TuiConfig {
     pub max_log_lines: usize,
     pub provider: String,
     pub model: String,
+    pub mode_label: String,
+    pub authority_label: String,
     pub caps_source: String,
     pub policy_hash: String,
+    pub mcp_catalog_hash: String,
 }
 
 pub fn run_live(
@@ -63,8 +66,11 @@ pub fn run_live(
     let mut state = UiState::new(cfg.max_log_lines);
     state.provider = cfg.provider;
     state.model = cfg.model;
+    state.mode_label = cfg.mode_label;
+    state.authority_label = cfg.authority_label;
     state.caps_source = cfg.caps_source;
     state.policy_hash = cfg.policy_hash;
+    state.mcp_catalog_hash = cfg.mcp_catalog_hash;
     let mut selected_approval = 0usize;
     let mut last_refresh = Instant::now();
 

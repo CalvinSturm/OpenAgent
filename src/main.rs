@@ -4919,8 +4919,19 @@ async fn run_agent_with_ui<P: ModelProvider>(
             max_log_lines: args.tui_max_log_lines,
             provider: provider_to_string(provider_kind),
             model: worker_model.clone(),
+            mode_label: if !args.allow_shell && !args.allow_write && !args.enable_write_tools {
+                "SAFE".to_string()
+            } else {
+                "CODE".to_string()
+            },
+            authority_label: if args.approval_mode == ApprovalMode::Auto {
+                "EXEC".to_string()
+            } else {
+                "VETO".to_string()
+            },
             caps_source: format!("{:?}", resolved_settings.caps_mode).to_lowercase(),
             policy_hash: policy_hash_hex.clone().unwrap_or_default(),
+            mcp_catalog_hash: mcp_tool_catalog_hash_hex.clone().unwrap_or_default(),
         };
         Some(std::thread::spawn(move || {
             tui::run_live(rx, approvals_path, cfg, cancel_tx.clone())
