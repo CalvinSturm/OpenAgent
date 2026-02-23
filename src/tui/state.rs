@@ -37,6 +37,7 @@ pub struct UiState {
     pub policy_hash: String,
     pub mcp_catalog_hash: String,
     pub mcp_lifecycle: String,
+    pub cancel_lifecycle: String,
     pub net_status: String,
     pub assistant_text: String,
     pub tool_calls: Vec<ToolRow>,
@@ -74,6 +75,7 @@ impl UiState {
             policy_hash: String::new(),
             mcp_catalog_hash: String::new(),
             mcp_lifecycle: "IDLE".to_string(),
+            cancel_lifecycle: "NONE".to_string(),
             net_status: "OK".to_string(),
             assistant_text: String::new(),
             tool_calls: Vec::new(),
@@ -121,6 +123,7 @@ impl UiState {
                 }
                 self.net_status = "OK".to_string();
                 self.mcp_lifecycle = "IDLE".to_string();
+                self.cancel_lifecycle = "NONE".to_string();
             }
             EventKind::RunEnd => {
                 let exit_reason = ev
@@ -129,6 +132,11 @@ impl UiState {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 self.exit_reason = exit_reason.clone();
+                if self.cancel_lifecycle == "REQUESTED"
+                    || exit_reason.as_deref() == Some("cancelled")
+                {
+                    self.cancel_lifecycle = "COMPLETE".to_string();
+                }
                 if exit_reason.as_deref() == Some("cancelled") {
                     if self
                         .tool_calls
@@ -639,6 +647,19 @@ impl UiState {
             format!("{}:{}", self.mcp_hash_short(), self.mcp_lifecycle)
         }
     }
+
+    pub fn mark_cancel_requested(&mut self) {
+        self.cancel_lifecycle = "REQUESTED".to_string();
+        self.next_hint = "cancel_requested".to_string();
+        self.push_log(
+            "cancel requested; waiting for run to terminate (press q again to force quit)"
+                .to_string(),
+        );
+    }
+
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel_lifecycle == "REQUESTED"
+    }
 }
 
 fn is_mcp_tool(name: &str) -> bool {
@@ -793,6 +814,7 @@ mod tests {
     #[test]
     fn mcp_running_tool_marked_cancelled_on_run_cancel() {
         let mut s = UiState::new(10);
+        s.mark_cancel_requested();
         s.apply_event(&Event::new(
             "r1".to_string(),
             1,
@@ -806,7 +828,22 @@ mod tests {
             serde_json::json!({"exit_reason":"cancelled"}),
         ));
         assert_eq!(s.mcp_lifecycle, "CANCELLED");
+        assert_eq!(s.cancel_lifecycle, "COMPLETE");
         assert_eq!(s.tool_calls[0].status, "CANCEL:user");
         assert_eq!(s.tool_calls[0].reason_token, "user");
+    }
+
+    #[test]
+    fn cancel_request_transitions_to_complete_on_run_end() {
+        let mut s = UiState::new(10);
+        s.mark_cancel_requested();
+        assert!(s.cancel_requested());
+        s.apply_event(&Event::new(
+            "r1".to_string(),
+            1,
+            EventKind::RunEnd,
+            serde_json::json!({"exit_reason":"ok"}),
+        ));
+        assert_eq!(s.cancel_lifecycle, "COMPLETE");
     }
 }

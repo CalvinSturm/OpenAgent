@@ -94,8 +94,12 @@ pub fn run_live(
                 if let Some(action) = map_key(k) {
                     match action {
                         UiAction::Quit => {
+                            if state.cancel_requested() {
+                                state.push_log("force quit requested by user".to_string());
+                                break;
+                            }
                             let _ = cancel_tx.send(true);
-                            break;
+                            state.mark_cancel_requested();
                         }
                         UiAction::Up => {
                             selected_approval = selected_approval.saturating_sub(1);
