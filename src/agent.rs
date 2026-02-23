@@ -289,6 +289,7 @@ impl<P: ModelProvider> Agent<P> {
         let mut saw_token_usage = false;
         let mut taint_state = TaintState::new();
         let mut active_plan_step_idx: usize = 0;
+        let mut blocked_halt_count: u32 = 0;
         for step in 0..self.max_steps {
             let compacted = match maybe_compact(&messages, &self.compaction_settings) {
                 Ok(c) => c,
@@ -809,6 +810,83 @@ impl<P: ModelProvider> Agent<P> {
             }
 
             if resp.tool_calls.is_empty() {
+                if !matches!(self.plan_tool_enforcement, PlanToolEnforcementMode::Off)
+                    && active_plan_step_idx < self.plan_step_constraints.len()
+                {
+                    let step_constraint = self.plan_step_constraints[active_plan_step_idx].clone();
+                    blocked_halt_count = blocked_halt_count.saturating_add(1);
+                    let reason = format!(
+                            "premature finalization blocked: plan step {} still pending (allowed tools: {})",
+                            step_constraint.step_id,
+                        if step_constraint.intended_tools.is_empty() {
+                            "none".to_string()
+                        } else {
+                            step_constraint.intended_tools.join(", ")
+                        }
+                    );
+                    self.emit_event(
+                        &run_id,
+                        step as u32,
+                        EventKind::Error,
+                        serde_json::json!({
+                            "error": reason,
+                            "source": "plan_halt_guard",
+                            "blocked_halt_count": blocked_halt_count
+                        }),
+                    );
+                    if blocked_halt_count >= 2 {
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::RunEnd,
+                            serde_json::json!({"exit_reason":"planner_error"}),
+                        );
+                        return AgentOutcome {
+                            run_id,
+                            started_at,
+                            finished_at: crate::trust::now_rfc3339(),
+                            exit_reason: AgentExitReason::PlannerError,
+                            final_output: String::new(),
+                            error: Some("model repeatedly attempted to halt before completing required planner steps".to_string()),
+                            messages,
+                            tool_calls: observed_tool_calls,
+                            tool_decisions: observed_tool_decisions,
+                            compaction_settings: self.compaction_settings.clone(),
+                            final_prompt_size_chars: request_context_chars,
+                            compaction_report: last_compaction_report,
+                            hook_invocations,
+                            provider_retry_count,
+                            provider_error_count,
+                            token_usage: if saw_token_usage {
+                                Some(total_token_usage.clone())
+                            } else {
+                                None
+                            },
+                            taint: taint_record_from_state(
+                                self.taint_toggle,
+                                self.taint_mode,
+                                self.taint_digest_bytes,
+                                &taint_state,
+                            ),
+                        };
+                    }
+                    messages.push(Message {
+                        role: Role::Developer,
+                        content: Some(format!(
+                            "Continue execution. Do not finalize yet. Complete pending step {} using only intended tools ({}), then return the next tool call.",
+                            step_constraint.step_id,
+                            if step_constraint.intended_tools.is_empty() {
+                                "none".to_string()
+                            } else {
+                                step_constraint.intended_tools.join(", ")
+                            }
+                        )),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    });
+                    continue;
+                }
                 self.emit_event(
                     &run_id,
                     step as u32,
@@ -2447,6 +2525,25 @@ mod tests {
         }
     }
 
+    struct NoToolProvider;
+
+    #[async_trait]
+    impl ModelProvider for NoToolProvider {
+        async fn generate(&self, _req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            Ok(GenerateResponse {
+                assistant: Message {
+                    role: Role::Assistant,
+                    content: Some("done".to_string()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn emits_tool_exec_target_before_exec_start() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -2636,6 +2733,90 @@ mod tests {
             .tool_decisions
             .iter()
             .any(|d| d.source.as_deref() == Some("plan_step_constraint")));
+    }
+
+    #[tokio::test]
+    async fn halting_is_blocked_when_plan_steps_are_pending() {
+        let mut agent = Agent {
+            provider: NoToolProvider,
+            model: "m".to_string(),
+            tools: vec![crate::types::ToolDef {
+                name: "read_file".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+                side_effects: crate::types::SideEffects::FilesystemRead,
+            }],
+            max_steps: 3,
+            tool_rt: ToolRuntime {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_shell_in_workdir_only: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: Some("plan123".to_string()),
+                taint_enabled: false,
+                taint_mode: crate::taint::TaintMode::Propagate,
+                taint_overall: crate::taint::TaintLevel::Clean,
+                taint_sources: Vec::new(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: None,
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            policy_for_taint: None,
+            taint_toggle: crate::taint::TaintToggle::Off,
+            taint_mode: crate::taint::TaintMode::Propagate,
+            taint_digest_bytes: 4096,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Hard,
+            plan_step_constraints: vec![PlanStepConstraint {
+                step_id: "S1".to_string(),
+                intended_tools: vec!["read_file".to_string()],
+            }],
+        };
+        let out = agent.run("hi", vec![], Vec::new()).await;
+        assert!(matches!(out.exit_reason, AgentExitReason::PlannerError));
+        assert!(out.error.as_deref().unwrap_or_default().contains("halt"));
     }
 
     #[test]
