@@ -3190,6 +3190,9 @@ async fn run_chat_tui(
                             }
 
                             prompt_history.push(line.clone());
+                            // Sending a new prompt should always re-anchor the transcript to latest.
+                            follow_output = true;
+                            transcript_scroll = usize::MAX;
                             transcript.push(("user".to_string(), line.clone()));
                             if line.starts_with('?') {
                                 show_logs = true;
@@ -3198,9 +3201,6 @@ async fn run_chat_tui(
                             status = "running".to_string();
                             streaming_assistant.clear();
                             think_tick = 0;
-                            if follow_output {
-                                transcript_scroll = usize::MAX;
-                            }
                             terminal.draw(|f| {
                                 draw_chat_frame(
                                     f,
