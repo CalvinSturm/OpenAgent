@@ -4423,7 +4423,10 @@ fn draw_chat_frame(
         }
         chat_text.push_str(&format!("ASSISTANT: {}", streaming_assistant));
     }
-    let max_scroll = chat_text.lines().count().saturating_sub(1);
+    let chat_width = mid[0].width.max(1) as usize;
+    let chat_visible_lines = mid[0].height.max(1) as usize;
+    let chat_total_lines = wrapped_line_count(&chat_text, chat_width);
+    let max_scroll = chat_total_lines.saturating_sub(chat_visible_lines);
     let scroll = if transcript_scroll == usize::MAX {
         max_scroll
     } else {
@@ -4438,7 +4441,7 @@ fn draw_chat_frame(
         Paragraph::new(chat_text)
             .style(chat_style)
             .wrap(Wrap { trim: false })
-            .scroll((scroll as u16, 0)),
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         mid[0],
     );
 
