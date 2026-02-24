@@ -3072,16 +3072,20 @@ async fn run_chat_tui(
                                 if line.eq_ignore_ascii_case("cancel") {
                                     pending_timeout_input = false;
                                     logs.push("timeout update cancelled".to_string());
+                                    show_logs = false;
                                 } else {
                                     match apply_timeout_input(&mut active_run, &line) {
                                         Ok(msg) => {
                                             pending_timeout_input = false;
                                             logs.push(msg);
+                                            show_logs = false;
                                         }
-                                        Err(msg) => logs.push(msg),
+                                        Err(msg) => {
+                                            logs.push(msg);
+                                            show_logs = true;
+                                        }
                                     }
                                 }
-                                show_logs = true;
                                 continue;
                             }
                             if line.starts_with('/') {
@@ -3188,10 +3192,15 @@ async fn run_chat_tui(
                                     _ if resolved.starts_with("/timeout ") => {
                                         let value = resolved["/timeout ".len()..].trim();
                                         match apply_timeout_input(&mut active_run, value) {
-                                            Ok(msg) => logs.push(msg),
-                                            Err(msg) => logs.push(msg),
+                                            Ok(msg) => {
+                                                logs.push(msg);
+                                                show_logs = false;
+                                            }
+                                            Err(msg) => {
+                                                logs.push(msg);
+                                                show_logs = true;
+                                            }
                                         }
-                                        show_logs = true;
                                     }
                                     _ if resolved.starts_with("/params ") => {
                                         let value = resolved["/params ".len()..].trim();
