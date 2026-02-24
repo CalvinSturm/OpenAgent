@@ -26,9 +26,11 @@ impl OpenAiCompatProvider {
         api_key: Option<String>,
         http: HttpConfig,
     ) -> anyhow::Result<Self> {
-        let client = Client::builder()
-            .connect_timeout(http.connect_timeout())
-            .timeout(http.request_timeout())
+        let mut builder = Client::builder().connect_timeout(http.connect_timeout());
+        if let Some(timeout) = http.request_timeout_opt() {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder
             .build()
             .context("failed to build OpenAI-compatible HTTP client")?;
         Ok(Self {
@@ -319,32 +321,36 @@ impl ModelProvider for OpenAiCompatProvider {
             let mut saw_done = false;
 
             loop {
-                let next = tokio::time::timeout(self.http.idle_timeout(), stream.next()).await;
-                let maybe_chunk = match next {
-                    Ok(v) => v,
-                    Err(_) => {
-                        if !emitted_any && attempt < max_attempts {
-                            let backoff = deterministic_backoff_ms(self.http, attempt - 1);
-                            retries.push(RetryRecord {
+                let maybe_chunk = if let Some(idle) = self.http.idle_timeout_opt() {
+                    let next = tokio::time::timeout(idle, stream.next()).await;
+                    match next {
+                        Ok(v) => v,
+                        Err(_) => {
+                            if !emitted_any && attempt < max_attempts {
+                                let backoff = deterministic_backoff_ms(self.http, attempt - 1);
+                                retries.push(RetryRecord {
+                                    attempt,
+                                    max_attempts,
+                                    kind: ProviderErrorKind::Timeout,
+                                    status: Some(status.as_u16()),
+                                    backoff_ms: backoff,
+                                });
+                                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                                break;
+                            }
+                            return Err(anyhow!(ProviderError {
+                                kind: ProviderErrorKind::Timeout,
+                                http_status: Some(status.as_u16()),
+                                retryable: !emitted_any,
                                 attempt,
                                 max_attempts,
-                                kind: ProviderErrorKind::Timeout,
-                                status: Some(status.as_u16()),
-                                backoff_ms: backoff,
-                            });
-                            tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-                            break;
+                                message: "stream idle timeout exceeded".to_string(),
+                                retries,
+                            }));
                         }
-                        return Err(anyhow!(ProviderError {
-                            kind: ProviderErrorKind::Timeout,
-                            http_status: Some(status.as_u16()),
-                            retryable: !emitted_any,
-                            attempt,
-                            max_attempts,
-                            message: "stream idle timeout exceeded".to_string(),
-                            retries,
-                        }));
                     }
+                } else {
+                    stream.next().await
                 };
 
                 let Some(chunk_res) = maybe_chunk else {

@@ -32,12 +32,20 @@ impl HttpConfig {
         Duration::from_millis(self.connect_timeout_ms)
     }
 
-    pub fn request_timeout(&self) -> Duration {
-        Duration::from_millis(self.request_timeout_ms)
+    pub fn request_timeout_opt(&self) -> Option<Duration> {
+        if self.request_timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.request_timeout_ms))
+        }
     }
 
-    pub fn idle_timeout(&self) -> Duration {
-        Duration::from_millis(self.stream_idle_timeout_ms)
+    pub fn idle_timeout_opt(&self) -> Option<Duration> {
+        if self.stream_idle_timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.stream_idle_timeout_ms))
+        }
     }
 }
 

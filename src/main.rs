@@ -2282,11 +2282,12 @@ async fn discover_model_for_provider(
 }
 
 async fn discover_openai_compat_model(base_url: &str, http: &HttpConfig) -> Option<String> {
-    let client = Client::builder()
-        .connect_timeout(Duration::from_millis(http.connect_timeout_ms))
-        .timeout(Duration::from_millis(http.request_timeout_ms))
-        .build()
-        .ok()?;
+    let mut builder =
+        Client::builder().connect_timeout(Duration::from_millis(http.connect_timeout_ms));
+    if http.request_timeout_ms > 0 {
+        builder = builder.timeout(Duration::from_millis(http.request_timeout_ms));
+    }
+    let client = builder.build().ok()?;
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
@@ -2305,11 +2306,12 @@ async fn discover_openai_compat_model(base_url: &str, http: &HttpConfig) -> Opti
 }
 
 async fn discover_ollama_model(base_url: &str, http: &HttpConfig) -> Option<String> {
-    let client = Client::builder()
-        .connect_timeout(Duration::from_millis(http.connect_timeout_ms))
-        .timeout(Duration::from_millis(http.request_timeout_ms))
-        .build()
-        .ok()?;
+    let mut builder =
+        Client::builder().connect_timeout(Duration::from_millis(http.connect_timeout_ms));
+    if http.request_timeout_ms > 0 {
+        builder = builder.timeout(Duration::from_millis(http.request_timeout_ms));
+    }
+    let client = builder.build().ok()?;
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
     let resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
@@ -2406,7 +2408,7 @@ async fn run_chat_repl(
         chat.tui
     );
     println!(
-        "Commands: /help, /mode <safe|coding|web|custom>, /timeout [seconds|+N|-N], /params [key value], /dismiss, /exit, /clear"
+        "Commands: /help, /mode <safe|coding|web|custom>, /timeout [seconds|+N|-N|off], /params [key value], /dismiss, /exit, /clear"
     );
 
     loop {
@@ -2463,8 +2465,8 @@ async fn run_chat_repl(
                     println!("/help  show commands");
                     println!("/mode  show current mode");
                     println!("/mode <safe|coding|web|custom>  switch mode");
-                    println!("/timeout  show timeout settings and wait for numeric input");
-                    println!("/timeout <seconds|+N|-N>  set/adjust timeout in seconds");
+                    println!("/timeout  show timeout settings and wait for input");
+                    println!("/timeout <seconds|+N|-N|off>  set/adjust timeout (off disables request+stream idle timeout)");
                     println!(
                         "/params  show current tuning params and wait for '<key> <value>' input"
                     );
@@ -3090,7 +3092,7 @@ async fn run_chat_tui(
                                     "/exit" => break,
                                     "/help" => {
                                         logs.push(
-                                            "commands: /help /mode <safe|coding|web|custom> /timeout [seconds|+N|-N] /params [key value] /dismiss /clear /exit /hide tools|approvals|logs /show tools|approvals|logs|all ; slash dropdown: type / then Up/Down + Enter ; panes: Ctrl+T/Ctrl+Y/Ctrl+G (Ctrl+1/2/3 aliases, terminal-dependent) ; scroll: PgUp/PgDn, Ctrl+U/Ctrl+D, mouse wheel ; approvals: Ctrl+J/K select, Ctrl+A approve, Ctrl+X deny, Ctrl+R refresh ; history: Up/Down ; Esc quits"
+                                            "commands: /help /mode <safe|coding|web|custom> /timeout [seconds|+N|-N|off] /params [key value] /dismiss /clear /exit /hide tools|approvals|logs /show tools|approvals|logs|all ; slash dropdown: type / then Up/Down + Enter ; panes: Ctrl+T/Ctrl+Y/Ctrl+G (Ctrl+1/2/3 aliases, terminal-dependent) ; scroll: PgUp/PgDn, Ctrl+U/Ctrl+D, mouse wheel ; approvals: Ctrl+J/K select, Ctrl+A approve, Ctrl+X deny, Ctrl+R refresh ; history: Up/Down ; Esc quits"
                                                 .to_string(),
                                         );
                                         show_logs = true;
@@ -3782,6 +3784,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/timeout 60", "set timeout to 60 seconds"),
     ("/timeout +30", "increase timeout by 30 seconds"),
     ("/timeout -10", "decrease timeout by 10 seconds"),
+    ("/timeout off", "disable request and stream-idle timeout"),
     (
         "/params",
         "show current tuning params and enter a new key/value",
@@ -3842,10 +3845,20 @@ fn apply_chat_mode(run: &mut RunArgs, mode: &str) -> Option<()> {
 }
 
 fn timeout_settings_summary(run: &RunArgs) -> String {
+    let request = if run.http_timeout_ms == 0 {
+        "off".to_string()
+    } else {
+        format!("{}s", run.http_timeout_ms / 1000)
+    };
+    let stream_idle = if run.http_stream_idle_timeout_ms == 0 {
+        "off".to_string()
+    } else {
+        format!("{}s", run.http_stream_idle_timeout_ms / 1000)
+    };
     format!(
-        "timeouts: request={}s, stream-idle={}s, connect={}s",
-        run.http_timeout_ms / 1000,
-        run.http_stream_idle_timeout_ms / 1000,
+        "timeouts: request={}, stream-idle={}, connect={}s",
+        request,
+        stream_idle,
         run.http_connect_timeout_ms / 1000
     )
 }
@@ -3869,6 +3882,18 @@ fn apply_timeout_input(run: &mut RunArgs, input: &str) -> Result<String, String>
     let value = input.trim();
     if value.is_empty() {
         return Err("timeout value is empty".to_string());
+    }
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "off" | "none" | "disable" | "disabled"
+    ) {
+        run.http_timeout_ms = 0;
+        run.http_stream_idle_timeout_ms = 0;
+        return Ok(format!(
+            "updated {} (request+stream-idle timeout disabled; connect remains {}s)",
+            timeout_settings_summary(run),
+            run.http_connect_timeout_ms / 1000
+        ));
     }
     let parse_seconds = |s: &str| -> Result<i64, String> {
         s.parse::<i64>()
@@ -4103,7 +4128,10 @@ fn keybinds_overlay_text() -> Option<String> {
         ("Ctrl+F", "search transcript"),
         ("Enter (empty input)", "toggle selected tool details"),
         ("/mode <...>", "switch chat mode (safe/coding/web/custom)"),
-        ("/timeout <...>", "adjust request/stream idle timeout"),
+        (
+            "/timeout <...>",
+            "adjust request/stream idle timeout (or off)",
+        ),
         ("/params <key> <value>", "adjust live agent tuning settings"),
         ("/dismiss", "dismiss timeout notification"),
         ("/...", "slash commands dropdown"),
@@ -7806,6 +7834,17 @@ rules:
             resolved,
             crate::agent::PlanToolEnforcementMode::Soft
         ));
+    }
+
+    #[test]
+    fn timeout_command_off_disables_request_and_stream_idle() {
+        let mut args = default_run_args();
+        let msg = super::apply_timeout_input(&mut args, "off").expect("timeout off");
+        assert_eq!(args.http_timeout_ms, 0);
+        assert_eq!(args.http_stream_idle_timeout_ms, 0);
+        assert!(msg.contains("disabled"));
+        assert!(super::timeout_settings_summary(&args).contains("request=off"));
+        assert!(super::timeout_settings_summary(&args).contains("stream-idle=off"));
     }
 
     fn default_run_args() -> super::RunArgs {
