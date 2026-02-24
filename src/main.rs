@@ -69,7 +69,7 @@ use providers::ModelProvider;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Terminal;
 use repro::{render_verify_report, verify_run_record, ReproEnvMode, ReproMode};
@@ -3841,6 +3841,41 @@ fn activity_status_hint(ui_state: &UiState, status: &str) -> Option<String> {
     Some("generating response (esc to interrupt)".to_string())
 }
 
+fn is_diff_addition_line(line: &str) -> bool {
+    line.starts_with('+') && !line.starts_with("+++")
+}
+
+fn is_diff_deletion_line(line: &str) -> bool {
+    line.starts_with('-') && !line.starts_with("---")
+}
+
+fn styled_chat_text(chat_text: &str, base_style: Style) -> (Text<'static>, String) {
+    let mut lines = Vec::<Line<'static>>::new();
+    let mut plain = String::new();
+    let mut change_line_no = 1usize;
+
+    for raw in chat_text.lines() {
+        let (content, style) = if is_diff_addition_line(raw) {
+            let numbered = format!("{:>4} | {raw}", change_line_no);
+            change_line_no = change_line_no.saturating_add(1);
+            (numbered, Style::default().fg(Color::Green))
+        } else if is_diff_deletion_line(raw) {
+            let numbered = format!("{:>4} | {raw}", change_line_no);
+            change_line_no = change_line_no.saturating_add(1);
+            (numbered, Style::default().fg(Color::Red))
+        } else {
+            (raw.to_string(), base_style)
+        };
+        if !plain.is_empty() {
+            plain.push('\n');
+        }
+        plain.push_str(&content);
+        lines.push(Line::from(Span::styled(content, style)));
+    }
+
+    (Text::from(lines), plain)
+}
+
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show shortcuts and slash commands"),
     ("/mode", "show current mode"),
@@ -4491,23 +4526,23 @@ fn draw_chat_frame(
         }
         chat_text.push_str(&format!("ASSISTANT: {}", streaming_assistant));
     }
+    let chat_style = if show_hero_banner {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let (chat_render, chat_plain) = styled_chat_text(&chat_text, chat_style);
     let chat_width = mid[0].width.max(1) as usize;
     let chat_visible_lines = mid[0].height.max(1) as usize;
-    let chat_total_lines = wrapped_line_count(&chat_text, chat_width);
+    let chat_total_lines = wrapped_line_count(&chat_plain, chat_width);
     let max_scroll = chat_total_lines.saturating_sub(chat_visible_lines);
     let scroll = if transcript_scroll == usize::MAX {
         max_scroll
     } else {
         transcript_scroll.min(max_scroll)
     };
-    let chat_style = if show_hero_banner {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    };
     f.render_widget(
-        Paragraph::new(chat_text)
-            .style(chat_style)
+        Paragraph::new(chat_render)
             .wrap(Wrap { trim: false })
             .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         mid[0],
