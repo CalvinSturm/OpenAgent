@@ -2788,12 +2788,10 @@ async fn run_chat_tui(
                 match event::read()? {
                     CEvent::Mouse(me) => {
                         if let Some(delta) = mouse_scroll_delta(&me) {
-                            if delta < 0 {
-                                transcript_scroll =
-                                    transcript_scroll.saturating_sub((-delta) as usize);
-                            } else {
-                                transcript_scroll = transcript_scroll.saturating_add(delta as usize);
-                            }
+                            let max_scroll =
+                                transcript_max_scroll_lines(&transcript, &streaming_assistant);
+                            transcript_scroll =
+                                adjust_transcript_scroll(transcript_scroll, delta, max_scroll);
                             follow_output = false;
                         }
                     }
@@ -2951,19 +2949,31 @@ async fn run_chat_tui(
                             }
                         }
                         KeyCode::PageUp => {
-                            transcript_scroll = transcript_scroll.saturating_sub(12);
+                            let max_scroll =
+                                transcript_max_scroll_lines(&transcript, &streaming_assistant);
+                            transcript_scroll =
+                                adjust_transcript_scroll(transcript_scroll, -12, max_scroll);
                             follow_output = false;
                         }
                         KeyCode::PageDown => {
-                            transcript_scroll = transcript_scroll.saturating_add(12);
+                            let max_scroll =
+                                transcript_max_scroll_lines(&transcript, &streaming_assistant);
+                            transcript_scroll =
+                                adjust_transcript_scroll(transcript_scroll, 12, max_scroll);
                             follow_output = false;
                         }
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            transcript_scroll = transcript_scroll.saturating_sub(10);
+                            let max_scroll =
+                                transcript_max_scroll_lines(&transcript, &streaming_assistant);
+                            transcript_scroll =
+                                adjust_transcript_scroll(transcript_scroll, -10, max_scroll);
                             follow_output = false;
                         }
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            transcript_scroll = transcript_scroll.saturating_add(10);
+                            let max_scroll =
+                                transcript_max_scroll_lines(&transcript, &streaming_assistant);
+                            transcript_scroll =
+                                adjust_transcript_scroll(transcript_scroll, 10, max_scroll);
                             follow_output = false;
                         }
                         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3388,13 +3398,15 @@ async fn run_chat_tui(
                                     match event::read()? {
                                         CEvent::Mouse(me) => {
                                             if let Some(delta) = mouse_scroll_delta(&me) {
-                                                if delta < 0 {
-                                                    transcript_scroll = transcript_scroll
-                                                        .saturating_sub((-delta) as usize);
-                                                } else {
-                                                    transcript_scroll =
-                                                        transcript_scroll.saturating_add(delta as usize);
-                                                }
+                                                let max_scroll = transcript_max_scroll_lines(
+                                                    &transcript,
+                                                    &streaming_assistant,
+                                                );
+                                                transcript_scroll = adjust_transcript_scroll(
+                                                    transcript_scroll,
+                                                    delta,
+                                                    max_scroll,
+                                                );
                                                 follow_output = false;
                                             }
                                         }
@@ -3454,13 +3466,27 @@ async fn run_chat_tui(
                                                     break;
                                                 }
                                                 KeyCode::PageUp => {
-                                                    transcript_scroll =
-                                                        transcript_scroll.saturating_sub(12);
+                                                    let max_scroll = transcript_max_scroll_lines(
+                                                        &transcript,
+                                                        &streaming_assistant,
+                                                    );
+                                                    transcript_scroll = adjust_transcript_scroll(
+                                                        transcript_scroll,
+                                                        -12,
+                                                        max_scroll,
+                                                    );
                                                     follow_output = false;
                                                 }
                                                 KeyCode::PageDown => {
-                                                    transcript_scroll =
-                                                        transcript_scroll.saturating_add(12);
+                                                    let max_scroll = transcript_max_scroll_lines(
+                                                        &transcript,
+                                                        &streaming_assistant,
+                                                    );
+                                                    transcript_scroll = adjust_transcript_scroll(
+                                                        transcript_scroll,
+                                                        12,
+                                                        max_scroll,
+                                                    );
                                                     follow_output = false;
                                                 }
                                                 KeyCode::Char('u')
@@ -3468,8 +3494,15 @@ async fn run_chat_tui(
                                                         .modifiers
                                                         .contains(KeyModifiers::CONTROL) =>
                                                 {
-                                                    transcript_scroll =
-                                                        transcript_scroll.saturating_sub(10);
+                                                    let max_scroll = transcript_max_scroll_lines(
+                                                        &transcript,
+                                                        &streaming_assistant,
+                                                    );
+                                                    transcript_scroll = adjust_transcript_scroll(
+                                                        transcript_scroll,
+                                                        -10,
+                                                        max_scroll,
+                                                    );
                                                     follow_output = false;
                                                 }
                                                 KeyCode::Char('d')
@@ -3477,8 +3510,15 @@ async fn run_chat_tui(
                                                         .modifiers
                                                         .contains(KeyModifiers::CONTROL) =>
                                                 {
-                                                    transcript_scroll =
-                                                        transcript_scroll.saturating_add(10);
+                                                    let max_scroll = transcript_max_scroll_lines(
+                                                        &transcript,
+                                                        &streaming_assistant,
+                                                    );
+                                                    transcript_scroll = adjust_transcript_scroll(
+                                                        transcript_scroll,
+                                                        10,
+                                                        max_scroll,
+                                                    );
                                                     follow_output = false;
                                                 }
                                                 KeyCode::Char('t')
@@ -3697,6 +3737,37 @@ fn mouse_scroll_delta(me: &MouseEvent) -> Option<isize> {
         MouseEventKind::ScrollUp => Some(-(step as isize)),
         MouseEventKind::ScrollDown => Some(step as isize),
         _ => None,
+    }
+}
+
+fn transcript_max_scroll_lines(
+    transcript: &[(String, String)],
+    streaming_assistant: &str,
+) -> usize {
+    let mut chat_text = transcript
+        .iter()
+        .map(|(role, text)| format!("{}: {}", role.to_uppercase(), text))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !streaming_assistant.is_empty() {
+        if !chat_text.is_empty() {
+            chat_text.push_str("\n\n");
+        }
+        chat_text.push_str(&format!("ASSISTANT: {}", streaming_assistant));
+    }
+    chat_text.lines().count().saturating_sub(1)
+}
+
+fn adjust_transcript_scroll(current: usize, delta: isize, max_scroll: usize) -> usize {
+    let base = if current == usize::MAX {
+        max_scroll
+    } else {
+        current.min(max_scroll)
+    };
+    if delta < 0 {
+        base.saturating_sub((-delta) as usize)
+    } else {
+        base.saturating_add(delta as usize).min(max_scroll)
     }
 }
 
