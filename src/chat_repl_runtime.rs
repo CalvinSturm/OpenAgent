@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use anyhow::anyhow;
 
 use crate::chat_runtime;
+use crate::chat_tui_runtime;
 use crate::provider_runtime;
 use crate::providers::mock::MockProvider;
 use crate::providers::ollama::OllamaProvider;
@@ -10,7 +11,7 @@ use crate::providers::openai_compat::OpenAiCompatProvider;
 use crate::runtime_config;
 use crate::session::SessionStore;
 use crate::store;
-use crate::{run_agent, run_chat_tui, AgentExitReason, ChatArgs, ProviderKind, RunArgs};
+use crate::{run_agent, AgentExitReason, ChatArgs, ProviderKind, RunArgs};
 
 pub(crate) async fn run_chat_repl(
     chat: &ChatArgs,
@@ -18,7 +19,7 @@ pub(crate) async fn run_chat_repl(
     paths: &store::StatePaths,
 ) -> anyhow::Result<()> {
     if chat.tui {
-        return run_chat_tui(chat, base_run, paths).await;
+        return chat_tui_runtime::run_chat_tui(chat, base_run, paths).await;
     }
     let provider_kind = base_run
         .provider

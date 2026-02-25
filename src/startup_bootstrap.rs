@@ -16,7 +16,7 @@ use ratatui::Terminal;
 use crate::mcp::registry::doctor_server as mcp_doctor_server;
 use crate::store;
 use crate::{
-    chat_view_utils, provider_runtime, run_chat_tui, runtime_paths, startup_detect, ChatArgs,
+    chat_tui_runtime, chat_view_utils, provider_runtime, runtime_paths, startup_detect, ChatArgs,
     RunArgs,
 };
 
@@ -288,7 +288,7 @@ pub(crate) async fn run_startup_bootstrap(
         return Err(e);
     }
     if let Some((chat, run)) = next {
-        run_chat_tui(&chat, &run, paths).await?;
+        chat_tui_runtime::run_chat_tui(&chat, &run, paths).await?;
     }
     Ok(())
 }
