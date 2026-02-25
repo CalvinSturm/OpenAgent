@@ -201,7 +201,7 @@ In chat TUI:
 - `Ctrl+R`: refresh approvals
 - `/`: open slash-command dropdown
 - `/mode <safe|coding|web|custom>`: switch chat runtime mode
-- `/timeout [seconds|+N|-N]`: show and adjust request/stream idle timeout for slow generations
+- `/timeout [seconds|+N|-N|off]`: show and adjust request/stream idle timeout for slow generations
 - `/dismiss`: dismiss active timeout notification
 - `?`: show keybind help dropdown
 
