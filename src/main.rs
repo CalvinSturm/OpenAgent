@@ -17,6 +17,7 @@ mod qualification;
 mod repro;
 mod run_prep;
 mod runtime_config;
+mod runtime_flags;
 mod scaffold;
 mod session;
 mod startup_detect;
@@ -80,7 +81,7 @@ use ratatui::Terminal;
 use repro::{render_verify_report, verify_run_record, ReproEnvMode, ReproMode};
 use scaffold::{version_info, InitOptions};
 use session::{
-    settings_from_run, task_memory_message, CapsMode, ExplicitFlags, RunSettingInputs, SessionStore,
+    settings_from_run, task_memory_message, CapsMode, RunSettingInputs, SessionStore,
 };
 use store::{
     config_hash_hex, extract_session_messages, provider_to_string, resolve_state_paths,
@@ -3242,8 +3243,8 @@ async fn run_agent_with_ui<P: ModelProvider>(
         .worker_model
         .clone()
         .unwrap_or_else(|| default_model.to_string());
-    let plan_enforcement_explicit = has_explicit_plan_tool_enforcement_flag();
-    let effective_plan_tool_enforcement = resolve_plan_tool_enforcement(
+    let plan_enforcement_explicit = runtime_flags::has_explicit_plan_tool_enforcement_flag();
+    let effective_plan_tool_enforcement = runtime_flags::resolve_plan_tool_enforcement(
         args.mode,
         args.enforce_plan_tools,
         plan_enforcement_explicit,
@@ -3260,7 +3261,7 @@ async fn run_agent_with_ui<P: ModelProvider>(
     } else {
         session_store.load()?
     };
-    let explicit_flags = parse_explicit_flags();
+    let explicit_flags = runtime_flags::parse_explicit_flags();
     let resolved_settings = session::resolve_run_settings(
         args.use_session_settings,
         !args.no_session,
@@ -5649,48 +5650,6 @@ fn doctor_probe_urls(provider: ProviderKind, base_url: &str) -> Vec<String> {
     }
 }
 
-fn parse_explicit_flags() -> ExplicitFlags {
-    let mut out = ExplicitFlags::default();
-    for arg in std::env::args() {
-        if arg == "--max-context-chars" || arg.starts_with("--max-context-chars=") {
-            out.max_context_chars = true;
-        } else if arg == "--compaction-mode" || arg.starts_with("--compaction-mode=") {
-            out.compaction_mode = true;
-        } else if arg == "--compaction-keep-last" || arg.starts_with("--compaction-keep-last=") {
-            out.compaction_keep_last = true;
-        } else if arg == "--tool-result-persist" || arg.starts_with("--tool-result-persist=") {
-            out.tool_result_persist = true;
-        } else if arg == "--tool-args-strict" || arg.starts_with("--tool-args-strict=") {
-            out.tool_args_strict = true;
-        } else if arg == "--caps" || arg.starts_with("--caps=") {
-            out.caps_mode = true;
-        } else if arg == "--hooks" || arg.starts_with("--hooks=") {
-            out.hooks_mode = true;
-        }
-    }
-    out
-}
-
-fn has_explicit_plan_tool_enforcement_flag() -> bool {
-    std::env::args()
-        .any(|arg| arg == "--enforce-plan-tools" || arg.starts_with("--enforce-plan-tools="))
-}
-
-fn resolve_plan_tool_enforcement(
-    mode: planner::RunMode,
-    configured: PlanToolEnforcementMode,
-    explicit: bool,
-) -> PlanToolEnforcementMode {
-    if matches!(mode, planner::RunMode::PlannerWorker)
-        && matches!(configured, PlanToolEnforcementMode::Off)
-        && !explicit
-    {
-        PlanToolEnforcementMode::Hard
-    } else {
-        configured
-    }
-}
-
 fn handle_session_command(store: &SessionStore, cmd: &SessionSubcommand) -> anyhow::Result<()> {
     match cmd {
         SessionSubcommand::Info => {
@@ -6066,7 +6025,7 @@ rules:
 
     #[test]
     fn planner_worker_defaults_plan_enforcement_to_hard_when_not_explicit() {
-        let resolved = super::resolve_plan_tool_enforcement(
+        let resolved = super::runtime_flags::resolve_plan_tool_enforcement(
             crate::planner::RunMode::PlannerWorker,
             crate::agent::PlanToolEnforcementMode::Off,
             false,
@@ -6079,7 +6038,7 @@ rules:
 
     #[test]
     fn planner_worker_respects_explicit_off_override() {
-        let resolved = super::resolve_plan_tool_enforcement(
+        let resolved = super::runtime_flags::resolve_plan_tool_enforcement(
             crate::planner::RunMode::PlannerWorker,
             crate::agent::PlanToolEnforcementMode::Off,
             true,
@@ -6092,7 +6051,7 @@ rules:
 
     #[test]
     fn planner_worker_respects_explicit_soft_override() {
-        let resolved = super::resolve_plan_tool_enforcement(
+        let resolved = super::runtime_flags::resolve_plan_tool_enforcement(
             crate::planner::RunMode::PlannerWorker,
             crate::agent::PlanToolEnforcementMode::Soft,
             true,
