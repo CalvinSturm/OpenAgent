@@ -2,7 +2,7 @@
 
 Local-first agent runtime for building custom MCP-powered capabilities with local models, safety controls, reproducible runs, and beginner-to-pro UX.
 
-<img width="1093" height="581" alt="13451" src="https://github.com/user-attachments/assets/28d0f3e2-dd7e-4be8-84d5-533e303b733d" />
+<img width="1093" height="581" alt="LocalAgent startup screen with mode selection and provider auto-detection" src="https://github.com/user-attachments/assets/28d0f3e2-dd7e-4be8-84d5-533e303b733d" />
 
 LocalAgent is a local-first CLI runtime for developers who want to build stronger agents by connecting local LLMs to custom MCP tools.
 
@@ -166,6 +166,8 @@ localagent --provider lmstudio --model essentialai/rnj-1 chat --tui
 ```bash
 localagent
 ```
+
+<img width="1093" height="LocalAgent chat TUI showing Code mode, connected LM Studio provider, command hints, and cwd footer (C:\\demo)." alt="Screenshot 2026-02-25 145358" src="https://github.com/user-attachments/assets/1b2c6f7e-9869-46bc-8ec8-24b70ae23268" />
 
 Startup screen controls:
 
