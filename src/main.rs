@@ -23,6 +23,7 @@ mod types;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::mcp::registry::{
@@ -36,8 +37,8 @@ use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand, ValueEnum};
 use compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEventKind,
-    KeyModifiers, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CEvent, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -93,6 +94,9 @@ use trust::audit::AuditLog;
 use trust::policy::{McpAllowSummary, Policy};
 use tui::state::UiState;
 use types::{GenerateRequest, Message, Role};
+
+static ORCHESTRATOR_QUAL_CACHE: OnceLock<Mutex<std::collections::BTreeMap<String, bool>>> =
+    OnceLock::new();
 
 #[derive(Debug, Subcommand)]
 enum Commands {
@@ -2690,9 +2694,14 @@ async fn run_chat_tui(
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     if chat.plain_tui {
-        execute!(stdout, DisableMouseCapture)?;
+        execute!(stdout, DisableMouseCapture, EnableBracketedPaste)?;
     } else {
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
     }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -2826,6 +2835,11 @@ async fn run_chat_tui(
                                 adjust_transcript_scroll(transcript_scroll, delta, max_scroll);
                             follow_output = false;
                         }
+                    }
+                    CEvent::Paste(pasted) => {
+                        input.push_str(&normalize_pasted_text(&pasted));
+                        history_idx = None;
+                        slash_menu_index = 0;
                     }
                     CEvent::Key(key) => {
                     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -3452,6 +3466,11 @@ async fn run_chat_tui(
                                                 follow_output = false;
                                             }
                                         }
+                                        CEvent::Paste(pasted) => {
+                                            input.push_str(&normalize_pasted_text(&pasted));
+                                            history_idx = None;
+                                            slash_menu_index = 0;
+                                        }
                                         CEvent::Key(key)
                                             if matches!(
                                                 key.kind,
@@ -3839,10 +3858,15 @@ async fn run_chat_tui(
 
     disable_raw_mode()?;
     if chat.plain_tui {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+        execute!(
+            terminal.backend_mut(),
+            DisableBracketedPaste,
+            DisableMouseCapture
+        )?;
     } else {
         execute!(
             terminal.backend_mut(),
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         )?;
@@ -3853,6 +3877,10 @@ async fn run_chat_tui(
 
 fn is_text_input_mods(mods: KeyModifiers) -> bool {
     mods.is_empty() || mods == KeyModifiers::SHIFT
+}
+
+fn normalize_pasted_text(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn mouse_scroll_delta(me: &MouseEvent) -> Option<isize> {
@@ -5033,6 +5061,117 @@ async fn run_agent<P: ModelProvider>(
     .await
 }
 
+fn parse_wrapped_tool_call_from_content(content: &str) -> Option<types::ToolCall> {
+    let upper = content.to_ascii_uppercase();
+    let start_tag = "[TOOL_CALL]";
+    let end_tag = "[END_TOOL_CALL]";
+    let start = upper.find(start_tag)? + start_tag.len();
+    let end = upper[start..].find(end_tag)? + start;
+    let body = content[start..end].trim();
+    if body.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let name = value.get("name").and_then(|v| v.as_str())?;
+    let arguments = value
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some(types::ToolCall {
+        id: "wrapped_probe_tool_call".to_string(),
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+fn probe_response_to_tool_call(resp: &types::GenerateResponse) -> Option<types::ToolCall> {
+    if let Some(tc) = resp.tool_calls.first() {
+        return Some(tc.clone());
+    }
+    resp.assistant
+        .content
+        .as_deref()
+        .and_then(parse_wrapped_tool_call_from_content)
+}
+
+async fn ensure_orchestrator_qualified<P: ModelProvider>(
+    provider: &P,
+    provider_kind: ProviderKind,
+    base_url: &str,
+    model: &str,
+    tools: &[types::ToolDef],
+) -> anyhow::Result<()> {
+    let key = format!(
+        "{}|{}|{}",
+        provider_to_string(provider_kind),
+        base_url,
+        model
+    );
+    let cache =
+        ORCHESTRATOR_QUAL_CACHE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    if let Some(passed) = cache.lock().ok().and_then(|m| m.get(&key).copied()) {
+        if passed {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "orchestrator qualification failed previously for this model/session: {key}"
+        ));
+    }
+    let Some(list_dir_tool) = tools.iter().find(|t| t.name == "list_dir").cloned() else {
+        if let Ok(mut m) = cache.lock() {
+            m.insert(key, false);
+        }
+        return Err(anyhow!(
+            "orchestrator qualification failed: list_dir tool is not available"
+        ));
+    };
+    let probe_prompt =
+        "Emit exactly one native tool call and no prose:\nname=list_dir\narguments={\"path\":\".\"}";
+    for _ in 0..3 {
+        let req = GenerateRequest {
+            model: model.to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: Some(probe_prompt.to_string()),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            }],
+            tools: Some(vec![list_dir_tool.clone()]),
+        };
+        let resp = provider
+            .generate(req)
+            .await
+            .with_context(|| "orchestrator qualification provider call failed")?;
+        let Some(tc) = probe_response_to_tool_call(&resp) else {
+            if let Ok(mut m) = cache.lock() {
+                m.insert(key, false);
+            }
+            return Err(anyhow!(
+                "orchestrator qualification failed: no tool call returned by probe"
+            ));
+        };
+        let path_ok = tc
+            .arguments
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| p == ".")
+            .unwrap_or(false);
+        if tc.name != "list_dir" || !path_ok {
+            if let Ok(mut m) = cache.lock() {
+                m.insert(key, false);
+            }
+            return Err(anyhow!(
+                "orchestrator qualification failed: expected list_dir {{\"path\":\".\"}}"
+            ));
+        }
+    }
+    if let Ok(mut m) = cache.lock() {
+        m.insert(key, true);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_with_ui<P: ModelProvider>(
     provider: P,
@@ -5191,7 +5330,10 @@ async fn run_agent_with_ui<P: ModelProvider>(
         ))
     };
 
-    let mut all_tools = builtin_tools_enabled(args.enable_write_tools);
+    let mut all_tools = builtin_tools_enabled(
+        args.enable_write_tools,
+        args.allow_shell || args.allow_shell_in_workdir,
+    );
     let mut mcp_tool_snapshot: Vec<store::McpToolSnapshotEntry> = Vec::new();
     if let Some(reg) = &mcp_registry {
         let mut mcp_defs = reg.tool_defs();
@@ -5207,6 +5349,16 @@ async fn run_agent_with_ui<P: ModelProvider>(
             mcp_defs.retain(|t| policy.mcp_tool_allowed(&t.name).is_ok());
         }
         all_tools.extend(mcp_defs);
+    }
+    if args.enable_write_tools || args.allow_write {
+        ensure_orchestrator_qualified(
+            &provider,
+            provider_kind,
+            base_url,
+            &worker_model,
+            &all_tools,
+        )
+        .await?;
     }
     let mcp_tool_catalog_hash_hex = if mcp_tool_snapshot.is_empty() {
         None

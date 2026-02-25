@@ -348,7 +348,7 @@ pub fn verify_run_record(record: &RunRecord, strict: bool) -> anyhow::Result<Rep
         ));
     }
 
-    let builtin = builtin_tools_enabled(true);
+    let builtin = builtin_tools_enabled(true, true);
     let mut actual_schema_map = crate::store::tool_schema_hash_hex_map(&builtin);
     let mut mcp_live_snapshot_note = None;
     let mut mcp_live_hash = String::from("unavailable");

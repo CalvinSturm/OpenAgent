@@ -96,7 +96,7 @@ fn make_agent<P: ModelProvider + 'static>(
     Agent {
         provider,
         model: "mock-model".to_string(),
-        tools: builtin_tools_enabled(enable_write_tools),
+        tools: builtin_tools_enabled(enable_write_tools, allow_shell),
         max_steps: 8,
         tool_rt: ToolRuntime {
             workdir: workdir.to_path_buf(),
@@ -244,13 +244,12 @@ async fn write_file_on_existing_file_is_blocked_without_explicit_overwrite() {
     );
     let out = agent.run("Improve chess.html.", vec![], Vec::new()).await;
 
-    assert!(matches!(out.exit_reason, AgentExitReason::Ok));
-    assert!(out.messages.iter().any(|m| {
-        m.role == Role::Tool
-            && m.content.as_deref().unwrap_or_default().contains(
-                "write_file blocked for existing file; use apply_patch for in-place edits",
-            )
-    }));
+    assert!(matches!(out.exit_reason, AgentExitReason::PlannerError));
+    assert!(out
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("write_file on 'chess.html' requires prior read_file"));
     let on_disk = tokio::fs::read_to_string(&chess).await.expect("read");
     assert_eq!(on_disk, "<html>old</html>");
 }
@@ -265,6 +264,11 @@ async fn apply_patch_edits_existing_file_in_place() {
         steps: vec![
             ScriptStep::Tool {
                 id: "tc1",
+                name: "read_file",
+                arguments: serde_json::json!({"path":"chess.html"}),
+            },
+            ScriptStep::Tool {
+                id: "tc2",
                 name: "apply_patch",
                 arguments: serde_json::json!({"path":"chess.html","patch":"@@ -1 +1 @@\n-old\n+new\n"}),
             },
@@ -285,6 +289,49 @@ async fn apply_patch_edits_existing_file_in_place() {
     assert!(matches!(out.exit_reason, AgentExitReason::Ok));
     let on_disk = tokio::fs::read_to_string(&chess).await.expect("read");
     assert_eq!(on_disk, "new\n");
+}
+
+#[tokio::test]
+async fn placeholder_only_implementation_output_is_rejected() {
+    let tmp = tempdir().expect("tempdir");
+    let chess = tmp.path().join("chess.html");
+    tokio::fs::write(&chess, "<html>old</html>")
+        .await
+        .expect("write");
+    let provider = ScriptedProvider {
+        steps: vec![
+            ScriptStep::Tool {
+                id: "tc1",
+                name: "read_file",
+                arguments: serde_json::json!({"path":"chess.html"}),
+            },
+            ScriptStep::Final(
+                "Same HTML structure. Additional improvements coming. ... (full implementation) ...",
+            ),
+        ],
+        next: AtomicUsize::new(0),
+    };
+    let mut agent = make_agent(
+        provider,
+        tmp.path(),
+        Box::new(NoGate::new()),
+        false,
+        true,
+        true,
+    );
+    let out = agent
+        .run(
+            "Improve the chess game in chess.html so that it works like a proper chess game.",
+            vec![],
+            Vec::new(),
+        )
+        .await;
+    assert!(matches!(out.exit_reason, AgentExitReason::PlannerError));
+    assert!(out
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("placeholder artifacts"));
 }
 
 #[tokio::test]

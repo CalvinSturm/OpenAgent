@@ -83,7 +83,7 @@ pub fn tool_side_effects(tool_name: &str) -> SideEffects {
     }
 }
 
-pub fn builtin_tools_enabled(enable_write_tools: bool) -> Vec<ToolDef> {
+pub fn builtin_tools_enabled(enable_write_tools: bool, enable_shell_tool: bool) -> Vec<ToolDef> {
     let mut tools = vec![
         ToolDef {
             name: "list_dir".to_string(),
@@ -105,7 +105,9 @@ pub fn builtin_tools_enabled(enable_write_tools: bool) -> Vec<ToolDef> {
             }),
             side_effects: SideEffects::FilesystemRead,
         },
-        ToolDef {
+    ];
+    if enable_shell_tool {
+        tools.push(ToolDef {
             name: "shell".to_string(),
             description: "Run a shell command with optional args and cwd.".to_string(),
             parameters: json!({
@@ -118,8 +120,8 @@ pub fn builtin_tools_enabled(enable_write_tools: bool) -> Vec<ToolDef> {
                 "required":["cmd"]
             }),
             side_effects: SideEffects::ShellExec,
-        },
-    ];
+        });
+    }
     if enable_write_tools {
         tools.push(ToolDef {
             name: "write_file".to_string(),
@@ -671,8 +673,9 @@ mod tests {
 
     #[test]
     fn write_tools_not_exposed_by_default() {
-        let tools = builtin_tools_enabled(false);
+        let tools = builtin_tools_enabled(false, false);
         let names = tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
+        assert!(!names.iter().any(|n| n == "shell"));
         assert!(!names.iter().any(|n| n == "write_file"));
         assert!(!names.iter().any(|n| n == "apply_patch"));
     }

@@ -538,11 +538,15 @@ impl<P: ModelProvider> Agent<P> {
         let mut active_plan_step_idx: usize = 0;
         let mut blocked_halt_count: u32 = 0;
         let mut blocked_control_envelope_count: u32 = 0;
+        let mut blocked_tool_only_count: u32 = 0;
+        let mut tool_only_phase_active = prompt_requires_tool_only(user_prompt);
         let mut last_user_output: Option<String> = None;
         let mut step_retry_counts: std::collections::BTreeMap<String, u32> =
             std::collections::BTreeMap::new();
         let mut schema_repair_attempts: std::collections::BTreeMap<String, u32> =
             std::collections::BTreeMap::new();
+        let mut malformed_tool_call_attempts: u32 = 0;
+        let mut invalid_patch_format_attempts: u32 = 0;
         let mut tool_budget_usage = ToolCallBudgetUsage::default();
         let run_started = std::time::Instant::now();
         let mut announced_plan_step_id: Option<String> = None;
@@ -550,6 +554,8 @@ impl<P: ModelProvider> Agent<P> {
             .mcp_registry
             .as_ref()
             .and_then(|m| m.configured_tool_catalog_hash_hex().ok());
+        let allowed_tool_names: std::collections::BTreeSet<String> =
+            self.tools.iter().map(|t| t.name.clone()).collect();
         'agent_steps: for step in 0..self.max_steps {
             if self.tool_call_budget.max_wall_time_ms > 0 {
                 let elapsed_ms = run_started.elapsed().as_millis() as u64;
@@ -1043,7 +1049,7 @@ impl<P: ModelProvider> Agent<P> {
                 self.provider.generate(req).await
             };
 
-            let resp = match resp_result {
+            let mut resp = match resp_result {
                 Ok(r) => r,
                 Err(e) => {
                     if let Some(pe) = e.downcast_ref::<ProviderError>() {
@@ -1119,6 +1125,68 @@ impl<P: ModelProvider> Agent<P> {
                     };
                 }
             };
+            if resp.tool_calls.is_empty() {
+                let assistant_content = resp.assistant.content.clone().unwrap_or_default();
+                let normalized_calls = extract_content_tool_calls(
+                    &assistant_content,
+                    step as u32,
+                    &allowed_tool_names,
+                );
+                if !normalized_calls.is_empty() {
+                    resp.tool_calls = normalized_calls;
+                    resp.assistant.content = None;
+                } else if contains_tool_wrapper_markers(&assistant_content) {
+                    malformed_tool_call_attempts = malformed_tool_call_attempts.saturating_add(1);
+                    if malformed_tool_call_attempts >= 2 {
+                        let reason = "MODEL_TOOL_PROTOCOL_VIOLATION: empty or malformed [TOOL_CALL] envelope".to_string();
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::Error,
+                            serde_json::json!({
+                                "error": reason,
+                                "source": "tool_protocol_guard",
+                                "failure_class": "E_PROTOCOL_TOOL_WRAPPER",
+                                "attempt": malformed_tool_call_attempts
+                            }),
+                        );
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::RunEnd,
+                            serde_json::json!({"exit_reason":"planner_error"}),
+                        );
+                        return AgentOutcome {
+                            run_id,
+                            started_at,
+                            finished_at: crate::trust::now_rfc3339(),
+                            exit_reason: AgentExitReason::PlannerError,
+                            final_output: reason.clone(),
+                            error: Some(reason),
+                            messages,
+                            tool_calls: observed_tool_calls,
+                            tool_decisions: observed_tool_decisions,
+                            compaction_settings: self.compaction_settings.clone(),
+                            final_prompt_size_chars: request_context_chars,
+                            compaction_report: last_compaction_report,
+                            hook_invocations,
+                            provider_retry_count,
+                            provider_error_count,
+                            token_usage: if saw_token_usage {
+                                Some(total_token_usage.clone())
+                            } else {
+                                None
+                            },
+                            taint: taint_record_from_state(
+                                self.taint_toggle,
+                                self.taint_mode,
+                                self.taint_digest_bytes,
+                                &taint_state,
+                            ),
+                        };
+                    }
+                }
+            }
             if let Some(usage) = &resp.usage {
                 saw_token_usage = true;
                 total_token_usage.prompt_tokens =
@@ -1134,6 +1202,89 @@ impl<P: ModelProvider> Agent<P> {
                 EventKind::ModelResponseEnd,
                 serde_json::json!({"tool_calls": resp.tool_calls.len()}),
             );
+            if tool_only_phase_active
+                && resp.tool_calls.is_empty()
+                && !resp
+                    .assistant
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                blocked_tool_only_count = blocked_tool_only_count.saturating_add(1);
+                self.emit_event(
+                    &run_id,
+                    step as u32,
+                    EventKind::StepBlocked,
+                    serde_json::json!({
+                        "reason": "tool_only_violation",
+                        "blocked_count": blocked_tool_only_count
+                    }),
+                );
+                if blocked_tool_only_count >= 2 {
+                    let reason = "MODEL_TOOL_PROTOCOL_VIOLATION: repeated prose output during tool-only phase".to_string();
+                    self.emit_event(
+                        &run_id,
+                        step as u32,
+                        EventKind::Error,
+                        serde_json::json!({
+                            "error": reason,
+                            "source": "tool_protocol_guard",
+                            "failure_class": "E_PROTOCOL_TOOL_ONLY"
+                        }),
+                    );
+                    self.emit_event(
+                        &run_id,
+                        step as u32,
+                        EventKind::RunEnd,
+                        serde_json::json!({"exit_reason":"planner_error"}),
+                    );
+                    return AgentOutcome {
+                        run_id,
+                        started_at,
+                        finished_at: crate::trust::now_rfc3339(),
+                        exit_reason: AgentExitReason::PlannerError,
+                        final_output: reason.clone(),
+                        error: Some(reason),
+                        messages,
+                        tool_calls: observed_tool_calls,
+                        tool_decisions: observed_tool_decisions,
+                        compaction_settings: self.compaction_settings.clone(),
+                        final_prompt_size_chars: request_context_chars,
+                        compaction_report: last_compaction_report,
+                        hook_invocations,
+                        provider_retry_count,
+                        provider_error_count,
+                        token_usage: if saw_token_usage {
+                            Some(total_token_usage.clone())
+                        } else {
+                            None
+                        },
+                        taint: taint_record_from_state(
+                            self.taint_toggle,
+                            self.taint_mode,
+                            self.taint_digest_bytes,
+                            &taint_state,
+                        ),
+                    };
+                }
+                messages.push(resp.assistant.clone());
+                messages.push(Message {
+                    role: Role::Developer,
+                    content: Some(
+                        "Tool-only phase active. Return exactly one valid tool call and no prose."
+                            .to_string(),
+                    ),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                });
+                continue;
+            }
+            if !resp.tool_calls.is_empty() {
+                tool_only_phase_active = false;
+            }
             let mut assistant = resp.assistant.clone();
             if let Some(c) = assistant.content.as_deref() {
                 assistant.content = Some(sanitize_user_visible_output(c));
@@ -1656,20 +1807,63 @@ impl<P: ModelProvider> Agent<P> {
                     EventKind::RunEnd,
                     serde_json::json!({"exit_reason":"ok"}),
                 );
+                let final_output =
+                    if !matches!(self.plan_tool_enforcement, PlanToolEnforcementMode::Off)
+                        && !self.plan_step_constraints.is_empty()
+                    {
+                        last_user_output.unwrap_or_default()
+                    } else {
+                        assistant.content.unwrap_or_default()
+                    };
+                if let Some(reason) = implementation_integrity_violation(
+                    user_prompt,
+                    &final_output,
+                    &observed_tool_calls,
+                ) {
+                    self.emit_event(
+                        &run_id,
+                        step as u32,
+                        EventKind::Error,
+                        serde_json::json!({
+                            "error": reason,
+                            "source": "implementation_integrity_guard"
+                        }),
+                    );
+                    return AgentOutcome {
+                        run_id,
+                        started_at,
+                        finished_at: crate::trust::now_rfc3339(),
+                        exit_reason: AgentExitReason::PlannerError,
+                        final_output: String::new(),
+                        error: Some(reason),
+                        messages,
+                        tool_calls: observed_tool_calls,
+                        tool_decisions: observed_tool_decisions,
+                        compaction_settings: self.compaction_settings.clone(),
+                        final_prompt_size_chars: request_context_chars,
+                        compaction_report: last_compaction_report,
+                        hook_invocations,
+                        provider_retry_count,
+                        provider_error_count,
+                        token_usage: if saw_token_usage {
+                            Some(total_token_usage.clone())
+                        } else {
+                            None
+                        },
+                        taint: taint_record_from_state(
+                            self.taint_toggle,
+                            self.taint_mode,
+                            self.taint_digest_bytes,
+                            &taint_state,
+                        ),
+                    };
+                }
                 return AgentOutcome {
                     run_id,
                     started_at,
                     finished_at: crate::trust::now_rfc3339(),
                     exit_reason: AgentExitReason::Ok,
-                    final_output: if !matches!(
-                        self.plan_tool_enforcement,
-                        PlanToolEnforcementMode::Off
-                    ) && !self.plan_step_constraints.is_empty()
-                    {
-                        last_user_output.unwrap_or_default()
-                    } else {
-                        assistant.content.unwrap_or_default()
-                    },
+                    final_output,
                     error: None,
                     messages,
                     tool_calls: observed_tool_calls,
@@ -1971,6 +2165,60 @@ impl<P: ModelProvider> Agent<P> {
                     .err()
                 };
                 if let Some(err) = &invalid_args_error {
+                    malformed_tool_call_attempts = malformed_tool_call_attempts.saturating_add(1);
+                    if malformed_tool_call_attempts >= 2 {
+                        let reason = format!(
+                            "MODEL_TOOL_PROTOCOL_VIOLATION: repeated malformed tool calls (tool='{}', error='{}')",
+                            tc.name, err
+                        );
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::Error,
+                            serde_json::json!({
+                                "error": reason,
+                                "source": "tool_protocol_guard",
+                                "tool_call_id": tc.id,
+                                "name": tc.name,
+                                "failure_class": "E_SCHEMA",
+                                "attempt": malformed_tool_call_attempts
+                            }),
+                        );
+                        self.emit_event(
+                            &run_id,
+                            step as u32,
+                            EventKind::RunEnd,
+                            serde_json::json!({"exit_reason":"planner_error"}),
+                        );
+                        return AgentOutcome {
+                            run_id,
+                            started_at,
+                            finished_at: crate::trust::now_rfc3339(),
+                            exit_reason: AgentExitReason::PlannerError,
+                            final_output: reason.clone(),
+                            error: Some(reason),
+                            messages,
+                            tool_calls: observed_tool_calls,
+                            tool_decisions: observed_tool_decisions,
+                            compaction_settings: self.compaction_settings.clone(),
+                            final_prompt_size_chars: request_context_chars,
+                            compaction_report: last_compaction_report,
+                            hook_invocations,
+                            provider_retry_count,
+                            provider_error_count,
+                            token_usage: if saw_token_usage {
+                                Some(total_token_usage.clone())
+                            } else {
+                                None
+                            },
+                            taint: taint_record_from_state(
+                                self.taint_toggle,
+                                self.taint_mode,
+                                self.taint_digest_bytes,
+                                &taint_state,
+                            ),
+                        };
+                    }
                     let repair_key = format!("{}|{}", tc.name, err);
                     let attempts = schema_repair_attempts
                         .entry(repair_key)
@@ -2466,6 +2714,60 @@ impl<P: ModelProvider> Agent<P> {
                                 let current_content = tool_msg.content.clone().unwrap_or_default();
                                 if !tool_result_has_error(&current_content) {
                                     break;
+                                }
+                                if is_apply_patch_invalid_format_error(tc, &current_content) {
+                                    invalid_patch_format_attempts =
+                                        invalid_patch_format_attempts.saturating_add(1);
+                                    if invalid_patch_format_attempts >= 2 {
+                                        let reason = "MODEL_TOOL_PROTOCOL_VIOLATION: repeated invalid patch format for apply_patch".to_string();
+                                        self.emit_event(
+                                            &run_id,
+                                            step as u32,
+                                            EventKind::Error,
+                                            serde_json::json!({
+                                                "error": reason,
+                                                "source": "tool_protocol_guard",
+                                                "tool_call_id": tc.id,
+                                                "name": tc.name,
+                                                "failure_class": "E_PROTOCOL_PATCH_FORMAT",
+                                                "attempt": invalid_patch_format_attempts
+                                            }),
+                                        );
+                                        self.emit_event(
+                                            &run_id,
+                                            step as u32,
+                                            EventKind::RunEnd,
+                                            serde_json::json!({"exit_reason":"planner_error"}),
+                                        );
+                                        return AgentOutcome {
+                                            run_id,
+                                            started_at,
+                                            finished_at: crate::trust::now_rfc3339(),
+                                            exit_reason: AgentExitReason::PlannerError,
+                                            final_output: reason.clone(),
+                                            error: Some(reason),
+                                            messages,
+                                            tool_calls: observed_tool_calls,
+                                            tool_decisions: observed_tool_decisions,
+                                            compaction_settings: self.compaction_settings.clone(),
+                                            final_prompt_size_chars: request_context_chars,
+                                            compaction_report: last_compaction_report,
+                                            hook_invocations,
+                                            provider_retry_count,
+                                            provider_error_count,
+                                            token_usage: if saw_token_usage {
+                                                Some(total_token_usage.clone())
+                                            } else {
+                                                None
+                                            },
+                                            taint: taint_record_from_state(
+                                                self.taint_toggle,
+                                                self.taint_mode,
+                                                self.taint_digest_bytes,
+                                                &taint_state,
+                                            ),
+                                        };
+                                    }
                                 }
                                 let class = classify_tool_failure(tc, &current_content, false);
                                 let max_retries = class.retry_limit_for(side_effects);
@@ -3473,6 +3775,88 @@ fn parse_jsonish(raw: &str) -> Option<serde_json::Value> {
     None
 }
 
+fn contains_tool_wrapper_markers(s: &str) -> bool {
+    let u = s.to_ascii_uppercase();
+    u.contains("[TOOL_CALL]") || u.contains("[END_TOOL_CALL]")
+}
+
+fn extract_content_tool_calls(
+    raw: &str,
+    step: u32,
+    allowed_tool_names: &std::collections::BTreeSet<String>,
+) -> Vec<ToolCall> {
+    let wrapped = extract_wrapped_tool_calls(raw, step, allowed_tool_names);
+    if !wrapped.is_empty() {
+        return wrapped;
+    }
+    if let Some(tc) = extract_inline_tool_call(raw, step, allowed_tool_names) {
+        return vec![tc];
+    }
+    Vec::new()
+}
+
+fn extract_inline_tool_call(
+    raw: &str,
+    step: u32,
+    allowed_tool_names: &std::collections::BTreeSet<String>,
+) -> Option<ToolCall> {
+    let v = parse_jsonish(raw)?;
+    let name = v.get("name").and_then(|x| x.as_str())?;
+    if !allowed_tool_names.contains(name) {
+        return None;
+    }
+    let arguments = v
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some(ToolCall {
+        id: format!("inline_tc_{step}_0"),
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+fn extract_wrapped_tool_calls(
+    raw: &str,
+    step: u32,
+    allowed_tool_names: &std::collections::BTreeSet<String>,
+) -> Vec<ToolCall> {
+    let upper = raw.to_ascii_uppercase();
+    let start_tag = "[TOOL_CALL]";
+    let end_tag = "[END_TOOL_CALL]";
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while let Some(rel_start) = upper[offset..].find(start_tag) {
+        let start = offset + rel_start + start_tag.len();
+        let Some(rel_end) = upper[start..].find(end_tag) else {
+            break;
+        };
+        let end = start + rel_end;
+        let body = raw[start..end].trim();
+        if !body.is_empty() {
+            if let Some(v) = parse_jsonish(body) {
+                if let Some(name) = v.get("name").and_then(|x| x.as_str()) {
+                    if !allowed_tool_names.contains(name) {
+                        offset = end + end_tag.len();
+                        continue;
+                    }
+                    let arguments = v
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    out.push(ToolCall {
+                        id: format!("wrapped_tc_{step}_{}", out.len()),
+                        name: name.to_string(),
+                        arguments,
+                    });
+                }
+            }
+        }
+        offset = end + end_tag.len();
+    }
+    out
+}
+
 fn fenced_json_candidate(s: &str) -> Option<String> {
     if !s.starts_with("```") {
         return None;
@@ -3543,6 +3927,160 @@ fn classify_tool_failure(
         return ToolFailureClass::NonIdempotent;
     }
     ToolFailureClass::Other
+}
+
+fn is_apply_patch_invalid_format_error(tc: &ToolCall, raw_content: &str) -> bool {
+    if tc.name != "apply_patch" {
+        return false;
+    }
+    let text = tool_result_text(raw_content).to_ascii_lowercase();
+    text.contains("invalid patch format")
+        || text.contains("invalid patch:")
+        || text.contains("failed to apply patch:")
+}
+
+fn implementation_integrity_violation(
+    user_prompt: &str,
+    final_output: &str,
+    observed_tool_calls: &[ToolCall],
+) -> Option<String> {
+    if !is_implementation_task_prompt(user_prompt) {
+        return None;
+    }
+    if observed_tool_calls.is_empty() {
+        return Some(
+            "implementation guard: file-edit task finalized without any tool calls".to_string(),
+        );
+    }
+    if output_has_placeholder_artifacts(final_output) {
+        return Some(
+            "implementation guard: final answer contains placeholder artifacts instead of concrete implementation".to_string(),
+        );
+    }
+    let mut read_paths = std::collections::BTreeSet::<String>::new();
+    let allow_new_file_without_read = prompt_allows_new_file_without_read(user_prompt);
+    for call in observed_tool_calls {
+        match call.name.as_str() {
+            "read_file" => {
+                if let Some(path) = call
+                    .arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(normalize_tool_path)
+                {
+                    read_paths.insert(path);
+                }
+            }
+            "apply_patch" => {
+                if let Some(path) = call
+                    .arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(normalize_tool_path)
+                {
+                    if !read_paths.contains(&path) {
+                        return Some(format!(
+                            "implementation guard: apply_patch on '{path}' requires prior read_file on the same path"
+                        ));
+                    }
+                }
+            }
+            "write_file" => {
+                if allow_new_file_without_read {
+                    continue;
+                }
+                if let Some(path) = call
+                    .arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(normalize_tool_path)
+                {
+                    if !read_paths.contains(&path) {
+                        return Some(format!(
+                            "implementation guard: write_file on '{path}' requires prior read_file on the same path"
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn normalize_tool_path(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn is_implementation_task_prompt(prompt: &str) -> bool {
+    let p = prompt.to_ascii_lowercase();
+    let action = [
+        "improve",
+        "fix",
+        "implement",
+        "update",
+        "rewrite",
+        "refactor",
+        "patch",
+        "edit",
+        "modify",
+        "build",
+    ]
+    .iter()
+    .any(|kw| p.contains(kw));
+    let artifact = [
+        "file",
+        "files",
+        "directory",
+        "dir",
+        ".rs",
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".html",
+        ".css",
+        ".md",
+        ".json",
+        ".yaml",
+        ".yml",
+    ]
+    .iter()
+    .any(|kw| p.contains(kw));
+    action && artifact
+}
+
+fn prompt_allows_new_file_without_read(prompt: &str) -> bool {
+    let p = prompt.to_ascii_lowercase();
+    p.contains("create a new file")
+        || p.contains("create new file")
+        || p.contains("new file at")
+        || p.contains("add new file")
+}
+
+fn output_has_placeholder_artifacts(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    let patterns = [
+        "... (full implementation) ...",
+        "...full implementation...",
+        "same css as before",
+        "same html structure",
+        "additional improvements coming",
+        "todo:",
+        "coming soon",
+    ];
+    patterns.iter().any(|p| t.contains(p))
+}
+
+fn prompt_requires_tool_only(prompt: &str) -> bool {
+    let p = prompt.to_ascii_lowercase();
+    (p.contains("tool calls only")
+        || p.contains("tool-only")
+        || p.contains("exactly one tool call"))
+        && (p.contains("no prose")
+            || p.contains("do not output code")
+            || p.contains("do not explain"))
 }
 
 fn tool_result_text(raw: &str) -> String {
@@ -3986,6 +4524,45 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_tool_call_content_is_parsed() {
+        let raw =
+            "[TOOL_CALL]\n{\"name\":\"list_dir\",\"arguments\":{\"path\":\".\"}}\n[END_TOOL_CALL]";
+        let mut allowed = std::collections::BTreeSet::new();
+        allowed.insert("list_dir".to_string());
+        let calls = super::extract_wrapped_tool_calls(raw, 1, &allowed);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list_dir");
+        assert_eq!(calls[0].arguments, serde_json::json!({"path":"."}));
+    }
+
+    #[test]
+    fn wrapper_marker_detection_works() {
+        assert!(super::contains_tool_wrapper_markers(
+            "[TOOL_CALL]\n[END_TOOL_CALL]"
+        ));
+        assert!(!super::contains_tool_wrapper_markers("plain response"));
+    }
+
+    #[test]
+    fn inline_tool_call_json_is_parsed() {
+        let raw = "{\"name\":\"list_dir\",\"arguments\":{\"path\":\".\"}}";
+        let mut allowed = std::collections::BTreeSet::new();
+        allowed.insert("list_dir".to_string());
+        let tc = super::extract_inline_tool_call(raw, 1, &allowed).expect("tool call");
+        assert_eq!(tc.name, "list_dir");
+        assert_eq!(tc.arguments, serde_json::json!({"path":"."}));
+    }
+
+    #[test]
+    fn inline_tool_call_fenced_json_is_parsed() {
+        let raw = "```json\n{\"name\":\"list_dir\",\"arguments\":{\"path\":\".\"}}\n```";
+        let mut allowed = std::collections::BTreeSet::new();
+        allowed.insert("list_dir".to_string());
+        let tc = super::extract_inline_tool_call(raw, 1, &allowed).expect("tool call");
+        assert_eq!(tc.name, "list_dir");
+    }
+
+    #[test]
     fn tool_failure_classification_schema_and_network() {
         let tc_read = crate::types::ToolCall {
             id: "tc-schema".to_string(),
@@ -4211,6 +4788,124 @@ mod tests {
                     usage: None,
                 }),
             }
+        }
+    }
+
+    struct AlwaysInvalidArgsProvider;
+
+    #[async_trait]
+    impl ModelProvider for AlwaysInvalidArgsProvider {
+        async fn generate(&self, _req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            Ok(GenerateResponse {
+                assistant: Message {
+                    role: Role::Assistant,
+                    content: Some(String::new()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+                tool_calls: vec![crate::types::ToolCall {
+                    id: "tc_bad".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+            })
+        }
+    }
+
+    struct AlwaysInvalidPatchProvider;
+
+    #[async_trait]
+    impl ModelProvider for AlwaysInvalidPatchProvider {
+        async fn generate(&self, _req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            Ok(GenerateResponse {
+                assistant: Message {
+                    role: Role::Assistant,
+                    content: Some(String::new()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+                tool_calls: vec![crate::types::ToolCall {
+                    id: "tc_bad_patch".to_string(),
+                    name: "apply_patch".to_string(),
+                    arguments: serde_json::json!({
+                        "path":"a.txt",
+                        "patch":"@@ -1 +1 @@\n-no-match\n+new\n"
+                    }),
+                }],
+                usage: None,
+            })
+        }
+    }
+
+    struct ToolOnlyProseThenToolProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolOnlyProseThenToolProvider {
+        async fn generate(&self, _req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => Ok(GenerateResponse {
+                    assistant: Message {
+                        role: Role::Assistant,
+                        content: Some("I will help with that.".to_string()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    },
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                1 => Ok(GenerateResponse {
+                    assistant: Message {
+                        role: Role::Assistant,
+                        content: Some(String::new()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    },
+                    tool_calls: vec![crate::types::ToolCall {
+                        id: "tc1".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({"path":"a.txt"}),
+                    }],
+                    usage: None,
+                }),
+                _ => Ok(GenerateResponse {
+                    assistant: Message {
+                        role: Role::Assistant,
+                        content: Some("done".to_string()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    },
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            }
+        }
+    }
+
+    struct ToolOnlyAlwaysProseProvider;
+
+    #[async_trait]
+    impl ModelProvider for ToolOnlyAlwaysProseProvider {
+        async fn generate(&self, _req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            Ok(GenerateResponse {
+                assistant: Message {
+                    role: Role::Assistant,
+                    content: Some("prose only".to_string()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+                tool_calls: Vec::new(),
+                usage: None,
+            })
         }
     }
 
@@ -4890,6 +5585,406 @@ mod tests {
                     .unwrap_or_default()
                     == "repair"
         }));
+    }
+
+    #[tokio::test]
+    async fn repeated_malformed_tool_calls_fail_fast_with_protocol_violation() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut agent = Agent {
+            provider: AlwaysInvalidArgsProvider,
+            model: "m".to_string(),
+            tools: vec![crate::types::ToolDef {
+                name: "read_file".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties":{"path":{"type":"string"}},
+                    "required":["path"]
+                }),
+                side_effects: crate::types::SideEffects::FilesystemRead,
+            }],
+            max_steps: 8,
+            tool_rt: ToolRuntime {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_shell_in_workdir_only: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: None,
+                taint_enabled: false,
+                taint_mode: crate::taint::TaintMode::Propagate,
+                taint_overall: crate::taint::TaintLevel::Clean,
+                taint_sources: Vec::new(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: None,
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            policy_for_taint: None,
+            taint_toggle: crate::taint::TaintToggle::Off,
+            taint_mode: crate::taint::TaintMode::Propagate,
+            taint_digest_bytes: 4096,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
+            plan_step_constraints: Vec::new(),
+            tool_call_budget: ToolCallBudget::default(),
+            mcp_runtime_trace: Vec::new(),
+        };
+        let out = agent.run("hi", vec![], Vec::new()).await;
+        assert!(
+            matches!(out.exit_reason, AgentExitReason::PlannerError),
+            "unexpected exit={:?} error={:?}",
+            out.exit_reason,
+            out.error
+        );
+        assert!(out
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("MODEL_TOOL_PROTOCOL_VIOLATION"));
+    }
+
+    #[tokio::test]
+    async fn repeated_invalid_patch_format_fails_fast_with_protocol_violation() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        tokio::fs::write(tmp.path().join("a.txt"), "hello\n")
+            .await
+            .expect("write");
+        let mut agent = Agent {
+            provider: AlwaysInvalidPatchProvider,
+            model: "m".to_string(),
+            tools: vec![crate::types::ToolDef {
+                name: "apply_patch".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties":{"path":{"type":"string"},"patch":{"type":"string"}},
+                    "required":["path","patch"]
+                }),
+                side_effects: crate::types::SideEffects::FilesystemWrite,
+            }],
+            max_steps: 8,
+            tool_rt: ToolRuntime {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_shell_in_workdir_only: false,
+                allow_write: true,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_write: true,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: true,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: None,
+                taint_enabled: false,
+                taint_mode: crate::taint::TaintMode::Propagate,
+                taint_overall: crate::taint::TaintLevel::Clean,
+                taint_sources: Vec::new(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: None,
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            policy_for_taint: None,
+            taint_toggle: crate::taint::TaintToggle::Off,
+            taint_mode: crate::taint::TaintMode::Propagate,
+            taint_digest_bytes: 4096,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
+            plan_step_constraints: Vec::new(),
+            tool_call_budget: ToolCallBudget::default(),
+            mcp_runtime_trace: Vec::new(),
+        };
+        let out = agent.run("hi", vec![], Vec::new()).await;
+        assert!(
+            matches!(out.exit_reason, AgentExitReason::PlannerError),
+            "unexpected exit={:?} error={:?}",
+            out.exit_reason,
+            out.error
+        );
+        assert!(out
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("repeated invalid patch format"));
+    }
+
+    #[tokio::test]
+    async fn tool_only_prompt_repairs_once_then_allows_tool_call() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        tokio::fs::write(tmp.path().join("a.txt"), "x")
+            .await
+            .expect("write");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent {
+            provider: ToolOnlyProseThenToolProvider {
+                calls: calls.clone(),
+            },
+            model: "m".to_string(),
+            tools: vec![crate::types::ToolDef {
+                name: "read_file".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties":{"path":{"type":"string"}},
+                    "required":["path"]
+                }),
+                side_effects: crate::types::SideEffects::FilesystemRead,
+            }],
+            max_steps: 5,
+            tool_rt: ToolRuntime {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_shell_in_workdir_only: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: None,
+                taint_enabled: false,
+                taint_mode: crate::taint::TaintMode::Propagate,
+                taint_overall: crate::taint::TaintLevel::Clean,
+                taint_sources: Vec::new(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: None,
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            policy_for_taint: None,
+            taint_toggle: crate::taint::TaintToggle::Off,
+            taint_mode: crate::taint::TaintMode::Propagate,
+            taint_digest_bytes: 4096,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
+            plan_step_constraints: Vec::new(),
+            tool_call_budget: ToolCallBudget::default(),
+            mcp_runtime_trace: Vec::new(),
+        };
+        let out = agent
+            .run(
+                "Emit exactly one tool call and no prose.",
+                vec![],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(out.exit_reason, AgentExitReason::Ok));
+        assert!(out.tool_calls.iter().any(|t| t.name == "read_file"));
+        assert!(calls.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[tokio::test]
+    async fn tool_only_prompt_repeated_prose_fails_fast() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut agent = Agent {
+            provider: ToolOnlyAlwaysProseProvider,
+            model: "m".to_string(),
+            tools: vec![crate::types::ToolDef {
+                name: "list_dir".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties":{"path":{"type":"string"}},
+                    "required":["path"]
+                }),
+                side_effects: crate::types::SideEffects::FilesystemRead,
+            }],
+            max_steps: 4,
+            tool_rt: ToolRuntime {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_shell_in_workdir_only: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: None,
+                taint_enabled: false,
+                taint_mode: crate::taint::TaintMode::Propagate,
+                taint_overall: crate::taint::TaintLevel::Clean,
+                taint_sources: Vec::new(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: None,
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            policy_for_taint: None,
+            taint_toggle: crate::taint::TaintToggle::Off,
+            taint_mode: crate::taint::TaintMode::Propagate,
+            taint_digest_bytes: 4096,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
+            plan_step_constraints: Vec::new(),
+            tool_call_budget: ToolCallBudget::default(),
+            mcp_runtime_trace: Vec::new(),
+        };
+        let out = agent
+            .run(
+                "Emit exactly one tool call and no prose.",
+                vec![],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(out.exit_reason, AgentExitReason::PlannerError));
+        assert!(out
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tool-only phase"));
     }
 
     #[tokio::test]

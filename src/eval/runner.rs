@@ -999,7 +999,10 @@ async fn run_single(
         ))
     };
 
-    let mut tools = builtin_tools_enabled(config.enable_write_tools);
+    let mut tools = builtin_tools_enabled(
+        config.enable_write_tools,
+        config.allow_shell || config.unsafe_bypass_allow_flags,
+    );
     if let Some(reg) = &mcp_registry {
         let mut mcp_defs = reg.tool_defs();
         if let Some(policy) = &gate_build.policy_for_exposure {
