@@ -1507,10 +1507,8 @@ mod tests {
     use crate::taskgraph::{TaskCompaction, TaskFlags, TaskLimits};
     use crate::types::{GenerateRequest, GenerateResponse, Message, Role};
 
-    use super::{
-        doctor_probe_urls, policy_doctor_output, policy_effective_output, DockerNetwork,
-        ProviderKind,
-    };
+    use super::{DockerNetwork, ProviderKind};
+    use crate::{ops_helpers, provider_runtime};
 
     struct CaptureSink {
         events: Arc<Mutex<Vec<crate::events::Event>>>,
