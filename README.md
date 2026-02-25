@@ -343,7 +343,7 @@ localagent doctor --provider ollama
 - CLI reference: `docs/CLI_REFERENCE.md`
 - Provider setup: `docs/LLM_SETUP.md`
 - Contributing: `CONTRIBUTING.md`
-- Release notes: `docs/RELEASE_NOTES_v0.1.2.md`
+- Release notes: `docs/release-notes/`
 - Changelog: `CHANGELOG.md`
 - Security policy: `SECURITY.md`
 - Code of conduct: `CODE_OF_CONDUCT.md`
