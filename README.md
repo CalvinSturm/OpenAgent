@@ -389,15 +389,15 @@ localagent doctor --provider llamacpp
 
 Need deeper setup, profiles, or reference docs? Start here.
 
-- Install: `docs/INSTALL.md`
-- Templates: `docs/TEMPLATES.md`
-- CLI reference: `docs/CLI_REFERENCE.md`
-- Provider setup: `docs/LLM_SETUP.md`
-- Contributing: `CONTRIBUTING.md`
-- Release notes: `docs/release-notes/`
-- Changelog: `CHANGELOG.md`
-- Security policy: `SECURITY.md`
-- Code of conduct: `CODE_OF_CONDUCT.md`
+- [Install](docs/INSTALL.md)
+- [Templates](docs/TEMPLATES.md)
+- [CLI reference](docs/CLI_REFERENCE.md)
+- [Provider setup](docs/LLM_SETUP.md)
+- [Contributing](CONTRIBUTING.md)
+- [Release notes](docs/release-notes/README.md)
+- [Changelog](CHANGELOG.md)
+- [Security policy](SECURITY.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
 
 ## License
 
