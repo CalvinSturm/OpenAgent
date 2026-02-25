@@ -21,6 +21,7 @@ pub(crate) struct PreparedTools {
     pub qualification_fallback_note: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_tools_and_qualification<P: ModelProvider>(
     provider: &P,
     provider_kind: ProviderKind,
