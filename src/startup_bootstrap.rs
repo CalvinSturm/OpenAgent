@@ -16,8 +16,8 @@ use ratatui::Terminal;
 use crate::mcp::registry::doctor_server as mcp_doctor_server;
 use crate::store;
 use crate::{
-    chat_view_utils, provider_cli_name, provider_runtime, resolved_mcp_config_path, run_chat_tui,
-    startup_detect, ChatArgs, RunArgs,
+    chat_view_utils, provider_runtime, resolved_mcp_config_path, run_chat_tui, startup_detect,
+    ChatArgs, RunArgs,
 };
 
 #[derive(Debug, Clone)]
@@ -397,7 +397,7 @@ fn draw_startup_bootstrap_frame(
 
     let provider_name = detection
         .provider
-        .map(provider_cli_name)
+        .map(provider_runtime::provider_cli_name)
         .unwrap_or("not detected");
     let model_name = detection.model.as_deref().unwrap_or("not detected");
     f.render_widget(
@@ -758,3 +758,4 @@ fn draw_startup_bootstrap_frame(
         footer_outer[1],
     );
 }
+

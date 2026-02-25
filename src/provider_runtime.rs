@@ -19,7 +19,7 @@ pub(crate) async fn doctor_check(args: &DoctorArgs) -> Result<String, String> {
     match args.provider {
         ProviderKind::Mock => Ok(format!("OK: mock provider ready at {}", base_url)),
         ProviderKind::Lmstudio | ProviderKind::Llamacpp => {
-            let urls = crate::doctor_probe_urls(args.provider, &base_url);
+            let urls = doctor_probe_urls(args.provider, &base_url);
             let models_url = &urls[0];
             let health_url = &urls[1];
 
@@ -28,7 +28,7 @@ pub(crate) async fn doctor_check(args: &DoctorArgs) -> Result<String, String> {
                     if models_resp.status().is_success() {
                         return Ok(format!(
                             "OK: {} reachable at {}",
-                            crate::provider_cli_name(args.provider),
+                            provider_cli_name(args.provider),
                             base_url
                         ));
                     }
@@ -43,7 +43,7 @@ pub(crate) async fn doctor_check(args: &DoctorArgs) -> Result<String, String> {
                         if health_resp.status().is_success() {
                             return Ok(format!(
                                 "OK: {} reachable at {} (reachable but endpoint differs)",
-                                crate::provider_cli_name(args.provider),
+                                provider_cli_name(args.provider),
                                 base_url
                             ));
                         }
@@ -51,7 +51,7 @@ pub(crate) async fn doctor_check(args: &DoctorArgs) -> Result<String, String> {
 
                     Err(format!(
                         "{} responded with HTTP {} at {}",
-                        crate::provider_cli_name(args.provider),
+                        provider_cli_name(args.provider),
                         models_resp.status(),
                         models_url
                     ))
@@ -69,13 +69,13 @@ pub(crate) async fn doctor_check(args: &DoctorArgs) -> Result<String, String> {
                     if health_resp.status().is_success() {
                         Ok(format!(
                             "OK: {} reachable at {} (reachable but endpoint differs)",
-                            crate::provider_cli_name(args.provider),
+                            provider_cli_name(args.provider),
                             base_url
                         ))
                     } else {
                         Err(format!(
                             "{} responded with HTTP {} at fallback {}",
-                            crate::provider_cli_name(args.provider),
+                            provider_cli_name(args.provider),
                             health_resp.status(),
                             health_url
                         ))
@@ -84,7 +84,7 @@ pub(crate) async fn doctor_check(args: &DoctorArgs) -> Result<String, String> {
             }
         }
         ProviderKind::Ollama => {
-            let tags_url = crate::doctor_probe_urls(args.provider, &base_url)
+            let tags_url = doctor_probe_urls(args.provider, &base_url)
                 .into_iter()
                 .next()
                 .ok_or_else(|| "internal error building Ollama doctor URL".to_string())?;
@@ -124,6 +124,26 @@ pub(crate) fn default_base_url(provider: ProviderKind) -> &'static str {
         ProviderKind::Llamacpp => "http://localhost:8080/v1",
         ProviderKind::Ollama => "http://localhost:11434",
         ProviderKind::Mock => "mock://local",
+    }
+}
+
+pub(crate) fn provider_cli_name(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Lmstudio => "lmstudio",
+        ProviderKind::Llamacpp => "llamacpp",
+        ProviderKind::Ollama => "ollama",
+        ProviderKind::Mock => "mock",
+    }
+}
+
+pub(crate) fn doctor_probe_urls(provider: ProviderKind, base_url: &str) -> Vec<String> {
+    let trimmed = base_url.trim_end_matches('/').to_string();
+    match provider {
+        ProviderKind::Lmstudio | ProviderKind::Llamacpp => {
+            vec![format!("{trimmed}/models"), trimmed]
+        }
+        ProviderKind::Ollama => vec![format!("{trimmed}/api/tags")],
+        ProviderKind::Mock => vec![trimmed],
     }
 }
 

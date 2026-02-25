@@ -1473,9 +1473,9 @@ async fn main() -> anyhow::Result<()> {
                 return Err(anyhow!(
                     "{}\nHint: run `localagent doctor --provider {} --base-url {}`\nDefault base URL for {} is {}",
                     err,
-                    provider_cli_name(provider_kind),
+                    provider_runtime::provider_cli_name(provider_kind),
                     base_url,
-                    provider_cli_name(provider_kind),
+                    provider_runtime::provider_cli_name(provider_kind),
                     provider_runtime::default_base_url(provider_kind)
                 ));
             }
@@ -1503,9 +1503,9 @@ async fn main() -> anyhow::Result<()> {
                 return Err(anyhow!(
                     "{}\nHint: run `localagent doctor --provider {} --base-url {}`\nDefault base URL for {} is {}",
                     err,
-                    provider_cli_name(provider_kind),
+                    provider_runtime::provider_cli_name(provider_kind),
                     base_url,
-                    provider_cli_name(provider_kind),
+                    provider_runtime::provider_cli_name(provider_kind),
                     provider_runtime::default_base_url(provider_kind)
                 ));
             }
@@ -1602,7 +1602,7 @@ async fn run_chat_repl(
 
     println!(
         "LocalAgent chat started (provider={} model={} tui={}).",
-        provider_cli_name(provider_kind),
+        provider_runtime::provider_cli_name(provider_kind),
         model,
         chat.tui
     );
@@ -1775,9 +1775,9 @@ async fn run_chat_repl(
                     eprintln!(
                         "{}\nHint: run `localagent doctor --provider {} --base-url {}`\nDefault base URL for {} is {}",
                         err,
-                        provider_cli_name(provider_kind),
+                        provider_runtime::provider_cli_name(provider_kind),
                         base_url,
-                        provider_cli_name(provider_kind),
+                        provider_runtime::provider_cli_name(provider_kind),
                         provider_runtime::default_base_url(provider_kind)
                     );
                     if runtime_config::is_timeout_error_text(&err) && !timeout_notice_active {
@@ -1809,9 +1809,9 @@ async fn run_chat_repl(
                     eprintln!(
                         "{}\nHint: run `localagent doctor --provider {} --base-url {}`\nDefault base URL for {} is {}",
                         err,
-                        provider_cli_name(provider_kind),
+                        provider_runtime::provider_cli_name(provider_kind),
                         base_url,
-                        provider_cli_name(provider_kind),
+                        provider_runtime::provider_cli_name(provider_kind),
                         provider_runtime::default_base_url(provider_kind)
                     );
                     if runtime_config::is_timeout_error_text(&err) && !timeout_notice_active {
@@ -1918,7 +1918,7 @@ async fn run_chat_tui(
     let mut pending_params_input = false;
     let mut timeout_notice_active = false;
     let mut ui_state = UiState::new(max_logs);
-    ui_state.provider = provider_cli_name(provider_kind).to_string();
+    ui_state.provider = provider_runtime::provider_cli_name(provider_kind).to_string();
     ui_state.model = model.clone();
     ui_state.caps_source = format!("{:?}", base_run.caps).to_lowercase();
     ui_state.policy_hash = "-".to_string();
@@ -1954,7 +1954,7 @@ async fn run_chat_tui(
                 chat_ui::draw_chat_frame(
                     f,
                     chat_runtime::chat_mode_label(&active_run),
-                    provider_cli_name(provider_kind),
+                    provider_runtime::provider_cli_name(provider_kind),
                     provider_connected,
                     &model,
                     &status,
@@ -2459,7 +2459,7 @@ async fn run_chat_tui(
                                 chat_ui::draw_chat_frame(
                                     f,
                                     chat_runtime::chat_mode_label(&active_run),
-                                    provider_cli_name(provider_kind),
+                                    provider_runtime::provider_cli_name(provider_kind),
                                     provider_connected,
                                     &model,
                                     &status,
@@ -2902,7 +2902,7 @@ async fn run_chat_tui(
                                     chat_ui::draw_chat_frame(
                                         f,
                                         chat_runtime::chat_mode_label(&active_run),
-                                        provider_cli_name(provider_kind),
+                                        provider_runtime::provider_cli_name(provider_kind),
                                         provider_connected,
                                         &model,
                                         &status,
@@ -5630,26 +5630,6 @@ fn apply_eval_profile_overrides(
     Ok(Some(loaded))
 }
 
-fn provider_cli_name(provider: ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::Lmstudio => "lmstudio",
-        ProviderKind::Llamacpp => "llamacpp",
-        ProviderKind::Ollama => "ollama",
-        ProviderKind::Mock => "mock",
-    }
-}
-
-fn doctor_probe_urls(provider: ProviderKind, base_url: &str) -> Vec<String> {
-    let trimmed = base_url.trim_end_matches('/').to_string();
-    match provider {
-        ProviderKind::Lmstudio | ProviderKind::Llamacpp => {
-            vec![format!("{trimmed}/models"), trimmed]
-        }
-        ProviderKind::Ollama => vec![format!("{trimmed}/api/tags")],
-        ProviderKind::Mock => vec![trimmed],
-    }
-}
-
 fn handle_session_command(store: &SessionStore, cmd: &SessionSubcommand) -> anyhow::Result<()> {
     match cmd {
         SessionSubcommand::Info => {
@@ -5845,7 +5825,7 @@ mod tests {
 
     #[test]
     fn doctor_url_construction_openai_compat() {
-        let urls = doctor_probe_urls(ProviderKind::Lmstudio, "http://localhost:1234/v1/");
+        let urls = provider_runtime::doctor_probe_urls(ProviderKind::Lmstudio, "http://localhost:1234/v1/");
         assert_eq!(urls[0], "http://localhost:1234/v1/models");
         assert_eq!(urls[1], "http://localhost:1234/v1");
     }
@@ -6303,4 +6283,5 @@ rules:
         }
     }
 }
+
 
