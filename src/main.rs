@@ -43,6 +43,7 @@ mod planner;
 
 mod planner_runtime;
 
+mod operator_queue;
 mod packs;
 
 mod project_guidance;

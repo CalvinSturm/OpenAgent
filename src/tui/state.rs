@@ -640,6 +640,82 @@ impl UiState {
                     pack_id, truncated, bytes_kept
                 ));
             }
+            EventKind::QueueSubmitted => {
+                let queue_id = ev
+                    .data
+                    .get("queue_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("q?");
+                let kind = ev
+                    .data
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let truncated = ev
+                    .data
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let bytes_kept = ev
+                    .data
+                    .get("bytes_kept")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let boundary_phrase = ev
+                    .data
+                    .get("next_delivery")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                self.push_log(format!(
+                    "queue_submitted: id={} kind={} truncated={} bytes_kept={} next={}",
+                    queue_id, kind, truncated, bytes_kept, boundary_phrase
+                ));
+            }
+            EventKind::QueueDelivered => {
+                let queue_id = ev
+                    .data
+                    .get("queue_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("q?");
+                let kind = ev
+                    .data
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let boundary = ev
+                    .data
+                    .get("delivery_boundary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                self.push_log(format!(
+                    "queue_delivered: id={} kind={} boundary={}",
+                    queue_id, kind, boundary
+                ));
+            }
+            EventKind::QueueInterrupt => {
+                let queue_id = ev
+                    .data
+                    .get("queue_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("q?");
+                let reason = ev
+                    .data
+                    .get("cancelled_reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("operator_steer");
+                let cancelled_remaining_work = ev
+                    .data
+                    .get("cancelled_remaining_work")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.push_log(format!(
+                    "queue_interrupt: id={} cancelled_remaining_work={} reason={}",
+                    queue_id, cancelled_remaining_work, reason
+                ));
+                if cancelled_remaining_work {
+                    self.next_hint = "interrupt_applied".to_string();
+                }
+            }
             EventKind::Error => {
                 let msg = ev
                     .data
@@ -1363,5 +1439,47 @@ mod tests {
         ));
         assert_eq!(s.mcp_lifecycle, "CANCELLED");
         assert_eq!(s.next_hint, "cancelled");
+    }
+
+    #[test]
+    fn queue_events_log_stable_summaries() {
+        let mut s = UiState::new(50);
+        s.apply_event(&Event::new(
+            "r".to_string(),
+            1,
+            EventKind::QueueSubmitted,
+            serde_json::json!({
+                "queue_id":"q7",
+                "kind":"steer",
+                "truncated": false,
+                "bytes_kept": 12,
+                "next_delivery":"after current tool finishes"
+            }),
+        ));
+        s.apply_event(&Event::new(
+            "r".to_string(),
+            1,
+            EventKind::QueueDelivered,
+            serde_json::json!({
+                "queue_id":"q7",
+                "kind":"steer",
+                "delivery_boundary":"post_tool"
+            }),
+        ));
+        s.apply_event(&Event::new(
+            "r".to_string(),
+            1,
+            EventKind::QueueInterrupt,
+            serde_json::json!({
+                "queue_id":"q7",
+                "cancelled_remaining_work": true,
+                "cancelled_reason":"operator_steer"
+            }),
+        ));
+        let joined = s.logs.join("\n");
+        assert!(joined.contains("queue_submitted: id=q7 kind=steer"));
+        assert!(joined.contains("queue_delivered: id=q7 kind=steer boundary=post_tool"));
+        assert!(joined.contains("queue_interrupt: id=q7 cancelled_remaining_work=true"));
+        assert_eq!(s.next_hint, "interrupt_applied");
     }
 }

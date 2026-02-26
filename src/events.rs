@@ -46,6 +46,9 @@ pub enum EventKind {
     McpPinned,
     McpDrift,
     PackActivated,
+    QueueSubmitted,
+    QueueDelivered,
+    QueueInterrupt,
     Error,
 }
 
@@ -235,5 +238,23 @@ mod tests {
         );
         let s = serde_json::to_string(&ev).expect("serialize");
         assert!(s.contains("\"pack_activated\""));
+    }
+
+    #[test]
+    fn queue_event_kinds_serialize() {
+        for kind in [
+            EventKind::QueueSubmitted,
+            EventKind::QueueDelivered,
+            EventKind::QueueInterrupt,
+        ] {
+            let ev = Event::new(
+                "r".to_string(),
+                1,
+                kind,
+                serde_json::json!({"queue_id":"q1"}),
+            );
+            let s = serde_json::to_string(&ev).expect("serialize");
+            assert!(s.contains("\"queue_"));
+        }
     }
 }

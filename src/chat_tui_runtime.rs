@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
@@ -774,6 +775,9 @@ pub(crate) async fn run_chat_tui(
                             ui_tick = ui_tick.saturating_add(1);
 
                             let (tx, rx) = std::sync::mpsc::channel::<Event>();
+                            let (queue_tx, queue_rx) =
+                                std::sync::mpsc::channel::<crate::operator_queue::QueueSubmitRequest>();
+                            let mut queue_rx_opt = Some(queue_rx);
                             let mut turn_args = active_run.clone();
                             turn_args.prompt = Some(line.clone());
                             turn_args.tui = false;
@@ -829,6 +833,7 @@ pub(crate) async fn run_chat_tui(
                                         &turn_args,
                                         paths,
                                         Some(tx),
+                                        Some(queue_rx_opt.take().expect("queue rx once")),
                                         shared_chat_mcp_registry.clone(),
                                         true,
                                     ))
@@ -847,6 +852,7 @@ pub(crate) async fn run_chat_tui(
                                         &turn_args,
                                         paths,
                                         Some(tx),
+                                        Some(queue_rx_opt.take().expect("queue rx once")),
                                         shared_chat_mcp_registry.clone(),
                                         true,
                                     ))
@@ -862,16 +868,99 @@ pub(crate) async fn run_chat_tui(
                                         &turn_args,
                                         paths,
                                         Some(tx),
+                                        Some(queue_rx_opt.take().expect("queue rx once")),
                                         shared_chat_mcp_registry.clone(),
                                         true,
                                     ))
                                 }
                             };
 
+                            #[derive(Clone)]
+                            struct ActiveQueueRow {
+                                sequence_no: u64,
+                                kind: String,
+                                status: String,
+                                delivery_phrase: String,
+                            }
+
+                            let mut active_queue_rows: BTreeMap<String, ActiveQueueRow> =
+                                BTreeMap::new();
+
                             loop {
                                 ui_state.on_tick(Instant::now());
                                 while let Ok(ev) = rx.try_recv() {
                                     ui_state.apply_event(&ev);
+                                    match ev.kind {
+                                        EventKind::QueueSubmitted => {
+                                            if let Some(queue_id) =
+                                                ev.data.get("queue_id").and_then(|v| v.as_str())
+                                            {
+                                                let sequence_no = ev
+                                                    .data
+                                                    .get("sequence_no")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0);
+                                                let kind = ev
+                                                    .data
+                                                    .get("kind")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("unknown")
+                                                    .to_string();
+                                                let delivery_phrase = ev
+                                                    .data
+                                                    .get("next_delivery")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("pending")
+                                                    .to_string();
+                                                active_queue_rows.insert(
+                                                    queue_id.to_string(),
+                                                    ActiveQueueRow {
+                                                        sequence_no,
+                                                        kind,
+                                                        status: "pending".to_string(),
+                                                        delivery_phrase,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        EventKind::QueueDelivered => {
+                                            if let Some(queue_id) =
+                                                ev.data.get("queue_id").and_then(|v| v.as_str())
+                                            {
+                                                if let Some(row) = active_queue_rows.get_mut(queue_id)
+                                                {
+                                                    row.status = "delivered".to_string();
+                                                    row.delivery_phrase = match ev
+                                                        .data
+                                                        .get("delivery_boundary")
+                                                        .and_then(|v| v.as_str())
+                                                    {
+                                                        Some("post_tool") => {
+                                                            "after current tool finishes".to_string()
+                                                        }
+                                                        Some("post_step") => {
+                                                            "after current step finishes".to_string()
+                                                        }
+                                                        Some("turn_idle") => {
+                                                            "after this turn completes".to_string()
+                                                        }
+                                                        _ => "delivered".to_string(),
+                                                    };
+                                                }
+                                            }
+                                        }
+                                        EventKind::QueueInterrupt => {
+                                            if let Some(queue_id) =
+                                                ev.data.get("queue_id").and_then(|v| v.as_str())
+                                            {
+                                                if let Some(row) = active_queue_rows.get_mut(queue_id)
+                                                {
+                                                    row.status = "interrupted".to_string();
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                     match ev.kind {
                                         EventKind::ModelDelta => {
                                             if let Some(d) = ev.data.get("delta").and_then(|v| v.as_str()) {
@@ -1155,6 +1244,88 @@ pub(crate) async fn run_chat_tui(
                                                         }
                                                         let _ =
                                                             ui_state.refresh_approvals(&paths.approvals_path);
+                                                    }
+                                                }
+                                                KeyCode::Enter => {
+                                                    let line = input.trim().to_string();
+                                                    if let Some(rest) = line.strip_prefix("/interrupt ") {
+                                                        let msg = rest.trim();
+                                                        if msg.is_empty() {
+                                                            logs.push("usage: /interrupt <message>".to_string());
+                                                        } else {
+                                                            let req = crate::operator_queue::QueueSubmitRequest {
+                                                                kind: crate::operator_queue::QueueMessageKind::Steer,
+                                                                content: msg.to_string(),
+                                                            };
+                                                            match queue_tx.send(req) {
+                                                                Ok(_) => logs.push(
+                                                                    "queued Interrupt: will apply after current tool finishes".to_string()
+                                                                ),
+                                                                Err(_) => logs.push(
+                                                                    "queue unavailable: run is ending".to_string()
+                                                                ),
+                                                            }
+                                                            input.clear();
+                                                            slash_menu_index = 0;
+                                                        }
+                                                    } else if let Some(rest) = line.strip_prefix("/next ") {
+                                                        let msg = rest.trim();
+                                                        if msg.is_empty() {
+                                                            logs.push("usage: /next <message>".to_string());
+                                                        } else {
+                                                            let req = crate::operator_queue::QueueSubmitRequest {
+                                                                kind: crate::operator_queue::QueueMessageKind::FollowUp,
+                                                                content: msg.to_string(),
+                                                            };
+                                                            match queue_tx.send(req) {
+                                                                Ok(_) => logs.push(
+                                                                    "queued Next: will apply after this turn completes".to_string()
+                                                                ),
+                                                                Err(_) => logs.push(
+                                                                    "queue unavailable: run is ending".to_string()
+                                                                ),
+                                                            }
+                                                            input.clear();
+                                                            slash_menu_index = 0;
+                                                        }
+                                                    } else if line == "/queue" {
+                                                        let mut rows = active_queue_rows
+                                                            .iter()
+                                                            .map(|(id, row)| {
+                                                                (
+                                                                    row.sequence_no,
+                                                                    id.clone(),
+                                                                    row.kind.clone(),
+                                                                    row.status.clone(),
+                                                                    row.delivery_phrase.clone(),
+                                                                )
+                                                            })
+                                                            .collect::<Vec<_>>();
+                                                        rows.sort_by(|a, b| {
+                                                            a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1))
+                                                        });
+                                                        if rows.is_empty() {
+                                                            logs.push("queue: empty".to_string());
+                                                        } else {
+                                                            logs.push(format!(
+                                                                "queue: {} item(s)",
+                                                                rows.len()
+                                                            ));
+                                                            for (seq, id, kind, status_row, when) in
+                                                                rows.into_iter().take(8)
+                                                            {
+                                                                let label = match kind.as_str() {
+                                                                    "steer" => "Interrupt",
+                                                                    "follow_up" => "Next",
+                                                                    _ => "Unknown",
+                                                                };
+                                                                logs.push(format!(
+                                                                    "  #{seq} {label} [{status_row}] id={id} ({when})"
+                                                                ));
+                                                            }
+                                                        }
+                                                        input.clear();
+                                                        slash_menu_index = 0;
                                                     }
                                                 }
                                                 _ => {}

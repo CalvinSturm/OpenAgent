@@ -253,6 +253,9 @@ fn make_agent_with_mcp<P: ModelProvider + 'static>(
         plan_step_constraints: Vec::<PlanStepConstraint>::new(),
         tool_call_budget: ToolCallBudget::default(),
         mcp_runtime_trace: Vec::new(),
+        operator_queue: localagent::operator_queue::PendingMessageQueue::default(),
+        operator_queue_limits: localagent::operator_queue::QueueLimits::default(),
+        operator_queue_rx: None,
     }
 }
 

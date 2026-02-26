@@ -29,6 +29,17 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/tool docs mcp.stub.echo",
         "show MCP tool docs from local registry snapshot",
     ),
+    ("/interrupt", "queue Interrupt for active run"),
+    (
+        "/interrupt fix course after tool finishes",
+        "queue Interrupt message (applies after current tool finishes)",
+    ),
+    ("/next", "queue Next message for active run"),
+    (
+        "/next continue after this turn",
+        "queue Next message (applies after this turn completes)",
+    ),
+    ("/queue", "show queue support/status"),
     ("/clear", "clear transcript (and session if enabled)"),
     ("/exit", "exit chat"),
     ("/hide tools", "hide tools pane"),
@@ -137,6 +148,9 @@ pub(crate) fn keybinds_overlay_text() -> Option<String> {
             "/tool docs <name>",
             "show tool docs from local registry snapshot",
         ),
+        ("/interrupt <msg>", "queue Interrupt (active run only)"),
+        ("/next <msg>", "queue Next (active run only)"),
+        ("/queue", "show queue support/status"),
         ("/...", "slash commands dropdown"),
         ("?", "show this keybinds panel"),
     ];

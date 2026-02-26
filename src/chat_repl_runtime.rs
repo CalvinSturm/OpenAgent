@@ -50,7 +50,7 @@ pub(crate) async fn run_chat_repl(
         chat.tui
     );
     println!(
-        "Commands: /help, /mode <safe|coding|web|custom>, /timeout [seconds|+N|-N|off], /params [key value], /project guidance, /tool docs <name>, /dismiss, /exit, /clear"
+        "Commands: /help, /mode <safe|coding|web|custom>, /timeout [seconds|+N|-N|off], /params [key value], /project guidance, /tool docs <name>, /interrupt <msg>, /next <msg>, /queue, /dismiss, /exit, /clear"
     );
 
     loop {
@@ -115,6 +115,11 @@ pub(crate) async fn run_chat_repl(
                     println!("/params <key> <value>  set a tuning param");
                     println!("/project guidance  show resolved AGENTS.md guidance snapshot");
                     println!("/tool docs <name>  show tool docs from local MCP registry snapshot");
+                    println!(
+                        "/interrupt <msg>  queue Interrupt (TUI active-run only in this version)"
+                    );
+                    println!("/next <msg>  queue Next (TUI active-run only in this version)");
+                    println!("/queue  show queue support status");
                     println!("/dismiss  dismiss timeout notification");
                     println!("/clear clear current session messages");
                     println!("/exit  quit chat");
@@ -157,6 +162,11 @@ pub(crate) async fn run_chat_repl(
                         Ok(g) => println!("{}", project_guidance::render_project_guidance_text(&g)),
                         Err(e) => println!("project guidance unavailable: {e}"),
                     }
+                }
+                "/queue" => {
+                    println!(
+                        "queue commands are available in TUI during an active run in this version"
+                    );
                 }
                 "/clear" => {
                     if active_run.no_session {
@@ -227,6 +237,9 @@ pub(crate) async fn run_chat_repl(
                     } else {
                         println!("MCP registry unavailable: failed to initialize");
                     }
+                }
+                _ if input.starts_with("/interrupt ") || input.starts_with("/next ") => {
+                    println!("queue commands are currently supported in TUI during an active run");
                 }
                 _ => println!("unknown command: {input}"),
             }

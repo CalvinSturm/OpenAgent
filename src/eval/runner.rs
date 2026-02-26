@@ -1095,6 +1095,9 @@ async fn run_single(
             max_browser_calls: 0,
         },
         mcp_runtime_trace: Vec::new(),
+        operator_queue: crate::operator_queue::PendingMessageQueue::default(),
+        operator_queue_limits: crate::operator_queue::QueueLimits::default(),
+        operator_queue_rx: None,
     };
     let session_messages = Vec::new();
     let outcome = agent.run(&prompt, session_messages, Vec::new()).await;

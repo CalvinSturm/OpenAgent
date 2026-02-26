@@ -59,6 +59,7 @@ pub(crate) async fn run_agent<P: ModelProvider>(
         paths,
         None,
         None,
+        None,
         false,
     )
     .await
@@ -74,6 +75,9 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
     args: &RunArgs,
     paths: &store::StatePaths,
     external_ui_tx: Option<Sender<Event>>,
+    external_operator_queue_rx: Option<
+        std::sync::mpsc::Receiver<crate::operator_queue::QueueSubmitRequest>,
+    >,
     shared_mcp_registry: Option<std::sync::Arc<McpRegistry>>,
     suppress_stdout_stream: bool,
 ) -> anyhow::Result<RunExecutionResult> {
@@ -817,6 +821,9 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
             max_browser_calls: args.max_browser_calls,
         },
         mcp_runtime_trace: Vec::new(),
+        operator_queue: crate::operator_queue::PendingMessageQueue::default(),
+        operator_queue_limits: crate::operator_queue::QueueLimits::default(),
+        operator_queue_rx: external_operator_queue_rx,
     };
 
     let base_instruction_messages = instruction_resolution.messages.clone();

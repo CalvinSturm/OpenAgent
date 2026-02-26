@@ -8,6 +8,10 @@ use crate::hooks::protocol::{
 };
 use crate::hooks::runner::{make_pre_model_input, make_tool_result_input, HookManager};
 use crate::mcp::registry::McpRegistry;
+use crate::operator_queue::{
+    DeliveryBoundary, PendingMessageQueue, QueueLimits, QueueMessageKind, QueueSubmitRequest,
+    QueuedOperatorMessage,
+};
 use crate::providers::http::{message_short, ProviderError};
 use crate::providers::{ModelProvider, StreamDelta};
 use crate::taint::{digest_prefix_hex, TaintMode, TaintSpan, TaintState, TaintToggle};
@@ -273,6 +277,10 @@ pub struct Agent<P: ModelProvider> {
     pub plan_step_constraints: Vec<PlanStepConstraint>,
     pub tool_call_budget: ToolCallBudget,
     pub mcp_runtime_trace: Vec<McpRuntimeTraceEntry>,
+    pub operator_queue: PendingMessageQueue,
+    #[allow(dead_code)]
+    pub operator_queue_limits: QueueLimits,
+    pub operator_queue_rx: Option<std::sync::mpsc::Receiver<QueueSubmitRequest>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -386,6 +394,48 @@ fn check_and_consume_mcp_budget(
 }
 
 impl<P: ModelProvider> Agent<P> {
+    #[allow(dead_code)]
+    pub fn queue_operator_message(
+        &mut self,
+        kind: QueueMessageKind,
+        content: &str,
+    ) -> QueuedOperatorMessage {
+        let submitted = self
+            .operator_queue
+            .submit(kind, content, &self.operator_queue_limits)
+            .queued;
+        if let Some(run_id) = self.gate_ctx.run_id.clone() {
+            self.emit_event(
+                &run_id,
+                0,
+                EventKind::QueueSubmitted,
+                serde_json::json!({
+                    "queue_id": submitted.queue_id,
+                    "sequence_no": submitted.sequence_no,
+                    "kind": submitted.kind,
+                    "truncated": submitted.truncated,
+                    "bytes_kept": submitted.bytes_kept,
+                    "bytes_loaded": submitted.bytes_loaded,
+                    "next_delivery": match submitted.kind {
+                        QueueMessageKind::Steer => DeliveryBoundary::PostTool.user_phrase(),
+                        QueueMessageKind::FollowUp => DeliveryBoundary::TurnIdle.user_phrase(),
+                    }
+                }),
+            );
+        }
+        submitted
+    }
+
+    #[allow(dead_code)]
+    pub fn pending_operator_messages(&self) -> &[QueuedOperatorMessage] {
+        self.operator_queue.pending()
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_operator_queue(&mut self) {
+        self.operator_queue.clear();
+    }
+
     fn emit_event(&mut self, run_id: &str, step: u32, kind: EventKind, data: serde_json::Value) {
         self.capture_mcp_runtime_trace(step, &kind, &data);
         if let Some(sink) = &mut self.event_sink {
@@ -468,7 +518,92 @@ impl<P: ModelProvider> Agent<P> {
             EventKind::McpPinned => push("pinned"),
             EventKind::McpDrift => push("drift"),
             EventKind::PackActivated => push("pack"),
+            EventKind::QueueSubmitted => push("queue_submitted"),
+            EventKind::QueueDelivered => push("queue_delivered"),
+            EventKind::QueueInterrupt => push("queue_interrupt"),
             _ => {}
+        }
+    }
+
+    fn deliver_operator_queue_at_boundary(
+        &mut self,
+        run_id: &str,
+        step: u32,
+        boundary: DeliveryBoundary,
+        messages: &mut Vec<Message>,
+    ) -> (bool, bool) {
+        let Some(delivery) = self.operator_queue.deliver_at_boundary(boundary) else {
+            return (false, false);
+        };
+        self.emit_event(
+            run_id,
+            step,
+            EventKind::QueueDelivered,
+            serde_json::json!({
+                "queue_id": delivery.message.queue_id,
+                "sequence_no": delivery.message.sequence_no,
+                "kind": delivery.message.kind,
+                "truncated": delivery.message.truncated,
+                "bytes_kept": delivery.message.bytes_kept,
+                "bytes_loaded": delivery.message.bytes_loaded,
+                "delivery_boundary": delivery.delivery_boundary,
+            }),
+        );
+        messages.push(Message {
+            role: Role::User,
+            content: Some(delivery.message.content.clone()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        });
+        if delivery.cancelled_remaining_work {
+            self.emit_event(
+                run_id,
+                step,
+                EventKind::QueueInterrupt,
+                serde_json::json!({
+                    "queue_id": delivery.message.queue_id,
+                    "sequence_no": delivery.message.sequence_no,
+                    "kind": delivery.message.kind,
+                    "delivery_boundary": delivery.delivery_boundary,
+                    "cancelled_remaining_work": true,
+                    "cancelled_reason": delivery.cancelled_reason.unwrap_or("operator_steer"),
+                }),
+            );
+            return (true, true);
+        }
+        (true, false)
+    }
+
+    fn drain_external_operator_queue(&mut self, run_id: &str, step: u32) {
+        let mut drained = Vec::new();
+        if let Some(rx) = &self.operator_queue_rx {
+            while let Ok(req) = rx.try_recv() {
+                drained.push(req);
+            }
+        }
+        for req in drained {
+            let submitted = self
+                .operator_queue
+                .submit(req.kind, &req.content, &self.operator_queue_limits)
+                .queued;
+            self.emit_event(
+                run_id,
+                step,
+                EventKind::QueueSubmitted,
+                serde_json::json!({
+                    "queue_id": submitted.queue_id,
+                    "sequence_no": submitted.sequence_no,
+                    "kind": submitted.kind,
+                    "truncated": submitted.truncated,
+                    "bytes_kept": submitted.bytes_kept,
+                    "bytes_loaded": submitted.bytes_loaded,
+                    "next_delivery": match submitted.kind {
+                        QueueMessageKind::Steer => DeliveryBoundary::PostTool.user_phrase(),
+                        QueueMessageKind::FollowUp => DeliveryBoundary::TurnIdle.user_phrase(),
+                    }
+                }),
+            );
         }
     }
 
@@ -562,6 +697,7 @@ impl<P: ModelProvider> Agent<P> {
         let allowed_tool_names: std::collections::BTreeSet<String> =
             self.tools.iter().map(|t| t.name.clone()).collect();
         'agent_steps: for step in 0..self.max_steps {
+            self.drain_external_operator_queue(&run_id, step as u32);
             if self.tool_call_budget.max_wall_time_ms > 0 {
                 let elapsed_ms = run_started.elapsed().as_millis() as u64;
                 if elapsed_ms > self.tool_call_budget.max_wall_time_ms {
@@ -1806,6 +1942,15 @@ impl<P: ModelProvider> Agent<P> {
                     });
                     continue;
                 }
+                let (queue_delivered, queue_interrupted) = self.deliver_operator_queue_at_boundary(
+                    &run_id,
+                    step as u32,
+                    DeliveryBoundary::TurnIdle,
+                    &mut messages,
+                );
+                if queue_interrupted || queue_delivered {
+                    continue 'agent_steps;
+                }
                 self.emit_event(
                     &run_id,
                     step as u32,
@@ -2561,6 +2706,16 @@ impl<P: ModelProvider> Agent<P> {
                             }),
                         );
                         messages.push(tool_msg);
+                        self.drain_external_operator_queue(&run_id, step as u32);
+                        let (_, queue_interrupted) = self.deliver_operator_queue_at_boundary(
+                            &run_id,
+                            step as u32,
+                            DeliveryBoundary::PostTool,
+                            &mut messages,
+                        );
+                        if queue_interrupted {
+                            continue 'agent_steps;
+                        }
                         messages.push(schema_repair_instruction_message(tc, err));
                         continue 'agent_steps;
                     }
@@ -2715,6 +2870,16 @@ impl<P: ModelProvider> Agent<P> {
                                     docker: None,
                                 },
                             )));
+                            self.drain_external_operator_queue(&run_id, step as u32);
+                            let (_, queue_interrupted) = self.deliver_operator_queue_at_boundary(
+                                &run_id,
+                                step as u32,
+                                DeliveryBoundary::PostTool,
+                                &mut messages,
+                            );
+                            if queue_interrupted {
+                                continue 'agent_steps;
+                            }
                             continue;
                         }
                         PlanToolEnforcementMode::Hard => {
@@ -3561,6 +3726,16 @@ impl<P: ModelProvider> Agent<P> {
                             }),
                         );
                         messages.push(tool_msg);
+                        self.drain_external_operator_queue(&run_id, step as u32);
+                        let (_, queue_interrupted) = self.deliver_operator_queue_at_boundary(
+                            &run_id,
+                            step as u32,
+                            DeliveryBoundary::PostTool,
+                            &mut messages,
+                        );
+                        if queue_interrupted {
+                            continue 'agent_steps;
+                        }
                     }
                     GateDecision::Deny {
                         reason,
@@ -3792,6 +3967,16 @@ impl<P: ModelProvider> Agent<P> {
                                 }),
                             );
                             messages.push(tool_msg);
+                            self.drain_external_operator_queue(&run_id, step as u32);
+                            let (_, queue_interrupted) = self.deliver_operator_queue_at_boundary(
+                                &run_id,
+                                step as u32,
+                                DeliveryBoundary::PostTool,
+                                &mut messages,
+                            );
+                            if queue_interrupted {
+                                continue 'agent_steps;
+                            }
                             continue;
                         }
                         self.emit_event(
@@ -4589,6 +4774,7 @@ mod tests {
     use crate::gate::{ApprovalMode, AutoApproveScope, GateContext, NoGate, ProviderKind};
     use crate::hooks::config::HooksMode;
     use crate::hooks::runner::{HookManager, HookRuntimeConfig};
+    use crate::operator_queue::{PendingMessageQueue, QueueLimits, QueueMessageKind};
     use crate::providers::{ModelProvider, StreamDelta};
     use crate::target::{ExecTargetKind, HostTarget};
     use crate::tools::{ToolArgsStrict, ToolRuntime};
@@ -4718,6 +4904,9 @@ mod tests {
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert_eq!(out.final_output, "done");
@@ -4804,6 +4993,9 @@ mod tests {
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let mem_msg = Message {
             role: Role::Developer,
@@ -5070,6 +5262,75 @@ mod tests {
                         arguments: serde_json::json!({"path":"a.txt"}),
                     },
                 ],
+                usage: None,
+            })
+        }
+    }
+
+    struct DualThenDoneProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for DualThenDoneProvider {
+        async fn generate(&self, _req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(GenerateResponse {
+                    assistant: Message {
+                        role: Role::Assistant,
+                        content: Some(String::new()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    },
+                    tool_calls: vec![
+                        crate::types::ToolCall {
+                            id: "tc1".to_string(),
+                            name: "read_file".to_string(),
+                            arguments: serde_json::json!({"path":"a.txt"}),
+                        },
+                        crate::types::ToolCall {
+                            id: "tc2".to_string(),
+                            name: "read_file".to_string(),
+                            arguments: serde_json::json!({"path":"a.txt"}),
+                        },
+                    ],
+                    usage: None,
+                })
+            } else {
+                Ok(GenerateResponse {
+                    assistant: Message {
+                        role: Role::Assistant,
+                        content: Some("done".to_string()),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_calls: None,
+                    },
+                    tool_calls: Vec::new(),
+                    usage: None,
+                })
+            }
+        }
+    }
+
+    struct CountingNoToolProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingNoToolProvider {
+        async fn generate(&self, _req: GenerateRequest) -> anyhow::Result<GenerateResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(GenerateResponse {
+                assistant: Message {
+                    role: Role::Assistant,
+                    content: Some("done".to_string()),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+                tool_calls: Vec::new(),
                 usage: None,
             })
         }
@@ -5356,6 +5617,9 @@ mod tests {
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert_eq!(out.final_output, "done");
@@ -5455,6 +5719,9 @@ mod tests {
             }],
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert!(matches!(out.exit_reason, AgentExitReason::Denied));
@@ -5463,6 +5730,232 @@ mod tests {
             .tool_decisions
             .iter()
             .any(|d| d.source.as_deref() == Some("plan_step_constraint")));
+    }
+
+    #[tokio::test]
+    async fn operator_interrupt_delivers_post_tool_and_cancels_remaining_turn_work() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        tokio::fs::write(tmp.path().join("a.txt"), "x")
+            .await
+            .expect("write");
+        let events = Arc::new(Mutex::new(Vec::<crate::events::Event>::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = DualThenDoneProvider {
+            calls: calls.clone(),
+        };
+        let mut agent = Agent {
+            provider,
+            model: "m".to_string(),
+            tools: vec![crate::types::ToolDef {
+                name: "read_file".to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+                side_effects: crate::types::SideEffects::FilesystemRead,
+            }],
+            max_steps: 4,
+            tool_rt: ToolRuntime {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_shell_in_workdir_only: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: tmp.path().to_path_buf(),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: None,
+                taint_enabled: false,
+                taint_mode: crate::taint::TaintMode::Propagate,
+                taint_overall: crate::taint::TaintLevel::Clean,
+                taint_sources: Vec::new(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: Some(Box::new(EventCaptureSink {
+                events: events.clone(),
+            })),
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            policy_for_taint: None,
+            taint_toggle: crate::taint::TaintToggle::Off,
+            taint_mode: crate::taint::TaintMode::Propagate,
+            taint_digest_bytes: 4096,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
+            plan_step_constraints: Vec::new(),
+            tool_call_budget: ToolCallBudget::default(),
+            mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
+        };
+        let _ = agent.queue_operator_message(QueueMessageKind::Steer, "interrupt now");
+        let out = agent.run("hi", vec![], Vec::new()).await;
+        assert!(matches!(out.exit_reason, AgentExitReason::Ok));
+        assert_eq!(out.final_output, "done");
+        // second tool in first response should be skipped due to interrupt-after-post_tool
+        assert_eq!(out.tool_calls.iter().filter(|t| t.id == "tc2").count(), 0);
+        let evs = events.lock().expect("lock");
+        let kinds = evs
+            .iter()
+            .map(|e| format!("{:?}", e.kind))
+            .collect::<Vec<_>>();
+        assert!(kinds.iter().any(|k| k == "QueueDelivered"));
+        assert!(kinds.iter().any(|k| k == "QueueInterrupt"));
+        let delivered = evs
+            .iter()
+            .find(|e| matches!(e.kind, crate::events::EventKind::QueueDelivered))
+            .expect("queue delivered");
+        assert_eq!(
+            delivered
+                .data
+                .get("delivery_boundary")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            "post_tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_next_delivers_at_turn_idle_without_interrupt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::<crate::events::Event>::new()));
+        let provider = CountingNoToolProvider {
+            calls: calls.clone(),
+        };
+        let mut agent = Agent {
+            provider,
+            model: "m".to_string(),
+            tools: Vec::new(),
+            max_steps: 4,
+            tool_rt: ToolRuntime {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_shell_in_workdir_only: false,
+                allow_write: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                unsafe_bypass_allow_flags: false,
+                tool_args_strict: ToolArgsStrict::On,
+                exec_target_kind: ExecTargetKind::Host,
+                exec_target: std::sync::Arc::new(HostTarget),
+            },
+            gate: Box::new(NoGate::new()),
+            gate_ctx: GateContext {
+                workdir: std::env::current_dir().expect("cwd"),
+                allow_shell: false,
+                allow_write: false,
+                approval_mode: ApprovalMode::Interrupt,
+                auto_approve_scope: AutoApproveScope::Run,
+                unsafe_mode: false,
+                unsafe_bypass_allow_flags: false,
+                run_id: None,
+                enable_write_tools: false,
+                max_tool_output_bytes: 200_000,
+                max_read_bytes: 200_000,
+                provider: ProviderKind::Ollama,
+                model: "m".to_string(),
+                exec_target: ExecTargetKind::Host,
+                approval_key_version: crate::gate::ApprovalKeyVersion::V1,
+                tool_schema_hashes: std::collections::BTreeMap::new(),
+                hooks_config_hash_hex: None,
+                planner_hash_hex: None,
+                taint_enabled: false,
+                taint_mode: crate::taint::TaintMode::Propagate,
+                taint_overall: crate::taint::TaintLevel::Clean,
+                taint_sources: Vec::new(),
+            },
+            mcp_registry: None,
+            stream: false,
+            event_sink: Some(Box::new(EventCaptureSink {
+                events: events.clone(),
+            })),
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 20,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            hooks: HookManager::build(HookRuntimeConfig {
+                mode: HooksMode::Off,
+                config_path: std::env::temp_dir().join("unused_hooks.yaml"),
+                strict: false,
+                timeout_ms: 1000,
+                max_stdout_bytes: 200_000,
+            })
+            .expect("hooks"),
+            policy_loaded: None,
+            policy_for_taint: None,
+            taint_toggle: crate::taint::TaintToggle::Off,
+            taint_mode: crate::taint::TaintMode::Propagate,
+            taint_digest_bytes: 4096,
+            run_id_override: None,
+            omit_tools_field_when_empty: false,
+            plan_tool_enforcement: PlanToolEnforcementMode::Off,
+            mcp_pin_enforcement: McpPinEnforcementMode::Hard,
+            plan_step_constraints: Vec::new(),
+            tool_call_budget: ToolCallBudget::default(),
+            mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
+        };
+        let _ = agent.queue_operator_message(QueueMessageKind::FollowUp, "next message");
+        let out = agent.run("hi", vec![], Vec::new()).await;
+        assert!(matches!(out.exit_reason, AgentExitReason::Ok));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let evs = events.lock().expect("lock");
+        let delivered = evs
+            .iter()
+            .find(|e| matches!(e.kind, crate::events::EventKind::QueueDelivered))
+            .expect("queue delivered");
+        assert_eq!(
+            delivered
+                .data
+                .get("delivery_boundary")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            "turn_idle"
+        );
+        assert!(!evs
+            .iter()
+            .any(|e| matches!(e.kind, crate::events::EventKind::QueueInterrupt)));
     }
 
     #[tokio::test]
@@ -5546,6 +6039,9 @@ mod tests {
             }],
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert!(matches!(out.exit_reason, AgentExitReason::PlannerError));
@@ -5637,6 +6133,9 @@ mod tests {
             }],
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert!(matches!(out.exit_reason, AgentExitReason::PlannerError));
@@ -5734,6 +6233,9 @@ mod tests {
                 ..ToolCallBudget::default()
             },
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert!(matches!(out.exit_reason, AgentExitReason::BudgetExceeded));
@@ -5827,6 +6329,9 @@ mod tests {
             }],
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert!(matches!(out.exit_reason, AgentExitReason::Ok));
@@ -5926,6 +6431,9 @@ mod tests {
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert!(matches!(out.exit_reason, AgentExitReason::Ok));
@@ -6029,6 +6537,9 @@ mod tests {
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert!(
@@ -6130,6 +6641,9 @@ mod tests {
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert!(
@@ -6234,6 +6748,9 @@ mod tests {
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent
             .run(
@@ -6330,6 +6847,9 @@ mod tests {
             plan_step_constraints: Vec::new(),
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent
             .run(
@@ -6435,6 +6955,9 @@ mod tests {
             ],
             tool_call_budget: ToolCallBudget::default(),
             mcp_runtime_trace: Vec::new(),
+            operator_queue: PendingMessageQueue::default(),
+            operator_queue_limits: QueueLimits::default(),
+            operator_queue_rx: None,
         };
         let out = agent.run("hi", vec![], Vec::new()).await;
         assert!(matches!(out.exit_reason, AgentExitReason::PlannerError));

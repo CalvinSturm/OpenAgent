@@ -10,6 +10,7 @@ pub mod gate;
 pub mod hooks;
 pub mod instructions;
 pub mod mcp;
+pub mod operator_queue;
 pub mod packs;
 pub mod planner;
 pub mod project_guidance;
