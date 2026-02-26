@@ -298,6 +298,37 @@ impl<P: ModelProvider> Agent<P> {
         )
     }
 
+    fn emit_plan_step_started_if_needed(
+        &mut self,
+        run_id: &str,
+        step: u32,
+        active_plan_step_idx: usize,
+        announced_plan_step_id: &mut Option<String>,
+    ) {
+        if matches!(self.plan_tool_enforcement, PlanToolEnforcementMode::Off)
+            || self.plan_step_constraints.is_empty()
+            || active_plan_step_idx >= self.plan_step_constraints.len()
+        {
+            return;
+        }
+        let step_constraint = self.plan_step_constraints[active_plan_step_idx].clone();
+        if announced_plan_step_id.as_deref() == Some(step_constraint.step_id.as_str()) {
+            return;
+        }
+        self.emit_event(
+            run_id,
+            step,
+            EventKind::StepStarted,
+            serde_json::json!({
+                "step_id": step_constraint.step_id,
+                "step_index": active_plan_step_idx,
+                "allowed_tools": step_constraint.intended_tools,
+                "enforcement_mode": format!("{:?}", self.plan_tool_enforcement).to_lowercase()
+            }),
+        );
+        *announced_plan_step_id = Some(step_constraint.step_id.clone());
+    }
+
     #[allow(dead_code)]
     pub fn queue_operator_message(
         &mut self,
@@ -439,26 +470,12 @@ impl<P: ModelProvider> Agent<P> {
                     };
                 }
             }
-            if !matches!(self.plan_tool_enforcement, PlanToolEnforcementMode::Off)
-                && !self.plan_step_constraints.is_empty()
-                && active_plan_step_idx < self.plan_step_constraints.len()
-            {
-                let step_constraint = self.plan_step_constraints[active_plan_step_idx].clone();
-                if announced_plan_step_id.as_deref() != Some(step_constraint.step_id.as_str()) {
-                    self.emit_event(
-                        &run_id,
-                        step as u32,
-                        EventKind::StepStarted,
-                        serde_json::json!({
-                            "step_id": step_constraint.step_id,
-                            "step_index": active_plan_step_idx,
-                            "allowed_tools": step_constraint.intended_tools,
-                            "enforcement_mode": format!("{:?}", self.plan_tool_enforcement).to_lowercase()
-                        }),
-                    );
-                    announced_plan_step_id = Some(step_constraint.step_id.clone());
-                }
-            }
+            self.emit_plan_step_started_if_needed(
+                &run_id,
+                step as u32,
+                active_plan_step_idx,
+                &mut announced_plan_step_id,
+            );
             let compacted = match maybe_compact(&messages, &self.compaction_settings) {
                 Ok(c) => c,
                 Err(e) => {
