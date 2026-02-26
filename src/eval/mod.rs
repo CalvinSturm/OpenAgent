@@ -8,3 +8,4 @@ pub mod profile;
 pub mod report_compare;
 pub mod runner;
 pub mod tasks;
+pub mod types;
