@@ -53,6 +53,601 @@ struct TuiSubmitLaunch {
     fut: TuiRunFuture,
 }
 
+#[derive(Clone)]
+struct ActiveQueueRow {
+    sequence_no: u64,
+    kind: String,
+    status: String,
+    delivery_phrase: String,
+}
+
+struct TuiActiveTurnLoopInput<'a> {
+    terminal: &'a mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    fut: TuiRunFuture,
+    rx: std::sync::mpsc::Receiver<Event>,
+    queue_tx: std::sync::mpsc::Sender<crate::operator_queue::QueueSubmitRequest>,
+    ui_state: &'a mut UiState,
+    paths: &'a store::StatePaths,
+    active_run: &'a RunArgs,
+    base_run: &'a RunArgs,
+    provider_kind: ProviderKind,
+    provider_connected: &'a mut bool,
+    model: &'a str,
+    cwd_label: &'a str,
+    input: &'a mut String,
+    logs: &'a mut Vec<String>,
+    transcript: &'a mut Vec<(String, String)>,
+    streaming_assistant: &'a mut String,
+    status: &'a mut String,
+    status_detail: &'a mut String,
+    think_tick: &'a mut u64,
+    ui_tick: &'a mut u64,
+    approvals_selected: &'a mut usize,
+    show_tools: &'a mut bool,
+    show_approvals: &'a mut bool,
+    show_logs: &'a mut bool,
+    timeout_notice_active: &'a mut bool,
+    transcript_scroll: &'a mut usize,
+    follow_output: &'a mut bool,
+    compact_tools: bool,
+    tools_selected: &'a mut usize,
+    tools_focus: &'a mut bool,
+    show_tool_details: &'a mut bool,
+    show_banner: bool,
+    palette_open: bool,
+    palette_items: &'a [&'a str],
+    palette_selected: usize,
+    search_mode: bool,
+    search_query: &'a str,
+    slash_menu_index: &'a mut usize,
+}
+
+async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow::Result<()> {
+    let TuiActiveTurnLoopInput {
+        terminal,
+        mut fut,
+        rx,
+        queue_tx,
+        ui_state,
+        paths,
+        active_run,
+        base_run,
+        provider_kind,
+        provider_connected,
+        model,
+        cwd_label,
+        input: input_buf,
+        logs,
+        transcript,
+        streaming_assistant,
+        status,
+        status_detail,
+        think_tick,
+        ui_tick,
+        approvals_selected,
+        show_tools,
+        show_approvals,
+        show_logs,
+        timeout_notice_active,
+        transcript_scroll,
+        follow_output,
+        compact_tools,
+        tools_selected,
+        tools_focus,
+        show_tool_details,
+        show_banner,
+        palette_open,
+        palette_items,
+        palette_selected,
+        search_mode,
+        search_query,
+        slash_menu_index,
+    } = input;
+
+    let tool_row_count = if compact_tools { 20 } else { 12 };
+    let mut active_queue_rows: BTreeMap<String, ActiveQueueRow> = BTreeMap::new();
+
+    loop {
+        ui_state.on_tick(Instant::now());
+        while let Ok(ev) = rx.try_recv() {
+            ui_state.apply_event(&ev);
+            match ev.kind {
+                EventKind::QueueSubmitted => {
+                    if let Some(queue_id) = ev.data.get("queue_id").and_then(|v| v.as_str()) {
+                        let sequence_no = ev
+                            .data
+                            .get("sequence_no")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let kind = ev
+                            .data
+                            .get("kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let delivery_phrase = ev
+                            .data
+                            .get("next_delivery")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("pending")
+                            .to_string();
+                        active_queue_rows.insert(
+                            queue_id.to_string(),
+                            ActiveQueueRow {
+                                sequence_no,
+                                kind,
+                                status: "pending".to_string(),
+                                delivery_phrase,
+                            },
+                        );
+                    }
+                }
+                EventKind::QueueDelivered => {
+                    if let Some(queue_id) = ev.data.get("queue_id").and_then(|v| v.as_str()) {
+                        if let Some(row) = active_queue_rows.get_mut(queue_id) {
+                            row.status = "delivered".to_string();
+                            row.delivery_phrase =
+                                match ev.data.get("delivery_boundary").and_then(|v| v.as_str()) {
+                                    Some("post_tool") => "after current tool finishes".to_string(),
+                                    Some("post_step") => "after current step finishes".to_string(),
+                                    Some("turn_idle") => "after this turn completes".to_string(),
+                                    _ => "delivered".to_string(),
+                                };
+                        }
+                    }
+                }
+                EventKind::QueueInterrupt => {
+                    if let Some(queue_id) = ev.data.get("queue_id").and_then(|v| v.as_str()) {
+                        if let Some(row) = active_queue_rows.get_mut(queue_id) {
+                            row.status = "interrupted".to_string();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            match ev.kind {
+                EventKind::ModelDelta => {
+                    if let Some(d) = ev.data.get("delta").and_then(|v| v.as_str()) {
+                        streaming_assistant.push_str(d);
+                        if *follow_output {
+                            *transcript_scroll = usize::MAX;
+                        }
+                    }
+                }
+                EventKind::ModelResponseEnd => {
+                    if streaming_assistant.is_empty() {
+                        if let Some(c) = ev.data.get("content").and_then(|v| v.as_str()) {
+                            streaming_assistant.push_str(c);
+                            if *follow_output {
+                                *transcript_scroll = usize::MAX;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        while event::poll(Duration::from_millis(0))? {
+            match event::read()? {
+                CEvent::Mouse(me) => {
+                    if let Some(delta) = chat_runtime::mouse_scroll_delta(&me) {
+                        let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                            transcript,
+                            streaming_assistant,
+                        );
+                        *transcript_scroll = chat_runtime::adjust_transcript_scroll(
+                            *transcript_scroll,
+                            delta,
+                            max_scroll,
+                        );
+                        *follow_output = false;
+                    }
+                }
+                CEvent::Paste(pasted) => {
+                    input_buf.push_str(&chat_runtime::normalize_pasted_text(&pasted));
+                    *slash_menu_index = 0;
+                }
+                CEvent::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    match key.code {
+                        KeyCode::Esc => {
+                            let partial = agent::sanitize_user_visible_output(streaming_assistant);
+                            if !partial.trim().is_empty() {
+                                transcript.push((
+                                    "assistant".to_string(),
+                                    format!("{partial}\n\n[cancelled]"),
+                                ));
+                            }
+                            logs.push("run cancelled by user (Esc/Ctrl+C)".to_string());
+                            *show_logs = true;
+                            streaming_assistant.clear();
+                            *status = "idle".to_string();
+                            *status_detail = "cancelled by user".to_string();
+                            if *follow_output {
+                                *transcript_scroll = usize::MAX;
+                            }
+                            break;
+                        }
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let partial = agent::sanitize_user_visible_output(streaming_assistant);
+                            if !partial.trim().is_empty() {
+                                transcript.push((
+                                    "assistant".to_string(),
+                                    format!("{partial}\n\n[cancelled]"),
+                                ));
+                            }
+                            logs.push("run cancelled by user (Esc/Ctrl+C)".to_string());
+                            *show_logs = true;
+                            streaming_assistant.clear();
+                            *status = "idle".to_string();
+                            *status_detail = "cancelled by user".to_string();
+                            if *follow_output {
+                                *transcript_scroll = usize::MAX;
+                            }
+                            break;
+                        }
+                        KeyCode::PageUp => {
+                            let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                                transcript,
+                                streaming_assistant,
+                            );
+                            *transcript_scroll = chat_runtime::adjust_transcript_scroll(
+                                *transcript_scroll,
+                                -12,
+                                max_scroll,
+                            );
+                            *follow_output = false;
+                        }
+                        KeyCode::PageDown => {
+                            let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                                transcript,
+                                streaming_assistant,
+                            );
+                            *transcript_scroll = chat_runtime::adjust_transcript_scroll(
+                                *transcript_scroll,
+                                12,
+                                max_scroll,
+                            );
+                            *follow_output = false;
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                                transcript,
+                                streaming_assistant,
+                            );
+                            *transcript_scroll = chat_runtime::adjust_transcript_scroll(
+                                *transcript_scroll,
+                                -10,
+                                max_scroll,
+                            );
+                            *follow_output = false;
+                        }
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                                transcript,
+                                streaming_assistant,
+                            );
+                            *transcript_scroll = chat_runtime::adjust_transcript_scroll(
+                                *transcript_scroll,
+                                10,
+                                max_scroll,
+                            );
+                            *follow_output = false;
+                        }
+                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            *show_tools = !*show_tools;
+                        }
+                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            *show_approvals = !*show_approvals;
+                        }
+                        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            *show_logs = !*show_logs;
+                        }
+                        KeyCode::Tab => {
+                            if *show_tools && *show_approvals {
+                                *tools_focus = !*tools_focus;
+                            }
+                        }
+                        KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            *show_tools = !*show_tools;
+                        }
+                        KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            *show_approvals = !*show_approvals;
+                        }
+                        KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            *show_logs = !*show_logs;
+                        }
+                        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let visible_tool_count = ui_state.tool_calls.len().min(tool_row_count);
+                            if *show_tools && (!*show_approvals || *tools_focus) {
+                                if *tools_selected + 1 < visible_tool_count {
+                                    *tools_selected += 1;
+                                }
+                            } else if *approvals_selected + 1 < ui_state.pending_approvals.len() {
+                                *approvals_selected += 1;
+                            }
+                        }
+                        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if *show_tools && (!*show_approvals || *tools_focus) {
+                                *tools_selected = tools_selected.saturating_sub(1);
+                            } else {
+                                *approvals_selected = approvals_selected.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Err(e) = ui_state.refresh_approvals(&paths.approvals_path) {
+                                logs.push(format!("approvals refresh failed: {e}"));
+                            }
+                        }
+                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(row) = ui_state.pending_approvals.get(*approvals_selected) {
+                                let store = ApprovalsStore::new(paths.approvals_path.clone());
+                                if let Err(e) = store.approve(&row.id, None, None) {
+                                    logs.push(format!("approve failed: {e}"));
+                                } else {
+                                    logs.push(format!("approved {}", row.id));
+                                }
+                                let _ = ui_state.refresh_approvals(&paths.approvals_path);
+                            }
+                        }
+                        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(row) = ui_state.pending_approvals.get(*approvals_selected) {
+                                let store = ApprovalsStore::new(paths.approvals_path.clone());
+                                if let Err(e) = store.deny(&row.id) {
+                                    logs.push(format!("deny failed: {e}"));
+                                } else {
+                                    logs.push(format!("denied {}", row.id));
+                                }
+                                let _ = ui_state.refresh_approvals(&paths.approvals_path);
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let line = input_buf.trim().to_string();
+                            if let Some(rest) = line.strip_prefix("/interrupt ") {
+                                let msg = rest.trim();
+                                if msg.is_empty() {
+                                    logs.push("usage: /interrupt <message>".to_string());
+                                } else {
+                                    let req = crate::operator_queue::QueueSubmitRequest {
+                                        kind: crate::operator_queue::QueueMessageKind::Steer,
+                                        content: msg.to_string(),
+                                    };
+                                    match queue_tx.send(req) {
+                                        Ok(_) => logs.push(
+                                            "queued Interrupt: will apply after current tool finishes"
+                                                .to_string(),
+                                        ),
+                                        Err(_) => logs.push(
+                                            "queue unavailable: run is ending".to_string(),
+                                        ),
+                                    }
+                                    input_buf.clear();
+                                    *slash_menu_index = 0;
+                                }
+                            } else if let Some(rest) = line.strip_prefix("/next ") {
+                                let msg = rest.trim();
+                                if msg.is_empty() {
+                                    logs.push("usage: /next <message>".to_string());
+                                } else {
+                                    let req = crate::operator_queue::QueueSubmitRequest {
+                                        kind: crate::operator_queue::QueueMessageKind::FollowUp,
+                                        content: msg.to_string(),
+                                    };
+                                    match queue_tx.send(req) {
+                                        Ok(_) => logs.push(
+                                            "queued Next: will apply after this turn completes"
+                                                .to_string(),
+                                        ),
+                                        Err(_) => logs
+                                            .push("queue unavailable: run is ending".to_string()),
+                                    }
+                                    input_buf.clear();
+                                    *slash_menu_index = 0;
+                                }
+                            } else if line == "/queue" {
+                                let mut rows = active_queue_rows
+                                    .iter()
+                                    .map(|(id, row)| {
+                                        (
+                                            row.sequence_no,
+                                            id.clone(),
+                                            row.kind.clone(),
+                                            row.status.clone(),
+                                            row.delivery_phrase.clone(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                                if rows.is_empty() {
+                                    logs.push("queue: empty".to_string());
+                                } else {
+                                    logs.push(format!("queue: {} item(s)", rows.len()));
+                                    for (seq, id, kind, status_row, when) in
+                                        rows.into_iter().take(8)
+                                    {
+                                        let label = match kind.as_str() {
+                                            "steer" => "Interrupt",
+                                            "follow_up" => "Next",
+                                            _ => "Unknown",
+                                        };
+                                        logs.push(format!(
+                                            "  #{seq} {label} [{status_row}] id={id} ({when})"
+                                        ));
+                                    }
+                                }
+                                input_buf.clear();
+                                *slash_menu_index = 0;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if *status == "idle" {
+            break;
+        }
+
+        terminal.draw(|f| {
+            chat_ui::draw_chat_frame(
+                f,
+                chat_runtime::chat_mode_label(active_run),
+                provider_runtime::provider_cli_name(provider_kind),
+                *provider_connected,
+                model,
+                status,
+                status_detail,
+                transcript,
+                streaming_assistant,
+                ui_state,
+                *tools_selected,
+                *tools_focus,
+                *show_tool_details,
+                *approvals_selected,
+                cwd_label,
+                input_buf,
+                logs,
+                *think_tick,
+                base_run.tui_refresh_ms,
+                *show_tools,
+                *show_approvals,
+                *show_logs,
+                *transcript_scroll,
+                compact_tools,
+                show_banner,
+                *ui_tick,
+                if palette_open {
+                    Some(format!(
+                        "⌘ {}  (Up/Down, Enter, Esc)",
+                        palette_items[palette_selected]
+                    ))
+                } else if search_mode {
+                    Some(format!("🔎 {}  (Enter next, Esc close)", search_query))
+                } else if input_buf.starts_with('/') {
+                    chat_commands::slash_overlay_text(input_buf, *slash_menu_index)
+                } else if input_buf.starts_with('?') {
+                    chat_commands::keybinds_overlay_text()
+                } else {
+                    None
+                },
+            );
+        })?;
+
+        let maybe_res = tokio::select! {
+            r = &mut fut => Some(r),
+            _ = tokio::time::sleep(Duration::from_millis(base_run.tui_refresh_ms)) => None,
+        };
+        if let Some(res) = maybe_res {
+            match res {
+                Ok(out) => {
+                    let outcome = out.outcome;
+                    let exit_reason = outcome.exit_reason;
+                    let outcome_error = outcome.error.unwrap_or_else(String::new);
+                    let final_text = if outcome.final_output.is_empty() {
+                        agent::sanitize_user_visible_output(streaming_assistant)
+                    } else {
+                        outcome.final_output
+                    };
+                    if matches!(exit_reason, AgentExitReason::ProviderError) {
+                        let err = if outcome_error.trim().is_empty() {
+                            "provider error".to_string()
+                        } else {
+                            outcome_error.clone()
+                        };
+                        *provider_connected = false;
+                        logs.push(err.clone());
+                        if runtime_config::is_timeout_error_text(&err) && !*timeout_notice_active {
+                            *timeout_notice_active = true;
+                            logs.push(runtime_config::timeout_notice_text(active_run));
+                        }
+                        *show_logs = true;
+                        *status_detail = format!(
+                            "{}: {}",
+                            exit_reason.as_str(),
+                            chat_view_utils::compact_status_detail(&err, 120)
+                        );
+                        transcript.push(("system".to_string(), format!("Provider error: {err}")));
+                        if let Some(hint) = runtime_config::protocol_remediation_hint(&err) {
+                            logs.push(hint.clone());
+                            transcript.push(("system".to_string(), hint));
+                            *show_logs = true;
+                        }
+                    } else {
+                        *provider_connected = true;
+                        if matches!(exit_reason, AgentExitReason::Ok) {
+                            status_detail.clear();
+                        } else {
+                            let reason_text = if !outcome_error.trim().is_empty() {
+                                outcome_error.clone()
+                            } else if !final_text.trim().is_empty() {
+                                final_text.clone()
+                            } else {
+                                exit_reason.as_str().to_string()
+                            };
+                            let reason_short =
+                                chat_view_utils::compact_status_detail(&reason_text, 120);
+                            *status_detail = format!("{}: {}", exit_reason.as_str(), reason_short);
+                            transcript.push((
+                                "system".to_string(),
+                                format!(
+                                    "Run ended with {}: {}",
+                                    exit_reason.as_str(),
+                                    chat_view_utils::compact_status_detail(&reason_text, 220)
+                                ),
+                            ));
+                            if let Some(hint) =
+                                runtime_config::protocol_remediation_hint(&reason_text)
+                            {
+                                logs.push(hint.clone());
+                                transcript.push(("system".to_string(), hint));
+                                *show_logs = true;
+                            }
+                        }
+                    }
+                    if !final_text.trim().is_empty() {
+                        transcript.push(("assistant".to_string(), final_text));
+                    }
+                    if *follow_output {
+                        *transcript_scroll = usize::MAX;
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("run failed: {e}");
+                    if runtime_config::is_timeout_error_text(&msg) {
+                        *provider_connected = false;
+                    }
+                    logs.push(msg.clone());
+                    *show_logs = true;
+                    transcript.push(("system".to_string(), msg));
+                    *status_detail = format!(
+                        "run failed: {}",
+                        chat_view_utils::compact_status_detail(&e.to_string(), 120)
+                    );
+                    if let Some(hint) = runtime_config::protocol_remediation_hint(&format!("{e}")) {
+                        logs.push(hint.clone());
+                        transcript.push(("system".to_string(), hint));
+                        *show_logs = true;
+                    }
+                    if *follow_output {
+                        *transcript_scroll = usize::MAX;
+                    }
+                }
+            }
+            streaming_assistant.clear();
+            *status = "idle".to_string();
+            break;
+        }
+        *think_tick = think_tick.saturating_add(1);
+        *ui_tick = ui_tick.saturating_add(1);
+    }
+
+    Ok(())
+}
+
 struct TuiSlashCommandDispatchInput<'a> {
     line: &'a str,
     slash_menu_index: usize,
@@ -591,10 +1186,7 @@ pub(crate) async fn run_chat_tui(
                             palette_items[palette_selected]
                         ))
                     } else if search_mode {
-                        Some(format!(
-                            "🔎 {}  (Enter next, Esc close)",
-                            search_query
-                        ))
+                        Some(format!("🔎 {}  (Enter next, Esc close)", search_query))
                     } else if input.starts_with('/') {
                         chat_commands::slash_overlay_text(&input, slash_menu_index)
                     } else if input.starts_with('?') {
@@ -609,10 +1201,15 @@ pub(crate) async fn run_chat_tui(
                 match event::read()? {
                     CEvent::Mouse(me) => {
                         if let Some(delta) = chat_runtime::mouse_scroll_delta(&me) {
-                            let max_scroll =
-                                chat_runtime::transcript_max_scroll_lines(&transcript, &streaming_assistant);
-                            transcript_scroll =
-                                chat_runtime::adjust_transcript_scroll(transcript_scroll, delta, max_scroll);
+                            let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                                &transcript,
+                                &streaming_assistant,
+                            );
+                            transcript_scroll = chat_runtime::adjust_transcript_scroll(
+                                transcript_scroll,
+                                delta,
+                                max_scroll,
+                            );
                             follow_output = false;
                         }
                     }
@@ -622,887 +1219,394 @@ pub(crate) async fn run_chat_tui(
                         slash_menu_index = 0;
                     }
                     CEvent::Key(key) => {
-                    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                        continue;
-                    }
-                    if key.code == KeyCode::Esc {
-                        break;
-                    }
-                    if key.code == KeyCode::End {
-                        follow_output = true;
-                        transcript_scroll = usize::MAX;
-                        continue;
-                    }
-                    if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                        palette_open = !palette_open;
-                        search_mode = false;
-                        continue;
-                    }
-                    if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                        search_mode = true;
-                        palette_open = false;
-                        continue;
-                    }
-                    if palette_open {
-                        match key.code {
-                            KeyCode::Esc => palette_open = false,
-                            KeyCode::Up => {
-                                palette_selected = palette_selected.saturating_sub(1);
-                            }
-                            KeyCode::Down => {
-                                if palette_selected + 1 < palette_items.len() {
-                                    palette_selected += 1;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                match palette_selected {
-                                    0 => show_tools = !show_tools,
-                                    1 => show_approvals = !show_approvals,
-                                    2 => show_logs = !show_logs,
-                                    3 => compact_tools = !compact_tools,
-                                    4 => {
-                                        transcript.clear();
-                                        ui_state.tool_calls.clear();
-                                        streaming_assistant.clear();
-                                        transcript_scroll = 0;
-                                        follow_output = true;
-                                    }
-                                    5 => {
-                                        follow_output = true;
-                                        transcript_scroll = usize::MAX;
-                                    }
-                                    _ => {}
-                                }
-                                palette_open = false;
-                            }
-                            _ => {}
+                        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                            continue;
                         }
-                        continue;
-                    }
-                    if search_mode {
-                        let mut do_search = false;
-                        match key.code {
-                            KeyCode::Esc => search_mode = false,
-                            KeyCode::Backspace => {
-                                search_query.pop();
-                                search_line_cursor = 0;
-                                do_search = true;
-                            }
-                            KeyCode::Enter => {
-                                do_search = true;
-                                search_line_cursor = search_line_cursor.saturating_add(1);
-                            }
-                            KeyCode::Char(c) if chat_runtime::is_text_input_mods(key.modifiers) => {
-                                search_query.push(c);
-                                search_line_cursor = 0;
-                                do_search = true;
-                            }
-                            _ => {}
+                        if key.code == KeyCode::Esc {
+                            break;
                         }
-                        if do_search && !search_query.is_empty() {
-                            let hay = transcript
-                                .iter()
-                                .map(|(role, text)| format!("{}: {}", role.to_uppercase(), text))
-                                .collect::<Vec<_>>()
-                                .join("\n\n");
-                            let lines: Vec<&str> = hay.lines().collect();
-                            let query = search_query.to_lowercase();
-                            let mut found = None;
-                            for (idx, line) in lines.iter().enumerate().skip(search_line_cursor) {
-                                if line.to_lowercase().contains(&query) {
-                                    found = Some(idx);
-                                    break;
+                        if key.code == KeyCode::End {
+                            follow_output = true;
+                            transcript_scroll = usize::MAX;
+                            continue;
+                        }
+                        if key.code == KeyCode::Char('p')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            palette_open = !palette_open;
+                            search_mode = false;
+                            continue;
+                        }
+                        if key.code == KeyCode::Char('f')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            search_mode = true;
+                            palette_open = false;
+                            continue;
+                        }
+                        if palette_open {
+                            match key.code {
+                                KeyCode::Esc => palette_open = false,
+                                KeyCode::Up => {
+                                    palette_selected = palette_selected.saturating_sub(1);
                                 }
+                                KeyCode::Down => {
+                                    if palette_selected + 1 < palette_items.len() {
+                                        palette_selected += 1;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    match palette_selected {
+                                        0 => show_tools = !show_tools,
+                                        1 => show_approvals = !show_approvals,
+                                        2 => show_logs = !show_logs,
+                                        3 => compact_tools = !compact_tools,
+                                        4 => {
+                                            transcript.clear();
+                                            ui_state.tool_calls.clear();
+                                            streaming_assistant.clear();
+                                            transcript_scroll = 0;
+                                            follow_output = true;
+                                        }
+                                        5 => {
+                                            follow_output = true;
+                                            transcript_scroll = usize::MAX;
+                                        }
+                                        _ => {}
+                                    }
+                                    palette_open = false;
+                                }
+                                _ => {}
                             }
-                            if found.is_none() {
-                                for (idx, line) in lines.iter().enumerate().take(search_line_cursor) {
+                            continue;
+                        }
+                        if search_mode {
+                            let mut do_search = false;
+                            match key.code {
+                                KeyCode::Esc => search_mode = false,
+                                KeyCode::Backspace => {
+                                    search_query.pop();
+                                    search_line_cursor = 0;
+                                    do_search = true;
+                                }
+                                KeyCode::Enter => {
+                                    do_search = true;
+                                    search_line_cursor = search_line_cursor.saturating_add(1);
+                                }
+                                KeyCode::Char(c)
+                                    if chat_runtime::is_text_input_mods(key.modifiers) =>
+                                {
+                                    search_query.push(c);
+                                    search_line_cursor = 0;
+                                    do_search = true;
+                                }
+                                _ => {}
+                            }
+                            if do_search && !search_query.is_empty() {
+                                let hay = transcript
+                                    .iter()
+                                    .map(|(role, text)| {
+                                        format!("{}: {}", role.to_uppercase(), text)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n");
+                                let lines: Vec<&str> = hay.lines().collect();
+                                let query = search_query.to_lowercase();
+                                let mut found = None;
+                                for (idx, line) in lines.iter().enumerate().skip(search_line_cursor)
+                                {
                                     if line.to_lowercase().contains(&query) {
                                         found = Some(idx);
                                         break;
                                     }
                                 }
+                                if found.is_none() {
+                                    for (idx, line) in
+                                        lines.iter().enumerate().take(search_line_cursor)
+                                    {
+                                        if line.to_lowercase().contains(&query) {
+                                            found = Some(idx);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(idx) = found {
+                                    transcript_scroll = idx;
+                                    follow_output = false;
+                                    search_line_cursor = idx;
+                                }
                             }
-                            if let Some(idx) = found {
-                                transcript_scroll = idx;
-                                follow_output = false;
-                                search_line_cursor = idx;
-                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                        KeyCode::Up => {
-                            if input.starts_with('/') {
-                                let matches_len = chat_commands::slash_match_count(&input);
-                                if matches_len > 0 {
-                                    slash_menu_index = if slash_menu_index == 0 {
-                                        matches_len - 1
-                                    } else {
-                                        slash_menu_index - 1
+                        match key.code {
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                break
+                            }
+                            KeyCode::Up => {
+                                if input.starts_with('/') {
+                                    let matches_len = chat_commands::slash_match_count(&input);
+                                    if matches_len > 0 {
+                                        slash_menu_index = if slash_menu_index == 0 {
+                                            matches_len - 1
+                                        } else {
+                                            slash_menu_index - 1
+                                        };
+                                    }
+                                    continue;
+                                }
+                                if !prompt_history.is_empty() {
+                                    let next = match history_idx {
+                                        None => prompt_history.len().saturating_sub(1),
+                                        Some(i) => i.saturating_sub(1),
                                     };
+                                    history_idx = Some(next);
+                                    input = prompt_history[next].clone();
                                 }
-                                continue;
                             }
-                            if !prompt_history.is_empty() {
-                                let next = match history_idx {
-                                    None => prompt_history.len().saturating_sub(1),
-                                    Some(i) => i.saturating_sub(1),
-                                };
-                                history_idx = Some(next);
-                                input = prompt_history[next].clone();
-                            }
-                        }
-                        KeyCode::Down => {
-                            if input.starts_with('/') {
-                                let matches_len = chat_commands::slash_match_count(&input);
-                                if matches_len > 0 {
-                                    slash_menu_index = (slash_menu_index + 1) % matches_len;
-                                }
-                                continue;
-                            }
-                            if !prompt_history.is_empty() {
-                                if let Some(i) = history_idx {
-                                    let next = (i + 1).min(prompt_history.len());
-                                    if next >= prompt_history.len() {
-                                        history_idx = None;
-                                        input.clear();
-                                    } else {
-                                        history_idx = Some(next);
-                                        input = prompt_history[next].clone();
+                            KeyCode::Down => {
+                                if input.starts_with('/') {
+                                    let matches_len = chat_commands::slash_match_count(&input);
+                                    if matches_len > 0 {
+                                        slash_menu_index = (slash_menu_index + 1) % matches_len;
                                     }
+                                    continue;
                                 }
-                            }
-                        }
-                        KeyCode::PageUp => {
-                            let max_scroll =
-                                chat_runtime::transcript_max_scroll_lines(&transcript, &streaming_assistant);
-                            transcript_scroll =
-                                chat_runtime::adjust_transcript_scroll(transcript_scroll, -12, max_scroll);
-                            follow_output = false;
-                        }
-                        KeyCode::PageDown => {
-                            let max_scroll =
-                                chat_runtime::transcript_max_scroll_lines(&transcript, &streaming_assistant);
-                            transcript_scroll =
-                                chat_runtime::adjust_transcript_scroll(transcript_scroll, 12, max_scroll);
-                            follow_output = false;
-                        }
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let max_scroll =
-                                chat_runtime::transcript_max_scroll_lines(&transcript, &streaming_assistant);
-                            transcript_scroll =
-                                chat_runtime::adjust_transcript_scroll(transcript_scroll, -10, max_scroll);
-                            follow_output = false;
-                        }
-                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let max_scroll =
-                                chat_runtime::transcript_max_scroll_lines(&transcript, &streaming_assistant);
-                            transcript_scroll =
-                                chat_runtime::adjust_transcript_scroll(transcript_scroll, 10, max_scroll);
-                            follow_output = false;
-                        }
-                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            show_tools = !show_tools;
-                        }
-                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            show_approvals = !show_approvals;
-                        }
-                        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            show_logs = !show_logs;
-                        }
-                        KeyCode::Tab => {
-                            if show_tools && show_approvals {
-                                tools_focus = !tools_focus;
-                            }
-                        }
-                        KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            show_tools = !show_tools;
-                        }
-                        KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            show_approvals = !show_approvals;
-                        }
-                        KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            show_logs = !show_logs;
-                        }
-                        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if show_tools && (!show_approvals || tools_focus) {
-                                if tools_selected + 1 < visible_tool_count {
-                                    tools_selected += 1;
-                                }
-                            } else if approvals_selected + 1 < ui_state.pending_approvals.len() {
-                                approvals_selected += 1;
-                            }
-                        }
-                        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if show_tools && (!show_approvals || tools_focus) {
-                                tools_selected = tools_selected.saturating_sub(1);
-                            } else {
-                                approvals_selected = approvals_selected.saturating_sub(1);
-                            }
-                        }
-                        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if let Err(e) = ui_state.refresh_approvals(&paths.approvals_path) {
-                                logs.push(format!("approvals refresh failed: {e}"));
-                            }
-                        }
-                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if let Some(row) = ui_state.pending_approvals.get(approvals_selected) {
-                                let store = ApprovalsStore::new(paths.approvals_path.clone());
-                                if let Err(e) = store.approve(&row.id, None, None) {
-                                    logs.push(format!("approve failed: {e}"));
-                                } else {
-                                    logs.push(format!("approved {}", row.id));
-                                }
-                                let _ = ui_state.refresh_approvals(&paths.approvals_path);
-                            }
-                        }
-                        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if let Some(row) = ui_state.pending_approvals.get(approvals_selected) {
-                                let store = ApprovalsStore::new(paths.approvals_path.clone());
-                                if let Err(e) = store.deny(&row.id) {
-                                    logs.push(format!("deny failed: {e}"));
-                                } else {
-                                    logs.push(format!("denied {}", row.id));
-                                }
-                                let _ = ui_state.refresh_approvals(&paths.approvals_path);
-                            }
-                        }
-                        KeyCode::Enter => {
-                            let line = input.trim().to_string();
-                            input.clear();
-                            history_idx = None;
-                            slash_menu_index = 0;
-                            if line.is_empty() {
-                                continue;
-                            }
-                            if pending_params_input && !line.starts_with('/') {
-                                if line.eq_ignore_ascii_case("cancel") {
-                                    pending_params_input = false;
-                                    logs.push("params update cancelled".to_string());
-                                } else {
-                                    match runtime_config::apply_params_input(&mut active_run, &line) {
-                                        Ok(msg) => {
-                                            pending_params_input = false;
-                                            logs.push(msg);
-                                        }
-                                        Err(msg) => logs.push(msg),
-                                    }
-                                }
-                                show_logs = true;
-                                continue;
-                            }
-                            if pending_timeout_input && !line.starts_with('/') {
-                                if line.eq_ignore_ascii_case("cancel") {
-                                    pending_timeout_input = false;
-                                    logs.push("timeout update cancelled".to_string());
-                                    show_logs = false;
-                                } else {
-                                    match runtime_config::apply_timeout_input(&mut active_run, &line) {
-                                        Ok(msg) => {
-                                            pending_timeout_input = false;
-                                            logs.push(msg);
-                                            show_logs = false;
-                                        }
-                                        Err(msg) => {
-                                            logs.push(msg);
-                                            show_logs = true;
+                                if !prompt_history.is_empty() {
+                                    if let Some(i) = history_idx {
+                                        let next = (i + 1).min(prompt_history.len());
+                                        if next >= prompt_history.len() {
+                                            history_idx = None;
+                                            input.clear();
+                                        } else {
+                                            history_idx = Some(next);
+                                            input = prompt_history[next].clone();
                                         }
                                     }
                                 }
-                                continue;
                             }
-                            if line.starts_with('/') {
-                                match handle_tui_slash_command(TuiSlashCommandDispatchInput {
-                                    line: &line,
-                                    slash_menu_index,
-                                    active_run: &mut active_run,
-                                    paths,
-                                    logs: &mut logs,
-                                    show_logs: &mut show_logs,
-                                    show_tools: &mut show_tools,
-                                    show_approvals: &mut show_approvals,
-                                    timeout_notice_active: &mut timeout_notice_active,
-                                    pending_timeout_input: &mut pending_timeout_input,
-                                    pending_params_input: &mut pending_params_input,
-                                    transcript: &mut transcript,
-                                    ui_state: &mut ui_state,
-                                    streaming_assistant: &mut streaming_assistant,
-                                    transcript_scroll: &mut transcript_scroll,
-                                    follow_output: &mut follow_output,
-                                    shared_chat_mcp_registry: &mut shared_chat_mcp_registry,
-                                })
-                                .await?
-                                {
-                                    SlashCommandDispatchOutcome::ExitRequested => break,
-                                    SlashCommandDispatchOutcome::Handled => {}
-                                }
-                                continue;
-                            }
-
-                            if line.is_empty() && show_tools && (!show_approvals || tools_focus) {
-                                if visible_tool_count > 0 {
-                                    show_tool_details = !show_tool_details;
-                                    if show_tool_details {
-                                        show_logs = false;
-                                    }
-                                }
-                                continue;
-                            }
-
-                            match prepare_tui_normal_submit_state(TuiNormalSubmitPrepInput {
-                                line: &line,
-                                prompt_history: &mut prompt_history,
-                                transcript: &mut transcript,
-                                show_logs: &mut show_logs,
-                                follow_output: &mut follow_output,
-                                transcript_scroll: &mut transcript_scroll,
-                                status: &mut status,
-                                status_detail: &mut status_detail,
-                                streaming_assistant: &mut streaming_assistant,
-                                think_tick: &mut think_tick,
-                            }) {
-                                TuiNormalSubmitPrepOutcome::HandledNoRun => continue,
-                                TuiNormalSubmitPrepOutcome::ContinueToRun => {}
-                            }
-                            terminal.draw(|f| {
-                                chat_ui::draw_chat_frame(
-                                    f,
-                                    chat_runtime::chat_mode_label(&active_run),
-                                    provider_runtime::provider_cli_name(provider_kind),
-                                    provider_connected,
-                                    &model,
-                                    &status,
-                                    &status_detail,
+                            KeyCode::PageUp => {
+                                let max_scroll = chat_runtime::transcript_max_scroll_lines(
                                     &transcript,
                                     &streaming_assistant,
-                                    &ui_state,
-                                    tools_selected,
-                                    tools_focus,
-                                    show_tool_details,
-                                    approvals_selected,
-                                    &cwd_label,
-                                    &input,
-                                    &logs,
-                                    think_tick,
-                                    base_run.tui_refresh_ms,
-                                    show_tools,
-                                    show_approvals,
-                                    show_logs,
-                                    transcript_scroll,
-                                    compact_tools,
-                                    show_banner,
-                                    ui_tick,
-                                    if palette_open {
-                                        Some(format!(
-                                            "⌘ {}  (Up/Down, Enter, Esc)",
-                                            palette_items[palette_selected]
-                                        ))
-                                    } else if search_mode {
-                                        Some(format!(
-                                            "🔎 {}  (Enter next, Esc close)",
-                                            search_query
-                                        ))
-                                    } else if input.starts_with('/') {
-                                        chat_commands::slash_overlay_text(&input, slash_menu_index)
-                                    } else if input.starts_with('?') {
-                                        chat_commands::keybinds_overlay_text()
-                                    } else {
-                                        None
-                                    },
                                 );
-                            })?;
-                            ui_tick = ui_tick.saturating_add(1);
-
-                            let TuiSubmitLaunch {
-                                rx,
-                                queue_tx,
-                                mut fut,
-                            } = match build_tui_normal_submit_launch(TuiNormalSubmitLaunchInput {
-                                provider_kind,
-                                base_url: &base_url,
-                                model: &model,
-                                line: &line,
-                                active_run: &active_run,
-                                paths,
-                                logs: &mut logs,
-                                show_logs: &mut show_logs,
-                                transcript: &mut transcript,
-                                status: &mut status,
-                                status_detail: &mut status_detail,
-                                follow_output: &follow_output,
-                                transcript_scroll: &mut transcript_scroll,
-                                shared_chat_mcp_registry: &mut shared_chat_mcp_registry,
-                            })
-                            .await?
-                            {
-                                Some(launch) => launch,
-                                None => continue,
-                            };
-
-                            #[derive(Clone)]
-                            struct ActiveQueueRow {
-                                sequence_no: u64,
-                                kind: String,
-                                status: String,
-                                delivery_phrase: String,
+                                transcript_scroll = chat_runtime::adjust_transcript_scroll(
+                                    transcript_scroll,
+                                    -12,
+                                    max_scroll,
+                                );
+                                follow_output = false;
                             }
-
-                            let mut active_queue_rows: BTreeMap<String, ActiveQueueRow> =
-                                BTreeMap::new();
-
-                            loop {
-                                ui_state.on_tick(Instant::now());
-                                while let Ok(ev) = rx.try_recv() {
-                                    ui_state.apply_event(&ev);
-                                    match ev.kind {
-                                        EventKind::QueueSubmitted => {
-                                            if let Some(queue_id) =
-                                                ev.data.get("queue_id").and_then(|v| v.as_str())
-                                            {
-                                                let sequence_no = ev
-                                                    .data
-                                                    .get("sequence_no")
-                                                    .and_then(|v| v.as_u64())
-                                                    .unwrap_or(0);
-                                                let kind = ev
-                                                    .data
-                                                    .get("kind")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("unknown")
-                                                    .to_string();
-                                                let delivery_phrase = ev
-                                                    .data
-                                                    .get("next_delivery")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("pending")
-                                                    .to_string();
-                                                active_queue_rows.insert(
-                                                    queue_id.to_string(),
-                                                    ActiveQueueRow {
-                                                        sequence_no,
-                                                        kind,
-                                                        status: "pending".to_string(),
-                                                        delivery_phrase,
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        EventKind::QueueDelivered => {
-                                            if let Some(queue_id) =
-                                                ev.data.get("queue_id").and_then(|v| v.as_str())
-                                            {
-                                                if let Some(row) = active_queue_rows.get_mut(queue_id)
-                                                {
-                                                    row.status = "delivered".to_string();
-                                                    row.delivery_phrase = match ev
-                                                        .data
-                                                        .get("delivery_boundary")
-                                                        .and_then(|v| v.as_str())
-                                                    {
-                                                        Some("post_tool") => {
-                                                            "after current tool finishes".to_string()
-                                                        }
-                                                        Some("post_step") => {
-                                                            "after current step finishes".to_string()
-                                                        }
-                                                        Some("turn_idle") => {
-                                                            "after this turn completes".to_string()
-                                                        }
-                                                        _ => "delivered".to_string(),
-                                                    };
-                                                }
-                                            }
-                                        }
-                                        EventKind::QueueInterrupt => {
-                                            if let Some(queue_id) =
-                                                ev.data.get("queue_id").and_then(|v| v.as_str())
-                                            {
-                                                if let Some(row) = active_queue_rows.get_mut(queue_id)
-                                                {
-                                                    row.status = "interrupted".to_string();
-                                                }
-                                            }
-                                        }
-                                        _ => {}
+                            KeyCode::PageDown => {
+                                let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                                    &transcript,
+                                    &streaming_assistant,
+                                );
+                                transcript_scroll = chat_runtime::adjust_transcript_scroll(
+                                    transcript_scroll,
+                                    12,
+                                    max_scroll,
+                                );
+                                follow_output = false;
+                            }
+                            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                                    &transcript,
+                                    &streaming_assistant,
+                                );
+                                transcript_scroll = chat_runtime::adjust_transcript_scroll(
+                                    transcript_scroll,
+                                    -10,
+                                    max_scroll,
+                                );
+                                follow_output = false;
+                            }
+                            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                                    &transcript,
+                                    &streaming_assistant,
+                                );
+                                transcript_scroll = chat_runtime::adjust_transcript_scroll(
+                                    transcript_scroll,
+                                    10,
+                                    max_scroll,
+                                );
+                                follow_output = false;
+                            }
+                            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                show_tools = !show_tools;
+                            }
+                            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                show_approvals = !show_approvals;
+                            }
+                            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                show_logs = !show_logs;
+                            }
+                            KeyCode::Tab => {
+                                if show_tools && show_approvals {
+                                    tools_focus = !tools_focus;
+                                }
+                            }
+                            KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                show_tools = !show_tools;
+                            }
+                            KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                show_approvals = !show_approvals;
+                            }
+                            KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                show_logs = !show_logs;
+                            }
+                            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if show_tools && (!show_approvals || tools_focus) {
+                                    if tools_selected + 1 < visible_tool_count {
+                                        tools_selected += 1;
                                     }
-                                    match ev.kind {
-                                        EventKind::ModelDelta => {
-                                            if let Some(d) = ev.data.get("delta").and_then(|v| v.as_str()) {
-                                                streaming_assistant.push_str(d);
-                                                if follow_output {
-                                                    transcript_scroll = usize::MAX;
-                                                }
-                                            }
-                                        }
-                                        EventKind::ModelResponseEnd => {
-                                            if streaming_assistant.is_empty() {
-                                                if let Some(c) = ev.data.get("content").and_then(|v| v.as_str()) {
-                                                    streaming_assistant.push_str(c);
-                                                    if follow_output {
-                                                        transcript_scroll = usize::MAX;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        _ => {}
+                                } else if approvals_selected + 1 < ui_state.pending_approvals.len()
+                                {
+                                    approvals_selected += 1;
+                                }
+                            }
+                            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if show_tools && (!show_approvals || tools_focus) {
+                                    tools_selected = tools_selected.saturating_sub(1);
+                                } else {
+                                    approvals_selected = approvals_selected.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if let Err(e) = ui_state.refresh_approvals(&paths.approvals_path) {
+                                    logs.push(format!("approvals refresh failed: {e}"));
+                                }
+                            }
+                            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if let Some(row) =
+                                    ui_state.pending_approvals.get(approvals_selected)
+                                {
+                                    let store = ApprovalsStore::new(paths.approvals_path.clone());
+                                    if let Err(e) = store.approve(&row.id, None, None) {
+                                        logs.push(format!("approve failed: {e}"));
+                                    } else {
+                                        logs.push(format!("approved {}", row.id));
                                     }
+                                    let _ = ui_state.refresh_approvals(&paths.approvals_path);
+                                }
+                            }
+                            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if let Some(row) =
+                                    ui_state.pending_approvals.get(approvals_selected)
+                                {
+                                    let store = ApprovalsStore::new(paths.approvals_path.clone());
+                                    if let Err(e) = store.deny(&row.id) {
+                                        logs.push(format!("deny failed: {e}"));
+                                    } else {
+                                        logs.push(format!("denied {}", row.id));
+                                    }
+                                    let _ = ui_state.refresh_approvals(&paths.approvals_path);
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let line = input.trim().to_string();
+                                input.clear();
+                                history_idx = None;
+                                slash_menu_index = 0;
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                if pending_params_input && !line.starts_with('/') {
+                                    if line.eq_ignore_ascii_case("cancel") {
+                                        pending_params_input = false;
+                                        logs.push("params update cancelled".to_string());
+                                    } else {
+                                        match runtime_config::apply_params_input(
+                                            &mut active_run,
+                                            &line,
+                                        ) {
+                                            Ok(msg) => {
+                                                pending_params_input = false;
+                                                logs.push(msg);
+                                            }
+                                            Err(msg) => logs.push(msg),
+                                        }
+                                    }
+                                    show_logs = true;
+                                    continue;
+                                }
+                                if pending_timeout_input && !line.starts_with('/') {
+                                    if line.eq_ignore_ascii_case("cancel") {
+                                        pending_timeout_input = false;
+                                        logs.push("timeout update cancelled".to_string());
+                                        show_logs = false;
+                                    } else {
+                                        match runtime_config::apply_timeout_input(
+                                            &mut active_run,
+                                            &line,
+                                        ) {
+                                            Ok(msg) => {
+                                                pending_timeout_input = false;
+                                                logs.push(msg);
+                                                show_logs = false;
+                                            }
+                                            Err(msg) => {
+                                                logs.push(msg);
+                                                show_logs = true;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if line.starts_with('/') {
+                                    match handle_tui_slash_command(TuiSlashCommandDispatchInput {
+                                        line: &line,
+                                        slash_menu_index,
+                                        active_run: &mut active_run,
+                                        paths,
+                                        logs: &mut logs,
+                                        show_logs: &mut show_logs,
+                                        show_tools: &mut show_tools,
+                                        show_approvals: &mut show_approvals,
+                                        timeout_notice_active: &mut timeout_notice_active,
+                                        pending_timeout_input: &mut pending_timeout_input,
+                                        pending_params_input: &mut pending_params_input,
+                                        transcript: &mut transcript,
+                                        ui_state: &mut ui_state,
+                                        streaming_assistant: &mut streaming_assistant,
+                                        transcript_scroll: &mut transcript_scroll,
+                                        follow_output: &mut follow_output,
+                                        shared_chat_mcp_registry: &mut shared_chat_mcp_registry,
+                                    })
+                                    .await?
+                                    {
+                                        SlashCommandDispatchOutcome::ExitRequested => break,
+                                        SlashCommandDispatchOutcome::Handled => {}
+                                    }
+                                    continue;
                                 }
 
-                                while event::poll(Duration::from_millis(0))? {
-                                    match event::read()? {
-                                        CEvent::Mouse(me) => {
-                                            if let Some(delta) = chat_runtime::mouse_scroll_delta(&me) {
-                                                let max_scroll = chat_runtime::transcript_max_scroll_lines(
-                                                    &transcript,
-                                                    &streaming_assistant,
-                                                );
-                                                transcript_scroll = chat_runtime::adjust_transcript_scroll(
-                                                    transcript_scroll,
-                                                    delta,
-                                                    max_scroll,
-                                                );
-                                                follow_output = false;
-                                            }
+                                if line.is_empty() && show_tools && (!show_approvals || tools_focus)
+                                {
+                                    if visible_tool_count > 0 {
+                                        show_tool_details = !show_tool_details;
+                                        if show_tool_details {
+                                            show_logs = false;
                                         }
-                                        CEvent::Paste(pasted) => {
-                                            input.push_str(&chat_runtime::normalize_pasted_text(&pasted));
-                                            history_idx = None;
-                                            slash_menu_index = 0;
-                                        }
-                                        CEvent::Key(key)
-                                            if matches!(
-                                                key.kind,
-                                                KeyEventKind::Press | KeyEventKind::Repeat
-                                            ) =>
-                                        {
-                                            match key.code {
-                                                KeyCode::Esc => {
-                                                    let partial = agent::sanitize_user_visible_output(
-                                                        &streaming_assistant,
-                                                    );
-                                                    if !partial.trim().is_empty() {
-                                                        transcript.push((
-                                                            "assistant".to_string(),
-                                                            format!("{partial}\n\n[cancelled]"),
-                                                        ));
-                                                    }
-                                                    logs.push(
-                                                        "run cancelled by user (Esc/Ctrl+C)"
-                                                            .to_string(),
-                                                    );
-                                                    show_logs = true;
-                                                    streaming_assistant.clear();
-                                                    status = "idle".to_string();
-                                                    status_detail = "cancelled by user".to_string();
-                                                    if follow_output {
-                                                        transcript_scroll = usize::MAX;
-                                                    }
-                                                    break;
-                                                }
-                                                KeyCode::Char('c')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    let partial = agent::sanitize_user_visible_output(
-                                                        &streaming_assistant,
-                                                    );
-                                                    if !partial.trim().is_empty() {
-                                                        transcript.push((
-                                                            "assistant".to_string(),
-                                                            format!("{partial}\n\n[cancelled]"),
-                                                        ));
-                                                    }
-                                                    logs.push(
-                                                        "run cancelled by user (Esc/Ctrl+C)"
-                                                            .to_string(),
-                                                    );
-                                                    show_logs = true;
-                                                    streaming_assistant.clear();
-                                                    status = "idle".to_string();
-                                                    status_detail = "cancelled by user".to_string();
-                                                    if follow_output {
-                                                        transcript_scroll = usize::MAX;
-                                                    }
-                                                    break;
-                                                }
-                                                KeyCode::PageUp => {
-                                                    let max_scroll = chat_runtime::transcript_max_scroll_lines(
-                                                        &transcript,
-                                                        &streaming_assistant,
-                                                    );
-                                                    transcript_scroll = chat_runtime::adjust_transcript_scroll(
-                                                        transcript_scroll,
-                                                        -12,
-                                                        max_scroll,
-                                                    );
-                                                    follow_output = false;
-                                                }
-                                                KeyCode::PageDown => {
-                                                    let max_scroll = chat_runtime::transcript_max_scroll_lines(
-                                                        &transcript,
-                                                        &streaming_assistant,
-                                                    );
-                                                    transcript_scroll = chat_runtime::adjust_transcript_scroll(
-                                                        transcript_scroll,
-                                                        12,
-                                                        max_scroll,
-                                                    );
-                                                    follow_output = false;
-                                                }
-                                                KeyCode::Char('u')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    let max_scroll = chat_runtime::transcript_max_scroll_lines(
-                                                        &transcript,
-                                                        &streaming_assistant,
-                                                    );
-                                                    transcript_scroll = chat_runtime::adjust_transcript_scroll(
-                                                        transcript_scroll,
-                                                        -10,
-                                                        max_scroll,
-                                                    );
-                                                    follow_output = false;
-                                                }
-                                                KeyCode::Char('d')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    let max_scroll = chat_runtime::transcript_max_scroll_lines(
-                                                        &transcript,
-                                                        &streaming_assistant,
-                                                    );
-                                                    transcript_scroll = chat_runtime::adjust_transcript_scroll(
-                                                        transcript_scroll,
-                                                        10,
-                                                        max_scroll,
-                                                    );
-                                                    follow_output = false;
-                                                }
-                                                KeyCode::Char('t')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    show_tools = !show_tools;
-                                                }
-                                                KeyCode::Char('y')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    show_approvals = !show_approvals;
-                                                }
-                                                KeyCode::Char('g')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    show_logs = !show_logs;
-                                                }
-                                                KeyCode::Tab => {
-                                                    if show_tools && show_approvals {
-                                                        tools_focus = !tools_focus;
-                                                    }
-                                                }
-                                                KeyCode::Char('1')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    show_tools = !show_tools;
-                                                }
-                                                KeyCode::Char('2')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    show_approvals = !show_approvals;
-                                                }
-                                                KeyCode::Char('3')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    show_logs = !show_logs;
-                                                }
-                                                KeyCode::Char('j')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    if show_tools && (!show_approvals || tools_focus) {
-                                                        if tools_selected + 1 < visible_tool_count {
-                                                            tools_selected += 1;
-                                                        }
-                                                    } else if approvals_selected + 1
-                                                        < ui_state.pending_approvals.len()
-                                                    {
-                                                        approvals_selected += 1;
-                                                    }
-                                                }
-                                                KeyCode::Char('k')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    if show_tools && (!show_approvals || tools_focus) {
-                                                        tools_selected = tools_selected.saturating_sub(1);
-                                                    } else {
-                                                        approvals_selected =
-                                                            approvals_selected.saturating_sub(1);
-                                                    }
-                                                }
-                                                KeyCode::Char('r')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    if let Err(e) =
-                                                        ui_state.refresh_approvals(&paths.approvals_path)
-                                                    {
-                                                        logs.push(format!(
-                                                            "approvals refresh failed: {e}"
-                                                        ));
-                                                    }
-                                                }
-                                                KeyCode::Char('a')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    if let Some(row) =
-                                                        ui_state.pending_approvals.get(approvals_selected)
-                                                    {
-                                                        let store = ApprovalsStore::new(
-                                                            paths.approvals_path.clone(),
-                                                        );
-                                                        if let Err(e) = store.approve(&row.id, None, None)
-                                                        {
-                                                            logs.push(format!("approve failed: {e}"));
-                                                        } else {
-                                                            logs.push(format!("approved {}", row.id));
-                                                        }
-                                                        let _ =
-                                                            ui_state.refresh_approvals(&paths.approvals_path);
-                                                    }
-                                                }
-                                                KeyCode::Char('x')
-                                                    if key
-                                                        .modifiers
-                                                        .contains(KeyModifiers::CONTROL) =>
-                                                {
-                                                    if let Some(row) =
-                                                        ui_state.pending_approvals.get(approvals_selected)
-                                                    {
-                                                        let store = ApprovalsStore::new(
-                                                            paths.approvals_path.clone(),
-                                                        );
-                                                        if let Err(e) = store.deny(&row.id) {
-                                                            logs.push(format!("deny failed: {e}"));
-                                                        } else {
-                                                            logs.push(format!("denied {}", row.id));
-                                                        }
-                                                        let _ =
-                                                            ui_state.refresh_approvals(&paths.approvals_path);
-                                                    }
-                                                }
-                                                KeyCode::Enter => {
-                                                    let line = input.trim().to_string();
-                                                    if let Some(rest) = line.strip_prefix("/interrupt ") {
-                                                        let msg = rest.trim();
-                                                        if msg.is_empty() {
-                                                            logs.push("usage: /interrupt <message>".to_string());
-                                                        } else {
-                                                            let req = crate::operator_queue::QueueSubmitRequest {
-                                                                kind: crate::operator_queue::QueueMessageKind::Steer,
-                                                                content: msg.to_string(),
-                                                            };
-                                                            match queue_tx.send(req) {
-                                                                Ok(_) => logs.push(
-                                                                    "queued Interrupt: will apply after current tool finishes".to_string()
-                                                                ),
-                                                                Err(_) => logs.push(
-                                                                    "queue unavailable: run is ending".to_string()
-                                                                ),
-                                                            }
-                                                            input.clear();
-                                                            slash_menu_index = 0;
-                                                        }
-                                                    } else if let Some(rest) = line.strip_prefix("/next ") {
-                                                        let msg = rest.trim();
-                                                        if msg.is_empty() {
-                                                            logs.push("usage: /next <message>".to_string());
-                                                        } else {
-                                                            let req = crate::operator_queue::QueueSubmitRequest {
-                                                                kind: crate::operator_queue::QueueMessageKind::FollowUp,
-                                                                content: msg.to_string(),
-                                                            };
-                                                            match queue_tx.send(req) {
-                                                                Ok(_) => logs.push(
-                                                                    "queued Next: will apply after this turn completes".to_string()
-                                                                ),
-                                                                Err(_) => logs.push(
-                                                                    "queue unavailable: run is ending".to_string()
-                                                                ),
-                                                            }
-                                                            input.clear();
-                                                            slash_menu_index = 0;
-                                                        }
-                                                    } else if line == "/queue" {
-                                                        let mut rows = active_queue_rows
-                                                            .iter()
-                                                            .map(|(id, row)| {
-                                                                (
-                                                                    row.sequence_no,
-                                                                    id.clone(),
-                                                                    row.kind.clone(),
-                                                                    row.status.clone(),
-                                                                    row.delivery_phrase.clone(),
-                                                                )
-                                                            })
-                                                            .collect::<Vec<_>>();
-                                                        rows.sort_by(|a, b| {
-                                                            a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1))
-                                                        });
-                                                        if rows.is_empty() {
-                                                            logs.push("queue: empty".to_string());
-                                                        } else {
-                                                            logs.push(format!(
-                                                                "queue: {} item(s)",
-                                                                rows.len()
-                                                            ));
-                                                            for (seq, id, kind, status_row, when) in
-                                                                rows.into_iter().take(8)
-                                                            {
-                                                                let label = match kind.as_str() {
-                                                                    "steer" => "Interrupt",
-                                                                    "follow_up" => "Next",
-                                                                    _ => "Unknown",
-                                                                };
-                                                                logs.push(format!(
-                                                                    "  #{seq} {label} [{status_row}] id={id} ({when})"
-                                                                ));
-                                                            }
-                                                        }
-                                                        input.clear();
-                                                        slash_menu_index = 0;
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                        _ => {}
                                     }
-                                }
-                                if status == "idle" {
-                                    break;
+                                    continue;
                                 }
 
+                                match prepare_tui_normal_submit_state(TuiNormalSubmitPrepInput {
+                                    line: &line,
+                                    prompt_history: &mut prompt_history,
+                                    transcript: &mut transcript,
+                                    show_logs: &mut show_logs,
+                                    follow_output: &mut follow_output,
+                                    transcript_scroll: &mut transcript_scroll,
+                                    status: &mut status,
+                                    status_detail: &mut status_detail,
+                                    streaming_assistant: &mut streaming_assistant,
+                                    think_tick: &mut think_tick,
+                                }) {
+                                    TuiNormalSubmitPrepOutcome::HandledNoRun => continue,
+                                    TuiNormalSubmitPrepOutcome::ContinueToRun => {}
+                                }
                                 terminal.draw(|f| {
                                     chat_ui::draw_chat_frame(
                                         f,
@@ -1542,7 +1646,10 @@ pub(crate) async fn run_chat_tui(
                                                 search_query
                                             ))
                                         } else if input.starts_with('/') {
-                                            chat_commands::slash_overlay_text(&input, slash_menu_index)
+                                            chat_commands::slash_overlay_text(
+                                                &input,
+                                                slash_menu_index,
+                                            )
                                         } else if input.starts_with('?') {
                                             chat_commands::keybinds_overlay_text()
                                         } else {
@@ -1550,152 +1657,97 @@ pub(crate) async fn run_chat_tui(
                                         },
                                     );
                                 })?;
-
-                                let maybe_res = tokio::select! {
-                                    r = &mut fut => Some(r),
-                                    _ = tokio::time::sleep(Duration::from_millis(base_run.tui_refresh_ms)) => None,
-                                };
-                                if let Some(res) = maybe_res {
-                                    match res {
-                                        Ok(out) => {
-                                            let outcome = out.outcome;
-                                            let exit_reason = outcome.exit_reason;
-                                            let outcome_error =
-                                                outcome.error.unwrap_or_else(String::new);
-                                            let final_text = if outcome.final_output.is_empty() {
-                                                agent::sanitize_user_visible_output(
-                                                    &streaming_assistant,
-                                                )
-                                            } else {
-                                                outcome.final_output
-                                            };
-                                            if matches!(exit_reason, AgentExitReason::ProviderError) {
-                                                let err = if outcome_error.trim().is_empty() {
-                                                    "provider error".to_string()
-                                                } else {
-                                                    outcome_error.clone()
-                                                };
-                                                provider_connected = false;
-                                                logs.push(err.clone());
-                                                if runtime_config::is_timeout_error_text(&err) && !timeout_notice_active {
-                                                    timeout_notice_active = true;
-                                                    logs.push(runtime_config::timeout_notice_text(&active_run));
-                                                }
-                                                show_logs = true;
-                                                status_detail = format!(
-                                                    "{}: {}",
-                                                    exit_reason.as_str(),
-                                                    chat_view_utils::compact_status_detail(&err, 120)
-                                                );
-                                                transcript.push((
-                                                    "system".to_string(),
-                                                    format!("Provider error: {err}"),
-                                                ));
-                                                if let Some(hint) = runtime_config::protocol_remediation_hint(&err) {
-                                                    logs.push(hint.clone());
-                                                    transcript.push((
-                                                        "system".to_string(),
-                                                        hint,
-                                                    ));
-                                                    show_logs = true;
-                                                }
-                                            } else {
-                                                provider_connected = true;
-                                                if matches!(exit_reason, AgentExitReason::Ok) {
-                                                    status_detail.clear();
-                                                } else {
-                                                    let reason_text = if !outcome_error.trim().is_empty() {
-                                                        outcome_error.clone()
-                                                    } else if !final_text.trim().is_empty() {
-                                                        final_text.clone()
-                                                    } else {
-                                                        exit_reason.as_str().to_string()
-                                                    };
-                                                    let reason_short =
-                                                        chat_view_utils::compact_status_detail(&reason_text, 120);
-                                                    status_detail = format!(
-                                                        "{}: {}",
-                                                        exit_reason.as_str(),
-                                                        reason_short
-                                                    );
-                                                    transcript.push((
-                                                        "system".to_string(),
-                                                        format!(
-                                                            "Run ended with {}: {}",
-                                                            exit_reason.as_str(),
-                                                            chat_view_utils::compact_status_detail(&reason_text, 220)
-                                                        ),
-                                                    ));
-                                                    if let Some(hint) =
-                                                        runtime_config::protocol_remediation_hint(&reason_text)
-                                                    {
-                                                        logs.push(hint.clone());
-                                                        transcript.push((
-                                                            "system".to_string(),
-                                                            hint,
-                                                        ));
-                                                        show_logs = true;
-                                                    }
-                                                }
-                                            }
-                                            if !final_text.trim().is_empty() {
-                                                transcript.push(("assistant".to_string(), final_text));
-                                            }
-                                            if follow_output {
-                                                transcript_scroll = usize::MAX;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let msg = format!("run failed: {e}");
-                                            if runtime_config::is_timeout_error_text(&msg) {
-                                                provider_connected = false;
-                                            }
-                                            logs.push(msg.clone());
-                                            show_logs = true;
-                                            transcript.push(("system".to_string(), msg));
-                                            status_detail = format!(
-                                                "run failed: {}",
-                                                chat_view_utils::compact_status_detail(&e.to_string(), 120)
-                                            );
-                                            if let Some(hint) = runtime_config::protocol_remediation_hint(
-                                                &format!("{e}"),
-                                            ) {
-                                                logs.push(hint.clone());
-                                                transcript.push(("system".to_string(), hint));
-                                                show_logs = true;
-                                            }
-                                            if follow_output {
-                                                transcript_scroll = usize::MAX;
-                                            }
-                                        }
-                                    }
-                                    streaming_assistant.clear();
-                                    status = "idle".to_string();
-                                    break;
-                                }
-                                think_tick = think_tick.saturating_add(1);
                                 ui_tick = ui_tick.saturating_add(1);
+
+                                let TuiSubmitLaunch {
+                                    rx,
+                                    queue_tx,
+                                    fut,
+                                } = match build_tui_normal_submit_launch(
+                                    TuiNormalSubmitLaunchInput {
+                                        provider_kind,
+                                        base_url: &base_url,
+                                        model: &model,
+                                        line: &line,
+                                        active_run: &active_run,
+                                        paths,
+                                        logs: &mut logs,
+                                        show_logs: &mut show_logs,
+                                        transcript: &mut transcript,
+                                        status: &mut status,
+                                        status_detail: &mut status_detail,
+                                        follow_output: &follow_output,
+                                        transcript_scroll: &mut transcript_scroll,
+                                        shared_chat_mcp_registry: &mut shared_chat_mcp_registry,
+                                    },
+                                )
+                                .await?
+                                {
+                                    Some(launch) => launch,
+                                    None => continue,
+                                };
+
+                                drive_tui_active_turn_loop(TuiActiveTurnLoopInput {
+                                    terminal: &mut terminal,
+                                    fut,
+                                    rx,
+                                    queue_tx,
+                                    ui_state: &mut ui_state,
+                                    paths,
+                                    active_run: &active_run,
+                                    base_run,
+                                    provider_kind,
+                                    provider_connected: &mut provider_connected,
+                                    model: &model,
+                                    cwd_label: &cwd_label,
+                                    input: &mut input,
+                                    logs: &mut logs,
+                                    transcript: &mut transcript,
+                                    streaming_assistant: &mut streaming_assistant,
+                                    status: &mut status,
+                                    status_detail: &mut status_detail,
+                                    think_tick: &mut think_tick,
+                                    ui_tick: &mut ui_tick,
+                                    approvals_selected: &mut approvals_selected,
+                                    show_tools: &mut show_tools,
+                                    show_approvals: &mut show_approvals,
+                                    show_logs: &mut show_logs,
+                                    timeout_notice_active: &mut timeout_notice_active,
+                                    transcript_scroll: &mut transcript_scroll,
+                                    follow_output: &mut follow_output,
+                                    compact_tools,
+                                    tools_selected: &mut tools_selected,
+                                    tools_focus: &mut tools_focus,
+                                    show_tool_details: &mut show_tool_details,
+                                    show_banner,
+                                    palette_open,
+                                    palette_items: &palette_items,
+                                    palette_selected,
+                                    search_mode,
+                                    search_query: &search_query,
+                                    slash_menu_index: &mut slash_menu_index,
+                                })
+                                .await?;
                             }
-                        }
-                        KeyCode::Backspace => {
-                            input.pop();
-                            slash_menu_index = 0;
-                        }
-                        KeyCode::Char(c) => {
-                            if chat_runtime::is_text_input_mods(key.modifiers) {
-                                input.push(c);
-                                if c == '/' && input.len() == 1 {
-                                    slash_menu_index = 0;
+                            KeyCode::Backspace => {
+                                input.pop();
+                                slash_menu_index = 0;
+                            }
+                            KeyCode::Char(c) => {
+                                if chat_runtime::is_text_input_mods(key.modifiers) {
+                                    input.push(c);
+                                    if c == '/' && input.len() == 1 {
+                                        slash_menu_index = 0;
+                                    }
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
-                    }
-                    if logs.len() > max_logs {
-                        let drop_n = logs.len() - max_logs;
-                        logs.drain(0..drop_n);
-                    }
-                    ui_tick = ui_tick.saturating_add(1);
+                        if logs.len() > max_logs {
+                            let drop_n = logs.len() - max_logs;
+                            logs.drain(0..drop_n);
+                        }
+                        ui_tick = ui_tick.saturating_add(1);
                     }
                     _ => {}
                 }
