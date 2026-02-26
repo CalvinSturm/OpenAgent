@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -162,7 +162,7 @@ impl SessionStore {
             settings: data.settings.clone(),
             task_memory: mem,
         };
-        write_json_atomic(&self.path, &out)
+        crate::store::write_json_atomic(&self.path, &out)
     }
 
     pub fn reset(&self) -> anyhow::Result<()> {
@@ -258,16 +258,6 @@ fn enforce_memory_size(content: &str) -> anyhow::Result<()> {
             MAX_MEMORY_CONTENT_CHARS
         ));
     }
-    Ok(())
-}
-
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp_path = path.with_extension(format!("tmp.{}", Uuid::new_v4()));
-    std::fs::write(&tmp_path, serde_json::to_string_pretty(value)?)?;
-    std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
 

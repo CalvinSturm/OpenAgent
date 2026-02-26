@@ -590,7 +590,7 @@ pub fn render_replay(record: &RunRecord) -> String {
     out
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
