@@ -1,5 +1,6 @@
 use uuid::Uuid;
 
+use crate::agent_tool_exec::run_tool_once;
 use crate::compaction::{context_size_chars, maybe_compact, CompactionReport, CompactionSettings};
 use crate::events::{EventKind, EventSink};
 use crate::gate::{ApprovalMode, AutoApproveScope, GateContext, GateDecision, GateEvent, ToolGate};
@@ -16,8 +17,8 @@ use crate::providers::http::{message_short, ProviderError};
 use crate::providers::{ModelProvider, StreamDelta};
 use crate::taint::{digest_prefix_hex, TaintMode, TaintSpan, TaintState, TaintToggle};
 use crate::tools::{
-    envelope_to_message, execute_tool, to_tool_result_envelope, tool_side_effects,
-    validate_builtin_tool_args, ToolResultMeta, ToolRuntime,
+    envelope_to_message, to_tool_result_envelope, tool_side_effects, validate_builtin_tool_args,
+    ToolResultMeta, ToolRuntime,
 };
 use crate::trust::policy::{McpAllowSummary, Policy};
 use crate::types::{GenerateRequest, Message, Role, SideEffects, TokenUsage, ToolCall, ToolDef};
@@ -3970,73 +3971,6 @@ impl<P: ModelProvider> Agent<P> {
             ),
         }
     }
-}
-
-async fn run_tool_once(
-    tool_rt: &ToolRuntime,
-    tc: &ToolCall,
-    mcp_registry: Option<&std::sync::Arc<McpRegistry>>,
-) -> ToolRunOutcome {
-    if tc.name.starts_with("mcp.") {
-        match mcp_registry {
-            Some(reg) => match reg.call_namespaced_tool(tc, tool_rt.tool_args_strict).await {
-                Ok(outcome) => ToolRunOutcome {
-                    message: outcome.message,
-                    mcp_meta: Some(outcome.meta),
-                },
-                Err(e) => ToolRunOutcome {
-                    message: envelope_to_message(to_tool_result_envelope(
-                        tc,
-                        "mcp",
-                        false,
-                        format!("mcp call failed: {e}"),
-                        false,
-                        ToolResultMeta {
-                            side_effects: tool_side_effects(&tc.name),
-                            bytes: None,
-                            exit_code: None,
-                            stderr_truncated: None,
-                            stdout_truncated: None,
-                            source: "mcp".to_string(),
-                            execution_target: "host".to_string(),
-                            docker: None,
-                        },
-                    )),
-                    mcp_meta: None,
-                },
-            },
-            None => ToolRunOutcome {
-                message: envelope_to_message(to_tool_result_envelope(
-                    tc,
-                    "mcp",
-                    false,
-                    "mcp registry not available".to_string(),
-                    false,
-                    ToolResultMeta {
-                        side_effects: tool_side_effects(&tc.name),
-                        bytes: None,
-                        exit_code: None,
-                        stderr_truncated: None,
-                        stdout_truncated: None,
-                        source: "mcp".to_string(),
-                        execution_target: "host".to_string(),
-                        docker: None,
-                    },
-                )),
-                mcp_meta: None,
-            },
-        }
-    } else {
-        ToolRunOutcome {
-            message: execute_tool(tool_rt, tc).await,
-            mcp_meta: None,
-        }
-    }
-}
-
-struct ToolRunOutcome {
-    message: Message,
-    mcp_meta: Option<crate::mcp::registry::McpCallMeta>,
 }
 
 fn parse_worker_step_status(
