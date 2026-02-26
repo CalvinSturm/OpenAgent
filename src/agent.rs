@@ -13,7 +13,9 @@ use crate::agent_tool_exec::{
 };
 use crate::agent_utils::{add_opt_u32, provider_name, sha256_hex};
 use crate::agent_worker_protocol::parse_worker_step_status;
-use crate::compaction::{context_size_chars, maybe_compact, CompactionReport, CompactionSettings};
+use crate::compaction::{
+    context_size_chars, maybe_compact, CompactionOutcome, CompactionReport, CompactionSettings,
+};
 use crate::events::{EventKind, EventSink};
 use crate::gate::{ApprovalMode, AutoApproveScope, GateContext, GateDecision, GateEvent, ToolGate};
 use crate::hooks::protocol::{
@@ -366,6 +368,66 @@ impl<P: ModelProvider> Agent<P> {
         Some(reason)
     }
 
+    fn compact_messages_for_step(
+        &mut self,
+        run_id: &str,
+        step: u32,
+        messages: &[Message],
+        provider_retry_count: &mut u32,
+        provider_error_count: &mut u32,
+    ) -> Result<CompactionOutcome, String> {
+        match maybe_compact(messages, &self.compaction_settings) {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                if let Some(pe) = e.downcast_ref::<ProviderError>() {
+                    for r in &pe.retries {
+                        *provider_retry_count = provider_retry_count.saturating_add(1);
+                        self.emit_event(
+                            run_id,
+                            step,
+                            EventKind::ProviderRetry,
+                            serde_json::json!({
+                                "attempt": r.attempt,
+                                "max_attempts": r.max_attempts,
+                                "kind": r.kind,
+                                "status": r.status,
+                                "backoff_ms": r.backoff_ms
+                            }),
+                        );
+                    }
+                    *provider_error_count = provider_error_count.saturating_add(1);
+                    self.emit_event(
+                        run_id,
+                        step,
+                        EventKind::ProviderError,
+                        serde_json::json!({
+                            "kind": pe.kind,
+                            "status": pe.http_status,
+                            "retryable": pe.retryable,
+                            "attempt": pe.attempt,
+                            "max_attempts": pe.max_attempts,
+                            "message_short": message_short(&pe.message)
+                        }),
+                    );
+                }
+                let err_text = format!("compaction failed: {e}");
+                self.emit_event(
+                    run_id,
+                    step,
+                    EventKind::Error,
+                    serde_json::json!({"error": err_text}),
+                );
+                self.emit_event(
+                    run_id,
+                    step,
+                    EventKind::RunEnd,
+                    serde_json::json!({"exit_reason":"provider_error"}),
+                );
+                Err(err_text)
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn queue_operator_message(
         &mut self,
@@ -491,59 +553,22 @@ impl<P: ModelProvider> Agent<P> {
                 active_plan_step_idx,
                 &mut announced_plan_step_id,
             );
-            let compacted = match maybe_compact(&messages, &self.compaction_settings) {
+            let compacted = match self.compact_messages_for_step(
+                &run_id,
+                step as u32,
+                &messages,
+                &mut provider_retry_count,
+                &mut provider_error_count,
+            ) {
                 Ok(c) => c,
-                Err(e) => {
-                    if let Some(pe) = e.downcast_ref::<ProviderError>() {
-                        for r in &pe.retries {
-                            provider_retry_count = provider_retry_count.saturating_add(1);
-                            self.emit_event(
-                                &run_id,
-                                step as u32,
-                                EventKind::ProviderRetry,
-                                serde_json::json!({
-                                    "attempt": r.attempt,
-                                    "max_attempts": r.max_attempts,
-                                    "kind": r.kind,
-                                    "status": r.status,
-                                    "backoff_ms": r.backoff_ms
-                                }),
-                            );
-                        }
-                        provider_error_count = provider_error_count.saturating_add(1);
-                        self.emit_event(
-                            &run_id,
-                            step as u32,
-                            EventKind::ProviderError,
-                            serde_json::json!({
-                                "kind": pe.kind,
-                                "status": pe.http_status,
-                                "retryable": pe.retryable,
-                                "attempt": pe.attempt,
-                                "max_attempts": pe.max_attempts,
-                                "message_short": message_short(&pe.message)
-                            }),
-                        );
-                    }
-                    self.emit_event(
-                        &run_id,
-                        step as u32,
-                        EventKind::Error,
-                        serde_json::json!({"error": format!("compaction failed: {e}")}),
-                    );
-                    self.emit_event(
-                        &run_id,
-                        step as u32,
-                        EventKind::RunEnd,
-                        serde_json::json!({"exit_reason":"provider_error"}),
-                    );
+                Err(err_text) => {
                     return AgentOutcome {
                         run_id,
                         started_at,
                         finished_at: crate::trust::now_rfc3339(),
                         exit_reason: AgentExitReason::ProviderError,
                         final_output: String::new(),
-                        error: Some(format!("compaction failed: {e}")),
+                        error: Some(err_text),
                         messages,
                         tool_calls: observed_tool_calls,
                         tool_decisions: observed_tool_decisions,
