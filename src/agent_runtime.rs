@@ -196,17 +196,8 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
         packs::activate_packs(&args.workdir, &args.packs, packs::PackLimits::default())?
     };
 
-    let mcp_config_path = runtime_paths::resolved_mcp_config_path(args, &paths.state_dir);
-    let mcp_registry = if let Some(reg) = shared_mcp_registry {
-        Some(reg)
-    } else if args.mcp.is_empty() {
-        None
-    } else {
-        Some(std::sync::Arc::new(
-            McpRegistry::from_config_path(&mcp_config_path, &args.mcp, Duration::from_secs(30))
-                .await?,
-        ))
-    };
+    let (mcp_config_path, mcp_registry) =
+        resolve_mcp_runtime_registry(args, paths, shared_mcp_registry).await?;
 
     let prep = run_prep::prepare_tools_and_qualification(run_prep::PrepareToolsInput {
         provider: &provider,
@@ -1321,6 +1312,25 @@ fn build_gate_context(
         taint_overall: taint::TaintLevel::Clean,
         taint_sources: Vec::new(),
     }
+}
+
+async fn resolve_mcp_runtime_registry(
+    args: &RunArgs,
+    paths: &store::StatePaths,
+    shared_mcp_registry: Option<std::sync::Arc<McpRegistry>>,
+) -> anyhow::Result<(std::path::PathBuf, Option<std::sync::Arc<McpRegistry>>)> {
+    let mcp_config_path = runtime_paths::resolved_mcp_config_path(args, &paths.state_dir);
+    let mcp_registry = if let Some(reg) = shared_mcp_registry {
+        Some(reg)
+    } else if args.mcp.is_empty() {
+        None
+    } else {
+        Some(std::sync::Arc::new(
+            McpRegistry::from_config_path(&mcp_config_path, &args.mcp, Duration::from_secs(30))
+                .await?,
+        ))
+    };
+    Ok((mcp_config_path, mcp_registry))
 }
 
 #[derive(Debug, Clone)]
