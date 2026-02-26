@@ -756,6 +756,39 @@ struct TuiOuterKeyDispatchInput<'a> {
     logs: &'a mut Vec<String>,
 }
 
+struct TuiOuterMouseInput<'a> {
+    me: &'a crossterm::event::MouseEvent,
+    transcript: &'a Vec<(String, String)>,
+    streaming_assistant: &'a str,
+    transcript_scroll: &'a mut usize,
+    follow_output: &'a mut bool,
+}
+
+fn handle_tui_outer_mouse_event(input: TuiOuterMouseInput<'_>) {
+    if let Some(delta) = chat_runtime::mouse_scroll_delta(input.me) {
+        let max_scroll =
+            chat_runtime::transcript_max_scroll_lines(input.transcript, input.streaming_assistant);
+        *input.transcript_scroll =
+            chat_runtime::adjust_transcript_scroll(*input.transcript_scroll, delta, max_scroll);
+        *input.follow_output = false;
+    }
+}
+
+struct TuiOuterPasteInput<'a> {
+    pasted: &'a str,
+    input: &'a mut String,
+    history_idx: &'a mut Option<usize>,
+    slash_menu_index: &'a mut usize,
+}
+
+fn handle_tui_outer_paste_event(input: TuiOuterPasteInput<'_>) {
+    input
+        .input
+        .push_str(&chat_runtime::normalize_pasted_text(input.pasted));
+    *input.history_idx = None;
+    *input.slash_menu_index = 0;
+}
+
 struct TuiRenderFrameInput<'a> {
     mode_label: &'a str,
     provider_label: &'a str,
@@ -1706,23 +1739,21 @@ pub(crate) async fn run_chat_tui(
             if event::poll(Duration::from_millis(base_run.tui_refresh_ms))? {
                 match event::read()? {
                     CEvent::Mouse(me) => {
-                        if let Some(delta) = chat_runtime::mouse_scroll_delta(&me) {
-                            let max_scroll = chat_runtime::transcript_max_scroll_lines(
-                                &transcript,
-                                &streaming_assistant,
-                            );
-                            transcript_scroll = chat_runtime::adjust_transcript_scroll(
-                                transcript_scroll,
-                                delta,
-                                max_scroll,
-                            );
-                            follow_output = false;
-                        }
+                        handle_tui_outer_mouse_event(TuiOuterMouseInput {
+                            me: &me,
+                            transcript: &transcript,
+                            streaming_assistant: &streaming_assistant,
+                            transcript_scroll: &mut transcript_scroll,
+                            follow_output: &mut follow_output,
+                        });
                     }
                     CEvent::Paste(pasted) => {
-                        input.push_str(&chat_runtime::normalize_pasted_text(&pasted));
-                        history_idx = None;
-                        slash_menu_index = 0;
+                        handle_tui_outer_paste_event(TuiOuterPasteInput {
+                            pasted: &pasted,
+                            input: &mut input,
+                            history_idx: &mut history_idx,
+                            slash_menu_index: &mut slash_menu_index,
+                        });
                     }
                     CEvent::Key(key) => {
                         match handle_tui_outer_key_prelude(TuiOuterKeyPreludeInput {
