@@ -483,27 +483,71 @@ impl UiState {
             EventKind::McpDrift => {
                 let expected = ev
                     .data
-                    .get("expected_hash_hex")
+                    .get("catalog_hash_expected")
+                    .or_else(|| ev.data.get("expected_hash_hex"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("-");
                 let actual = ev
                     .data
-                    .get("actual_hash_hex")
+                    .get("catalog_hash_live")
+                    .or_else(|| ev.data.get("actual_hash_hex"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("-");
+                let docs_expected = ev
+                    .data
+                    .get("docs_hash_expected")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                let docs_actual = ev
+                    .data
+                    .get("docs_hash_live")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                let catalog_drift = ev
+                    .data
+                    .get("catalog_drift")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(actual != expected && actual != "-");
+                let docs_drift = ev
+                    .data
+                    .get("docs_drift")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let primary_code = ev
+                    .data
+                    .get("primary_code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("MCP_DRIFT");
                 self.mcp_lifecycle = "DRIFT".to_string();
                 self.mcp_pin_state = "DRIFT".to_string();
                 self.mcp_stalled = false;
                 self.mcp_running_for_ms = 0;
-                self.push_log(format!(
-                    "mcp_drift: expected={} actual={} tool={}",
-                    truncate_chars(expected, 12),
-                    truncate_chars(actual, 12),
-                    ev.data
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("mcp.tool")
-                ));
+                let tool = ev
+                    .data
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mcp.tool");
+                let summary = match (catalog_drift, docs_drift) {
+                    (true, true) => format!(
+                        "mcp_drift[{primary_code}]: catalog {}->{} docs {}->{} tool={tool}",
+                        truncate_chars(expected, 12),
+                        truncate_chars(actual, 12),
+                        truncate_chars(docs_expected, 12),
+                        truncate_chars(docs_actual, 12),
+                    ),
+                    (true, false) => format!(
+                        "mcp_drift[{primary_code}]: catalog {}->{} tool={tool}",
+                        truncate_chars(expected, 12),
+                        truncate_chars(actual, 12),
+                    ),
+                    (false, true) => format!(
+                        "mcp_drift[{primary_code}]: docs {}->{} tool={tool}",
+                        truncate_chars(docs_expected, 12),
+                        truncate_chars(docs_actual, 12),
+                    ),
+                    (false, false) => format!("mcp_drift[{primary_code}]: tool={tool}"),
+                };
+                self.push_log(summary);
             }
             EventKind::McpProgress => {
                 let ticks = ev
@@ -1163,6 +1207,31 @@ mod tests {
             }),
         ));
         assert_eq!(s.mcp_lifecycle, "DRIFT");
+    }
+
+    #[test]
+    fn mcp_docs_drift_event_logs_docs_specific_summary() {
+        let mut s = UiState::new(10);
+        s.apply_event(&Event::new(
+            "r1".to_string(),
+            1,
+            EventKind::McpDrift,
+            serde_json::json!({
+                "name":"mcp.stub.echo",
+                "catalog_hash_expected":"aaa",
+                "catalog_hash_live":"aaa",
+                "catalog_drift":false,
+                "docs_hash_expected":"bbb",
+                "docs_hash_live":"ccc",
+                "docs_drift":true,
+                "primary_code":"MCP_DOCS_DRIFT"
+            }),
+        ));
+        assert_eq!(s.mcp_lifecycle, "DRIFT");
+        let last = s.logs.last().cloned().unwrap_or_default();
+        assert!(last.contains("MCP_DOCS_DRIFT"));
+        assert!(last.contains("docs"));
+        assert!(last.contains("mcp.stub.echo"));
     }
 
     #[test]
