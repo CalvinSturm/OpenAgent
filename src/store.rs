@@ -1,18 +1,18 @@
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use hex::encode as hex_encode;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-
-use crate::gate::TrustMode;
 use crate::trust::policy::McpAllowSummary;
-use crate::types::Message;
 
+mod hash;
 mod io;
+mod render;
 mod types;
+pub use hash::{
+    cli_trust_mode, config_hash_hex, hash_tool_schema, mcp_tool_snapshot_hash_hex,
+    provider_to_string, sha256_hex, stable_path_string, tool_schema_hash_hex_map,
+};
 pub(crate) use io::write_json_atomic;
 pub use io::{ensure_dir, load_run_record, write_run_record};
+pub use render::{extract_session_messages, render_replay};
 pub use types::{
     ActivatedPackRecord, ConfigFingerprintV1, McpPinSnapshotRecord, McpToolSnapshotEntry,
     PlannerRunRecord, RunCliConfig, RunCompactionRecord, RunMetadata, RunRecord, RunResolvedPaths,
@@ -68,157 +68,6 @@ pub fn resolve_state_dir(workdir: &Path, state_dir_override: Option<PathBuf>) ->
 
     let new_dir = workdir.join(".localagent");
     (new_dir, false)
-}
-
-pub fn render_replay(record: &RunRecord) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "run_id: {}\nmode: {}\nprovider: {}\nmodel: {}\nexit_reason: {}\nPolicy hash: {}\nConfig hash: {}\napproval_mode: {}\nauto_approve_scope: {}\nunsafe: {}\nno_limits: {}\nunsafe_bypass_allow_flags: {}\n",
-        record.metadata.run_id,
-        record.mode,
-        record.cli.provider,
-        record.cli.model,
-        record.metadata.exit_reason,
-        record.policy_hash_hex.as_deref().unwrap_or("-"),
-        record.config_hash_hex,
-        record.cli.approval_mode,
-        record.cli.auto_approve_scope,
-        record.cli.unsafe_mode,
-        record.cli.no_limits,
-        record.cli.unsafe_bypass_allow_flags
-    ));
-    out.push_str(&format!("exec_target: {}\n", record.cli.exec_target));
-    if let Some(summary) = &record.cli.docker_config_summary {
-        out.push_str(&format!("docker_config: {}\n", summary));
-    }
-    out.push_str(&format!("tui_enabled: {}\n", record.cli.tui_enabled));
-    out.push_str(&format!(
-        "taint: {} mode={} digest_bytes={}\n",
-        record.cli.taint, record.cli.taint_mode, record.cli.taint_digest_bytes
-    ));
-    if let Some(planner) = &record.planner {
-        let steps_count = planner
-            .plan_json
-            .get("steps")
-            .and_then(Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
-        let goal = planner
-            .plan_json
-            .get("goal")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        out.push_str(&format!(
-            "planner: model={} ok={} steps={} hash={}\nplanner_goal: {}\n",
-            planner.model, planner.ok, steps_count, planner.plan_hash_hex, goal
-        ));
-    }
-    for m in &record.transcript {
-        let content = m.content.clone().unwrap_or_default();
-        match m.role {
-            crate::types::Role::User => out.push_str(&format!("USER: {}\n", content)),
-            crate::types::Role::Assistant => out.push_str(&format!("ASSISTANT: {}\n", content)),
-            crate::types::Role::Tool => {
-                let name = m.tool_name.clone().unwrap_or_else(|| "unknown".to_string());
-                out.push_str(&format!("TOOL({}): {}\n", name, content));
-            }
-            crate::types::Role::System => out.push_str(&format!("SYSTEM: {}\n", content)),
-            crate::types::Role::Developer => out.push_str(&format!("DEVELOPER: {}\n", content)),
-        }
-    }
-    out
-}
-
-pub fn cli_trust_mode(mode: TrustMode) -> String {
-    match mode {
-        TrustMode::Auto => "auto".to_string(),
-        TrustMode::On => "on".to_string(),
-        TrustMode::Off => "off".to_string(),
-    }
-}
-
-pub fn extract_session_messages(messages: &[Message]) -> Vec<Message> {
-    messages
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, m)| {
-            if idx == 0
-                && matches!(m.role, crate::types::Role::System)
-                && m.content
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("You are an agent that may call tools")
-            {
-                return None;
-            }
-            if matches!(m.role, crate::types::Role::Developer)
-                && m.content
-                    .as_deref()
-                    .unwrap_or_default()
-                    .starts_with(crate::session::TASK_MEMORY_HEADER)
-            {
-                return None;
-            }
-            if matches!(m.role, crate::types::Role::Developer)
-                && m.content
-                    .as_deref()
-                    .unwrap_or_default()
-                    .starts_with(crate::planner::PLANNER_HANDOFF_HEADER)
-            {
-                return None;
-            }
-            Some(m.clone())
-        })
-        .collect()
-}
-
-pub fn provider_to_string(provider: crate::gate::ProviderKind) -> String {
-    match provider {
-        crate::gate::ProviderKind::Lmstudio => "lmstudio".to_string(),
-        crate::gate::ProviderKind::Llamacpp => "llamacpp".to_string(),
-        crate::gate::ProviderKind::Ollama => "ollama".to_string(),
-        crate::gate::ProviderKind::Mock => "mock".to_string(),
-    }
-}
-
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex_encode(hasher.finalize())
-}
-
-pub fn stable_path_string(path: &Path) -> String {
-    match std::fs::canonicalize(path) {
-        Ok(p) => p.display().to_string(),
-        Err(_) => path.display().to_string(),
-    }
-}
-
-pub fn config_hash_hex(fingerprint: &ConfigFingerprintV1) -> anyhow::Result<String> {
-    let bytes = serde_json::to_vec(fingerprint)?;
-    Ok(sha256_hex(&bytes))
-}
-
-pub fn tool_schema_hash_hex_map(tools: &[crate::types::ToolDef]) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for tool in tools {
-        out.insert(tool.name.clone(), hash_tool_schema(&tool.parameters));
-    }
-    out
-}
-
-pub fn mcp_tool_snapshot_hash_hex(snapshot: &[McpToolSnapshotEntry]) -> anyhow::Result<String> {
-    let mut sorted = snapshot.to_vec();
-    sorted.sort_by(|a, b| a.name.cmp(&b.name));
-    let value = serde_json::to_value(&sorted)?;
-    let canonical = crate::trust::approvals::canonical_json(&value)?;
-    Ok(sha256_hex(canonical.as_bytes()))
-}
-
-pub fn hash_tool_schema(schema: &Value) -> String {
-    let canonical = crate::trust::approvals::canonical_json(schema)
-        .unwrap_or_else(|_| serde_json::to_string(schema).unwrap_or_else(|_| "null".to_string()));
-    sha256_hex(canonical.as_bytes())
 }
 
 #[cfg(test)]
