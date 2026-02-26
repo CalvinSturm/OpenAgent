@@ -98,6 +98,8 @@ async fn mcp_call_routing_returns_wrapped_result() {
     assert!(content.contains("\"schema_version\":\"openagent.tool_result.v1\""));
     assert!(content.contains("\"tool_name\":\"mcp.stub.echo\""));
     assert!(content.contains("\"ok\":true"));
+    assert!(content.contains("\"truncated\":false"));
+    assert!(!content.contains("\"full_output_ref\""));
 }
 
 #[tokio::test]
@@ -143,6 +145,92 @@ async fn mcp_schema_validation_blocks_invalid_args_before_call() {
     let content = msg.message.content.unwrap_or_default();
     assert!(content.contains("invalid tool arguments"));
     assert!(!call_count.exists());
+}
+
+#[tokio::test]
+async fn mcp_oversize_output_is_truncated_and_spooled() {
+    let Some(stub) = stub_bin() else {
+        eprintln!("skipping: CARGO_BIN_EXE_mcp_stub not set");
+        return;
+    };
+    let tmp = tempdir().expect("tempdir");
+    let cfg_path = tmp.path().join("mcp_servers.json");
+    let mut servers = std::collections::BTreeMap::new();
+    servers.insert(
+        "stub".to_string(),
+        McpServerConfig {
+            command: stub,
+            args: vec![],
+        },
+    );
+    let cfg = McpConfigFile {
+        schema_version: "openagent.mcp_servers.v1".to_string(),
+        servers,
+    };
+    fs::write(
+        &cfg_path,
+        serde_json::to_string_pretty(&cfg).expect("serialize"),
+    )
+    .expect("write config");
+
+    let reg =
+        McpRegistry::from_config_path(&cfg_path, &["stub".to_string()], Duration::from_secs(5))
+            .await
+            .expect("start registry");
+
+    let large_msg = "x".repeat(128 * 1024);
+    let tc = ToolCall {
+        id: "tc_large".to_string(),
+        name: "mcp.stub.echo".to_string(),
+        arguments: json!({"msg": large_msg}),
+    };
+    let out = reg
+        .call_namespaced_tool(&tc, ToolArgsStrict::On)
+        .await
+        .expect("call");
+    let content = out.message.content.expect("tool result envelope");
+    let parsed: serde_json::Value = serde_json::from_str(&content).expect("parse envelope");
+    assert_eq!(parsed.get("ok").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        parsed.get("truncated").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        parsed.get("truncate_reason").and_then(|v| v.as_str()),
+        Some("max_bytes")
+    );
+
+    let model_excerpt = parsed
+        .get("content")
+        .and_then(|v| v.as_str())
+        .expect("content string");
+    assert!(model_excerpt.len() <= 64 * 1024);
+
+    let full_ref = parsed
+        .get("full_output_ref")
+        .and_then(|v| v.as_object())
+        .expect("full_output_ref");
+    assert_eq!(
+        full_ref.get("kind").and_then(|v| v.as_str()),
+        Some("state_spool_path")
+    );
+    let spool_path = full_ref
+        .get("path")
+        .and_then(|v| v.as_str())
+        .expect("spool path");
+    let spooled = fs::read_to_string(spool_path).expect("read spooled output");
+    let bytes = spooled.as_bytes();
+    let sha256 = localagent::store::sha256_hex(bytes);
+    assert_eq!(
+        full_ref.get("sha256").and_then(|v| v.as_str()),
+        Some(sha256.as_str())
+    );
+    assert_eq!(
+        full_ref.get("bytes").and_then(|v| v.as_u64()),
+        Some(bytes.len() as u64)
+    );
+    assert!(spool_path.contains(".localagent") || spool_path.contains("tmp"));
+    assert!(spooled.contains("\"echo\""));
 }
 
 #[test]

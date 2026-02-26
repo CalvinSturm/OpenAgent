@@ -54,6 +54,14 @@ pub struct ToolResultMeta {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ToolResultContentRef {
+    pub kind: String,
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolResultEnvelope {
     pub schema_version: String,
     pub tool_name: String,
@@ -61,6 +69,10 @@ pub struct ToolResultEnvelope {
     pub ok: bool,
     pub content: String,
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncate_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_output_ref: Option<ToolResultContentRef>,
     pub meta: ToolResultMeta,
 }
 
@@ -178,6 +190,8 @@ pub fn to_tool_result_envelope(
         ok,
         content,
         truncated,
+        truncate_reason: None,
+        full_output_ref: None,
         meta,
     }
 }

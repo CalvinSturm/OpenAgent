@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -8,10 +9,10 @@ use serde_json::json;
 
 use crate::mcp::client::McpClient;
 use crate::mcp::types::{McpConfigFile, McpServerConfig};
-use crate::store::{mcp_tool_snapshot_hash_hex, McpToolSnapshotEntry};
+use crate::store::{ensure_dir, mcp_tool_snapshot_hash_hex, sha256_hex, McpToolSnapshotEntry};
 use crate::tools::{
     envelope_to_message, to_tool_result_envelope, tool_side_effects, validate_schema_args,
-    ToolArgsStrict, ToolResultMeta,
+    ToolArgsStrict, ToolResultContentRef, ToolResultMeta,
 };
 use crate::types::{Message, ToolCall, ToolDef};
 
@@ -21,6 +22,7 @@ pub struct McpRegistry {
     tool_schema_map: BTreeMap<String, Option<serde_json::Value>>,
     tool_defs: Vec<ToolDef>,
     timeout: Duration,
+    mcp_spool_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -47,6 +49,11 @@ impl McpRegistry {
         let mut tool_map = BTreeMap::new();
         let mut tool_schema_map = BTreeMap::new();
         let mut tool_defs = Vec::new();
+        let mcp_spool_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("tmp")
+            .join("mcp_spool");
 
         for name in enabled {
             let server = config
@@ -80,6 +87,7 @@ impl McpRegistry {
             tool_schema_map,
             tool_defs,
             timeout,
+            mcp_spool_dir,
         })
     }
 
@@ -214,26 +222,86 @@ impl McpRegistry {
             other => serde_json::to_string(&other)
                 .unwrap_or_else(|e| format!("mcp result serialization failed: {e}")),
         };
+        let (model_content, was_truncated) =
+            truncate_utf8_to_bytes(&result_str, MCP_MAX_MODEL_RESULT_BYTES);
+        let mut env = to_tool_result_envelope(
+            tc,
+            "mcp",
+            true,
+            model_content.clone(),
+            was_truncated,
+            ToolResultMeta {
+                side_effects: tool_side_effects(&tc.name),
+                bytes: Some(result_str.len() as u64),
+                exit_code: None,
+                stderr_truncated: None,
+                stdout_truncated: None,
+                source: "mcp".to_string(),
+                execution_target: "host".to_string(),
+                docker: None,
+            },
+        );
+        if was_truncated {
+            env.truncate_reason = Some("max_bytes".to_string());
+            if let Some(output_ref) = spool_full_mcp_output(&self.mcp_spool_dir, tc, &result_str) {
+                env.full_output_ref = Some(output_ref);
+            }
+        }
         Ok(McpCallOutcome {
-            message: envelope_to_message(to_tool_result_envelope(
-                tc,
-                "mcp",
-                true,
-                result_str.clone(),
-                false,
-                ToolResultMeta {
-                    side_effects: tool_side_effects(&tc.name),
-                    bytes: Some(result_str.len() as u64),
-                    exit_code: None,
-                    stderr_truncated: None,
-                    stdout_truncated: None,
-                    source: "mcp".to_string(),
-                    execution_target: "host".to_string(),
-                    docker: None,
-                },
-            )),
+            message: envelope_to_message(env),
             meta,
         })
+    }
+}
+
+const MCP_MAX_MODEL_RESULT_BYTES: usize = 64 * 1024;
+
+fn truncate_utf8_to_bytes(input: &str, max_bytes: usize) -> (String, bool) {
+    if input.len() <= max_bytes {
+        return (input.to_string(), false);
+    }
+    let mut end = max_bytes.min(input.len());
+    while !input.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    (input[..end].to_string(), true)
+}
+
+fn spool_full_mcp_output(
+    spool_dir: &Path,
+    tc: &ToolCall,
+    full_output: &str,
+) -> Option<ToolResultContentRef> {
+    if ensure_dir(spool_dir).is_err() {
+        return None;
+    }
+    let bytes = full_output.as_bytes();
+    let sha256 = sha256_hex(bytes);
+    let tool = sanitize_filename_component(&tc.name);
+    let id = sanitize_filename_component(&tc.id);
+    let file_name = format!("{tool}__{id}__{}.txt", &sha256[..16]);
+    let path = spool_dir.join(file_name);
+    if std::fs::write(&path, bytes).is_err() {
+        return None;
+    }
+    Some(ToolResultContentRef {
+        kind: "state_spool_path".to_string(),
+        path: path.to_string_lossy().to_string(),
+        sha256,
+        bytes: bytes.len() as u64,
+    })
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_');
+        out.push(if ok { ch } else { '_' });
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
     }
 }
 
@@ -337,6 +405,7 @@ mod tests {
             tool_schema_map: BTreeMap::new(),
             tool_defs: defs.clone(),
             timeout: std::time::Duration::from_secs(1),
+            mcp_spool_dir: std::path::PathBuf::from("."),
         };
         let reg_b = super::McpRegistry {
             clients: BTreeMap::new(),
@@ -344,9 +413,23 @@ mod tests {
             tool_schema_map: BTreeMap::new(),
             tool_defs: defs,
             timeout: std::time::Duration::from_secs(1),
+            mcp_spool_dir: std::path::PathBuf::from("."),
         };
         let a = reg_a.configured_tool_catalog_hash_hex().expect("hash a");
         let b = reg_b.configured_tool_catalog_hash_hex().expect("hash b");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn truncate_utf8_to_bytes_preserves_char_boundary() {
+        let input = "abc🙂def";
+        let (truncated, was_truncated) = super::truncate_utf8_to_bytes(input, 5);
+        assert!(was_truncated);
+        assert_eq!(truncated, "abc");
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+
+        let (full, was_truncated) = super::truncate_utf8_to_bytes(input, input.len());
+        assert!(!was_truncated);
+        assert_eq!(full, input);
     }
 }
