@@ -127,6 +127,7 @@ fn build_run_cli_config() -> RunCliConfig {
         active_profile: None,
         profile_source: None,
         profile_hash_hex: None,
+        activated_packs: Vec::new(),
     }
 }
 

@@ -14,6 +14,7 @@ use crate::gate::{ApprovalMode, GateContext, ProviderKind};
 use crate::hooks::runner::{HookManager, HookRuntimeConfig};
 use crate::mcp::registry::McpRegistry;
 use crate::ops_helpers;
+use crate::packs;
 use crate::planner;
 use crate::project_guidance;
 use crate::providers::ModelProvider;
@@ -227,6 +228,11 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
     } else {
         None
     };
+    let activated_packs = if args.packs.is_empty() {
+        Vec::new()
+    } else {
+        packs::activate_packs(&args.workdir, &args.packs, packs::PackLimits::default())?
+    };
 
     let mcp_config_path = runtime_paths::resolved_mcp_config_path(args, &paths.state_dir);
     let mcp_registry = if let Some(reg) = shared_mcp_registry {
@@ -369,6 +375,21 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
             "pinned": mcp_snapshot_pinned
         }),
     );
+    for p in &activated_packs {
+        runtime_events::emit_event(
+            &mut event_sink,
+            &run_id,
+            0,
+            EventKind::PackActivated,
+            serde_json::json!({
+                "schema": "openagent.pack_activated.v1",
+                "pack_id": p.pack_id,
+                "pack_hash_hex": p.pack_hash_hex,
+                "truncated": p.truncated,
+                "bytes_kept": p.bytes_kept
+            }),
+        );
+    }
     if let Some(note) = &qualification_fallback_note {
         runtime_events::emit_event(
             &mut event_sink,
@@ -498,6 +519,7 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                             instructions: &instruction_resolution,
                             project_guidance: project_guidance_resolution.as_ref(),
                             repo_map: repo_map_resolution.as_ref(),
+                            activated_packs: &activated_packs,
                         });
                     let config_fingerprint = runtime_paths::build_config_fingerprint(
                         &cli_config,
@@ -685,6 +707,7 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                         instructions: &instruction_resolution,
                         project_guidance: project_guidance_resolution.as_ref(),
                         repo_map: repo_map_resolution.as_ref(),
+                        activated_packs: &activated_packs,
                     });
                 let config_fingerprint = runtime_paths::build_config_fingerprint(
                     &cli_config,
@@ -803,11 +826,13 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
     let repo_map_message = repo_map_resolution
         .as_ref()
         .and_then(repo_map::repo_map_message);
+    let pack_guidance_message = packs::pack_guidance_message(&activated_packs);
     let base_task_memory = task_memory.clone();
     let initial_injected_messages = runtime_paths::merge_injected_messages(
         base_instruction_messages.clone(),
         project_guidance_message.clone(),
         repo_map_message.clone(),
+        pack_guidance_message.clone(),
         base_task_memory.clone(),
         planner_injected_message.clone(),
     );
@@ -985,6 +1010,7 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                     base_instruction_messages.clone(),
                     project_guidance_message.clone(),
                     repo_map_message.clone(),
+                    pack_guidance_message.clone(),
                     base_task_memory.clone(),
                     Some(Message {
                         role: Role::Developer,
@@ -1157,6 +1183,7 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
         instructions: &instruction_resolution,
         project_guidance: project_guidance_resolution.as_ref(),
         repo_map: repo_map_resolution.as_ref(),
+        activated_packs: &activated_packs,
     });
     let config_fingerprint =
         runtime_paths::build_config_fingerprint(&cli_config, args, &worker_model, paths);

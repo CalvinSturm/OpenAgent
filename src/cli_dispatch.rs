@@ -690,6 +690,29 @@ pub(crate) async fn run_cli() -> anyhow::Result<()> {
             return Ok(());
         }
 
+        Some(Commands::Pack(args)) => {
+            match &args.command {
+                PackSubcommand::List => {
+                    let packs = crate::packs::discover_packs(
+                        &workdir,
+                        crate::packs::PackLimits::default(),
+                    )?;
+                    println!("{}", crate::packs::render_pack_list_text(&packs));
+                }
+                PackSubcommand::Show { pack_id } => {
+                    println!(
+                        "{}",
+                        crate::packs::render_pack_show_text(
+                            &workdir,
+                            pack_id,
+                            crate::packs::PackLimits::default()
+                        )?
+                    );
+                }
+            }
+            return Ok(());
+        }
+
         Some(Commands::Eval(eval_cmd)) => {
             if let Some(sub) = &eval_cmd.command {
                 match sub {

@@ -112,6 +112,15 @@ pub struct McpToolSnapshotEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivatedPackRecord {
+    pub pack_id: String,
+    pub pack_hash_hex: String,
+    pub bytes_loaded: u64,
+    pub bytes_kept: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpPinSnapshotRecord {
     pub enforcement: String,
     pub configured_catalog_hash_hex: String,
@@ -279,6 +288,8 @@ pub struct RunCliConfig {
     pub profile_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_hash_hex: Option<String>,
+    #[serde(default)]
+    pub activated_packs: Vec<ActivatedPackRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -978,6 +989,7 @@ mod tests {
                 active_profile: None,
                 profile_source: None,
                 profile_hash_hex: None,
+                activated_packs: Vec::new(),
             },
             PolicyRecordInfo {
                 source: "none".to_string(),
@@ -1162,6 +1174,7 @@ mod tests {
                 active_profile: None,
                 profile_source: None,
                 profile_hash_hex: None,
+                activated_packs: Vec::new(),
             },
             resolved_paths: RunResolvedPaths {
                 state_dir: ".".to_string(),

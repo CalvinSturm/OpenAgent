@@ -619,6 +619,27 @@ impl UiState {
                     pinned
                 ));
             }
+            EventKind::PackActivated => {
+                let pack_id = ev
+                    .data
+                    .get("pack_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("pack");
+                let truncated = ev
+                    .data
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let bytes_kept = ev
+                    .data
+                    .get("bytes_kept")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                self.push_log(format!(
+                    "pack_activated: id={} truncated={} bytes_kept={}",
+                    pack_id, truncated, bytes_kept
+                ));
+            }
             EventKind::Error => {
                 let msg = ev
                     .data

@@ -1313,6 +1313,7 @@ fn write_run_artifact_for_eval(
         active_profile: None,
         profile_source: None,
         profile_hash_hex: None,
+        activated_packs: Vec::new(),
     };
     let fingerprint = ConfigFingerprintV1 {
         schema_version: "openagent.confighash.v1".to_string(),

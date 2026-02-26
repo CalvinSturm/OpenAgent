@@ -38,6 +38,7 @@ localagent --provider lmstudio --model <model> chat --tui
 - `session`
 - `eval`
 - `repo`
+- `pack`
 - `tui`
 - `tasks`
 
@@ -52,6 +53,7 @@ localagent --provider lmstudio --model <model> chat --tui
 - `--workdir <PATH>` (default: `.`)
 - `--state-dir <PATH>`
 - `--mcp <NAME>` (repeatable)
+- `--pack <PACK_ID>` (repeatable)
 - `--mcp-config <PATH>`
 - `--reliability-profile <local_small_strict|coding_balanced|web_cautious>`
 
@@ -297,6 +299,16 @@ Major eval-only options:
 ### `repo`
 
 - `localagent repo map [--print-content] [--no-write] [--max-files <N>] [--max-scan-bytes <N>] [--max-out-bytes <N>]`
+
+### `pack`
+
+- `localagent pack list`
+- `localagent pack show <PACK_ID>`
+
+Notes:
+- Packs are discovered from `.localagent/packs/<pack_id>/PACK.md`.
+- Pack activation is operator-controlled and per-run via repeatable `--pack <PACK_ID>`.
+- Activated packs inject bounded guidance blocks and are recorded in run artifacts/events.
 - `--timeout-seconds <N>`
 - `--min-pass-rate <0..1>`
 - `--fail-on-any`

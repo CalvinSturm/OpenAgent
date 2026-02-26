@@ -399,6 +399,7 @@ fn minimal_cli_config_for_mcp_test() -> RunCliConfig {
         active_profile: None,
         profile_source: None,
         profile_hash_hex: None,
+        activated_packs: Vec::new(),
     }
 }
 

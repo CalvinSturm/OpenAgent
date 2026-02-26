@@ -21,6 +21,7 @@
   "policy_version": 2,
   "schema_keys": {
     "cli": [
+      "activated_packs",
       "allow_shell",
       "allow_write",
       "approval_key",

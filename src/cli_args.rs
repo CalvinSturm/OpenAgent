@@ -51,6 +51,8 @@ pub(crate) enum Commands {
 
     Profile(ProfileArgs),
 
+    Pack(PackArgs),
+
     Hooks(HooksArgs),
 
     Policy(PolicyArgs),
@@ -437,6 +439,18 @@ pub(crate) enum ProfileSubcommand {
 pub(crate) struct ProfileArgs {
     #[command(subcommand)]
     pub(crate) command: ProfileSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PackSubcommand {
+    List,
+    Show { pack_id: String },
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct PackArgs {
+    #[command(subcommand)]
+    pub(crate) command: PackSubcommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -850,6 +864,9 @@ pub(crate) struct RunArgs {
 
     #[arg(long = "mcp")]
     pub(crate) mcp: Vec<String>,
+
+    #[arg(long = "pack")]
+    pub(crate) packs: Vec<String>,
 
     #[arg(long)]
     pub(crate) mcp_config: Option<PathBuf>,

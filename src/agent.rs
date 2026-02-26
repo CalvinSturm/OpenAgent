@@ -467,6 +467,7 @@ impl<P: ModelProvider> Agent<P> {
             EventKind::McpCancelled => push("cancelled"),
             EventKind::McpPinned => push("pinned"),
             EventKind::McpDrift => push("drift"),
+            EventKind::PackActivated => push("pack"),
             _ => {}
         }
     }

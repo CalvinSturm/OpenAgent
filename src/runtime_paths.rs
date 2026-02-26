@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::gate::ProviderKind;
 use crate::instructions::InstructionResolution;
+use crate::packs::ActivatedPack;
 use crate::planner;
 use crate::project_guidance::ResolvedProjectGuidance;
 use crate::repo_map::ResolvedRepoMap;
@@ -18,6 +19,7 @@ pub(crate) fn merge_injected_messages(
     mut instruction_messages: Vec<Message>,
     project_guidance: Option<Message>,
     repo_map: Option<Message>,
+    pack_guidance: Option<Message>,
     task_memory: Option<Message>,
     planner_handoff: Option<Message>,
 ) -> Vec<Message> {
@@ -25,6 +27,9 @@ pub(crate) fn merge_injected_messages(
         instruction_messages.push(m);
     }
     if let Some(m) = repo_map {
+        instruction_messages.push(m);
+    }
+    if let Some(m) = pack_guidance {
         instruction_messages.push(m);
     }
     if let Some(m) = task_memory {
@@ -60,6 +65,7 @@ pub(crate) struct RunCliConfigInput<'a> {
     pub instructions: &'a InstructionResolution,
     pub project_guidance: Option<&'a ResolvedProjectGuidance>,
     pub repo_map: Option<&'a ResolvedRepoMap>,
+    pub activated_packs: &'a [ActivatedPack],
 }
 
 pub(crate) fn build_run_cli_config(input: RunCliConfigInput<'_>) -> RunCliConfig {
@@ -87,6 +93,7 @@ pub(crate) fn build_run_cli_config(input: RunCliConfigInput<'_>) -> RunCliConfig
         instructions,
         project_guidance,
         repo_map,
+        activated_packs,
     } = input;
     RunCliConfig {
         mode: format!("{:?}", mode).to_lowercase(),
@@ -213,6 +220,16 @@ pub(crate) fn build_run_cli_config(input: RunCliConfigInput<'_>) -> RunCliConfig
         active_profile: args.reliability_profile.clone(),
         profile_source: args.resolved_reliability_profile_source.clone(),
         profile_hash_hex: args.resolved_reliability_profile_hash_hex.clone(),
+        activated_packs: activated_packs
+            .iter()
+            .map(|p| store::ActivatedPackRecord {
+                pack_id: p.pack_id.clone(),
+                pack_hash_hex: p.pack_hash_hex.clone(),
+                bytes_loaded: p.bytes_loaded,
+                bytes_kept: p.bytes_kept,
+                truncated: p.truncated,
+            })
+            .collect(),
     }
 }
 

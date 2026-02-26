@@ -45,6 +45,7 @@ pub enum EventKind {
     McpCancelled,
     McpPinned,
     McpDrift,
+    PackActivated,
     Error,
 }
 
@@ -222,5 +223,17 @@ mod tests {
         );
         let s = serde_json::to_string(&ev).expect("serialize");
         assert!(s.contains("\"repro_snapshot\""));
+    }
+
+    #[test]
+    fn pack_activated_kind_serializes() {
+        let ev = Event::new(
+            "r".to_string(),
+            1,
+            EventKind::PackActivated,
+            serde_json::json!({"pack_id":"web/playwright"}),
+        );
+        let s = serde_json::to_string(&ev).expect("serialize");
+        assert!(s.contains("\"pack_activated\""));
     }
 }

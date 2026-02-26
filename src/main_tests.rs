@@ -729,6 +729,7 @@ fn default_run_args() -> super::RunArgs {
         state_dir: None,
 
         mcp: Vec::new(),
+        packs: Vec::new(),
 
         mcp_config: None,
 
