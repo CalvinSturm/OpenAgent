@@ -44,6 +44,19 @@ enum TuiNormalSubmitPrepOutcome {
     HandledNoRun,
 }
 
+enum TuiOuterKeyPreludeOutcome {
+    BreakLoop,
+    ContinueLoop,
+    Proceed,
+}
+
+enum TuiOuterKeyDispatchOutcome {
+    BreakLoop,
+    ContinueLoop,
+    Handled,
+    EnterInline,
+}
+
 type TuiRunFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<RunExecutionResult>> + Send>>;
 
@@ -681,6 +694,360 @@ struct TuiNormalSubmitPrepInput<'a> {
     think_tick: &'a mut u64,
 }
 
+struct TuiOuterKeyPreludeInput<'a> {
+    key: crossterm::event::KeyEvent,
+    palette_open: &'a mut bool,
+    search_mode: &'a mut bool,
+    follow_output: &'a mut bool,
+    transcript_scroll: &'a mut usize,
+}
+
+fn handle_tui_outer_key_prelude(input: TuiOuterKeyPreludeInput<'_>) -> TuiOuterKeyPreludeOutcome {
+    if !matches!(input.key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return TuiOuterKeyPreludeOutcome::ContinueLoop;
+    }
+    if input.key.code == KeyCode::Esc {
+        return TuiOuterKeyPreludeOutcome::BreakLoop;
+    }
+    if input.key.code == KeyCode::End {
+        *input.follow_output = true;
+        *input.transcript_scroll = usize::MAX;
+        return TuiOuterKeyPreludeOutcome::ContinueLoop;
+    }
+    if input.key.code == KeyCode::Char('p') && input.key.modifiers.contains(KeyModifiers::CONTROL) {
+        *input.palette_open = !*input.palette_open;
+        *input.search_mode = false;
+        return TuiOuterKeyPreludeOutcome::ContinueLoop;
+    }
+    if input.key.code == KeyCode::Char('f') && input.key.modifiers.contains(KeyModifiers::CONTROL) {
+        *input.search_mode = true;
+        *input.palette_open = false;
+        return TuiOuterKeyPreludeOutcome::ContinueLoop;
+    }
+    TuiOuterKeyPreludeOutcome::Proceed
+}
+
+struct TuiOuterKeyDispatchInput<'a> {
+    key: crossterm::event::KeyEvent,
+    input: &'a mut String,
+    prompt_history: &'a mut Vec<String>,
+    history_idx: &'a mut Option<usize>,
+    slash_menu_index: &'a mut usize,
+    palette_open: &'a mut bool,
+    palette_items: &'a [&'a str],
+    palette_selected: &'a mut usize,
+    search_mode: &'a mut bool,
+    search_query: &'a mut String,
+    search_line_cursor: &'a mut usize,
+    transcript: &'a mut Vec<(String, String)>,
+    streaming_assistant: &'a mut String,
+    transcript_scroll: &'a mut usize,
+    follow_output: &'a mut bool,
+    ui_state: &'a mut UiState,
+    visible_tool_count: usize,
+    show_tools: &'a mut bool,
+    show_approvals: &'a mut bool,
+    show_logs: &'a mut bool,
+    compact_tools: &'a mut bool,
+    tools_selected: &'a mut usize,
+    tools_focus: &'a mut bool,
+    approvals_selected: &'a mut usize,
+    paths: &'a store::StatePaths,
+    logs: &'a mut Vec<String>,
+}
+
+fn handle_tui_outer_key_dispatch(
+    input: TuiOuterKeyDispatchInput<'_>,
+) -> TuiOuterKeyDispatchOutcome {
+    if *input.palette_open {
+        match input.key.code {
+            KeyCode::Esc => *input.palette_open = false,
+            KeyCode::Up => {
+                *input.palette_selected = input.palette_selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if *input.palette_selected + 1 < input.palette_items.len() {
+                    *input.palette_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                match *input.palette_selected {
+                    0 => *input.show_tools = !*input.show_tools,
+                    1 => *input.show_approvals = !*input.show_approvals,
+                    2 => *input.show_logs = !*input.show_logs,
+                    3 => *input.compact_tools = !*input.compact_tools,
+                    4 => {
+                        input.transcript.clear();
+                        input.ui_state.tool_calls.clear();
+                        input.streaming_assistant.clear();
+                        *input.transcript_scroll = 0;
+                        *input.follow_output = true;
+                    }
+                    5 => {
+                        *input.follow_output = true;
+                        *input.transcript_scroll = usize::MAX;
+                    }
+                    _ => {}
+                }
+                *input.palette_open = false;
+            }
+            _ => {}
+        }
+        return TuiOuterKeyDispatchOutcome::ContinueLoop;
+    }
+    if *input.search_mode {
+        let mut do_search = false;
+        match input.key.code {
+            KeyCode::Esc => *input.search_mode = false,
+            KeyCode::Backspace => {
+                input.search_query.pop();
+                *input.search_line_cursor = 0;
+                do_search = true;
+            }
+            KeyCode::Enter => {
+                do_search = true;
+                *input.search_line_cursor = input.search_line_cursor.saturating_add(1);
+            }
+            KeyCode::Char(c) if chat_runtime::is_text_input_mods(input.key.modifiers) => {
+                input.search_query.push(c);
+                *input.search_line_cursor = 0;
+                do_search = true;
+            }
+            _ => {}
+        }
+        if do_search && !input.search_query.is_empty() {
+            let hay = input
+                .transcript
+                .iter()
+                .map(|(role, text)| format!("{}: {}", role.to_uppercase(), text))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let lines: Vec<&str> = hay.lines().collect();
+            let query = input.search_query.to_lowercase();
+            let mut found = None;
+            for (idx, line) in lines.iter().enumerate().skip(*input.search_line_cursor) {
+                if line.to_lowercase().contains(&query) {
+                    found = Some(idx);
+                    break;
+                }
+            }
+            if found.is_none() {
+                for (idx, line) in lines.iter().enumerate().take(*input.search_line_cursor) {
+                    if line.to_lowercase().contains(&query) {
+                        found = Some(idx);
+                        break;
+                    }
+                }
+            }
+            if let Some(idx) = found {
+                *input.transcript_scroll = idx;
+                *input.follow_output = false;
+                *input.search_line_cursor = idx;
+            }
+        }
+        return TuiOuterKeyDispatchOutcome::ContinueLoop;
+    }
+
+    match input.key.code {
+        KeyCode::Char('c') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            TuiOuterKeyDispatchOutcome::BreakLoop
+        }
+        KeyCode::Up => {
+            if input.input.starts_with('/') {
+                let matches_len = chat_commands::slash_match_count(input.input);
+                if matches_len > 0 {
+                    *input.slash_menu_index = if *input.slash_menu_index == 0 {
+                        matches_len - 1
+                    } else {
+                        *input.slash_menu_index - 1
+                    };
+                }
+                return TuiOuterKeyDispatchOutcome::ContinueLoop;
+            }
+            if !input.prompt_history.is_empty() {
+                let next = match *input.history_idx {
+                    None => input.prompt_history.len().saturating_sub(1),
+                    Some(i) => i.saturating_sub(1),
+                };
+                *input.history_idx = Some(next);
+                *input.input = input.prompt_history[next].clone();
+            }
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Down => {
+            if input.input.starts_with('/') {
+                let matches_len = chat_commands::slash_match_count(input.input);
+                if matches_len > 0 {
+                    *input.slash_menu_index = (*input.slash_menu_index + 1) % matches_len;
+                }
+                return TuiOuterKeyDispatchOutcome::ContinueLoop;
+            }
+            if !input.prompt_history.is_empty() {
+                if let Some(i) = *input.history_idx {
+                    let next = (i + 1).min(input.prompt_history.len());
+                    if next >= input.prompt_history.len() {
+                        *input.history_idx = None;
+                        input.input.clear();
+                    } else {
+                        *input.history_idx = Some(next);
+                        *input.input = input.prompt_history[next].clone();
+                    }
+                }
+            }
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::PageUp => {
+            let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                input.transcript,
+                input.streaming_assistant,
+            );
+            *input.transcript_scroll =
+                chat_runtime::adjust_transcript_scroll(*input.transcript_scroll, -12, max_scroll);
+            *input.follow_output = false;
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::PageDown => {
+            let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                input.transcript,
+                input.streaming_assistant,
+            );
+            *input.transcript_scroll =
+                chat_runtime::adjust_transcript_scroll(*input.transcript_scroll, 12, max_scroll);
+            *input.follow_output = false;
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('u') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                input.transcript,
+                input.streaming_assistant,
+            );
+            *input.transcript_scroll =
+                chat_runtime::adjust_transcript_scroll(*input.transcript_scroll, -10, max_scroll);
+            *input.follow_output = false;
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('d') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let max_scroll = chat_runtime::transcript_max_scroll_lines(
+                input.transcript,
+                input.streaming_assistant,
+            );
+            *input.transcript_scroll =
+                chat_runtime::adjust_transcript_scroll(*input.transcript_scroll, 10, max_scroll);
+            *input.follow_output = false;
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('t') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            *input.show_tools = !*input.show_tools;
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('y') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            *input.show_approvals = !*input.show_approvals;
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('g') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            *input.show_logs = !*input.show_logs;
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Tab => {
+            if *input.show_tools && (*input.show_approvals) {
+                *input.tools_focus = !*input.tools_focus;
+            }
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('1') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            *input.show_tools = !*input.show_tools;
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('2') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            *input.show_approvals = !*input.show_approvals;
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('3') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            *input.show_logs = !*input.show_logs;
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('j') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if *input.show_tools && (!*input.show_approvals || *input.tools_focus) {
+                if *input.tools_selected + 1 < input.visible_tool_count {
+                    *input.tools_selected += 1;
+                }
+            } else if *input.approvals_selected + 1 < input.ui_state.pending_approvals.len() {
+                *input.approvals_selected += 1;
+            }
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('k') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if *input.show_tools && (!*input.show_approvals || *input.tools_focus) {
+                *input.tools_selected = input.tools_selected.saturating_sub(1);
+            } else {
+                *input.approvals_selected = input.approvals_selected.saturating_sub(1);
+            }
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('r') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Err(e) = input
+                .ui_state
+                .refresh_approvals(&input.paths.approvals_path)
+            {
+                input.logs.push(format!("approvals refresh failed: {e}"));
+            }
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('a') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(row) = input
+                .ui_state
+                .pending_approvals
+                .get(*input.approvals_selected)
+            {
+                let store = ApprovalsStore::new(input.paths.approvals_path.clone());
+                if let Err(e) = store.approve(&row.id, None, None) {
+                    input.logs.push(format!("approve failed: {e}"));
+                } else {
+                    input.logs.push(format!("approved {}", row.id));
+                }
+                let _ = input
+                    .ui_state
+                    .refresh_approvals(&input.paths.approvals_path);
+            }
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char('x') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(row) = input
+                .ui_state
+                .pending_approvals
+                .get(*input.approvals_selected)
+            {
+                let store = ApprovalsStore::new(input.paths.approvals_path.clone());
+                if let Err(e) = store.deny(&row.id) {
+                    input.logs.push(format!("deny failed: {e}"));
+                } else {
+                    input.logs.push(format!("denied {}", row.id));
+                }
+                let _ = input
+                    .ui_state
+                    .refresh_approvals(&input.paths.approvals_path);
+            }
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Enter => TuiOuterKeyDispatchOutcome::EnterInline,
+        KeyCode::Backspace => {
+            input.input.pop();
+            *input.slash_menu_index = 0;
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Char(c) => {
+            if chat_runtime::is_text_input_mods(input.key.modifiers) {
+                input.input.push(c);
+                if c == '/' && input.input.len() == 1 {
+                    *input.slash_menu_index = 0;
+                }
+            }
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        _ => TuiOuterKeyDispatchOutcome::Handled,
+    }
+}
+
 fn prepare_tui_normal_submit_state(
     input: TuiNormalSubmitPrepInput<'_>,
 ) -> TuiNormalSubmitPrepOutcome {
@@ -1219,291 +1586,49 @@ pub(crate) async fn run_chat_tui(
                         slash_menu_index = 0;
                     }
                     CEvent::Key(key) => {
-                        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                            continue;
+                        match handle_tui_outer_key_prelude(TuiOuterKeyPreludeInput {
+                            key,
+                            palette_open: &mut palette_open,
+                            search_mode: &mut search_mode,
+                            follow_output: &mut follow_output,
+                            transcript_scroll: &mut transcript_scroll,
+                        }) {
+                            TuiOuterKeyPreludeOutcome::BreakLoop => break,
+                            TuiOuterKeyPreludeOutcome::ContinueLoop => continue,
+                            TuiOuterKeyPreludeOutcome::Proceed => {}
                         }
-                        if key.code == KeyCode::Esc {
-                            break;
-                        }
-                        if key.code == KeyCode::End {
-                            follow_output = true;
-                            transcript_scroll = usize::MAX;
-                            continue;
-                        }
-                        if key.code == KeyCode::Char('p')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            palette_open = !palette_open;
-                            search_mode = false;
-                            continue;
-                        }
-                        if key.code == KeyCode::Char('f')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            search_mode = true;
-                            palette_open = false;
-                            continue;
-                        }
-                        if palette_open {
-                            match key.code {
-                                KeyCode::Esc => palette_open = false,
-                                KeyCode::Up => {
-                                    palette_selected = palette_selected.saturating_sub(1);
-                                }
-                                KeyCode::Down => {
-                                    if palette_selected + 1 < palette_items.len() {
-                                        palette_selected += 1;
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    match palette_selected {
-                                        0 => show_tools = !show_tools,
-                                        1 => show_approvals = !show_approvals,
-                                        2 => show_logs = !show_logs,
-                                        3 => compact_tools = !compact_tools,
-                                        4 => {
-                                            transcript.clear();
-                                            ui_state.tool_calls.clear();
-                                            streaming_assistant.clear();
-                                            transcript_scroll = 0;
-                                            follow_output = true;
-                                        }
-                                        5 => {
-                                            follow_output = true;
-                                            transcript_scroll = usize::MAX;
-                                        }
-                                        _ => {}
-                                    }
-                                    palette_open = false;
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-                        if search_mode {
-                            let mut do_search = false;
-                            match key.code {
-                                KeyCode::Esc => search_mode = false,
-                                KeyCode::Backspace => {
-                                    search_query.pop();
-                                    search_line_cursor = 0;
-                                    do_search = true;
-                                }
-                                KeyCode::Enter => {
-                                    do_search = true;
-                                    search_line_cursor = search_line_cursor.saturating_add(1);
-                                }
-                                KeyCode::Char(c)
-                                    if chat_runtime::is_text_input_mods(key.modifiers) =>
-                                {
-                                    search_query.push(c);
-                                    search_line_cursor = 0;
-                                    do_search = true;
-                                }
-                                _ => {}
-                            }
-                            if do_search && !search_query.is_empty() {
-                                let hay = transcript
-                                    .iter()
-                                    .map(|(role, text)| {
-                                        format!("{}: {}", role.to_uppercase(), text)
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n\n");
-                                let lines: Vec<&str> = hay.lines().collect();
-                                let query = search_query.to_lowercase();
-                                let mut found = None;
-                                for (idx, line) in lines.iter().enumerate().skip(search_line_cursor)
-                                {
-                                    if line.to_lowercase().contains(&query) {
-                                        found = Some(idx);
-                                        break;
-                                    }
-                                }
-                                if found.is_none() {
-                                    for (idx, line) in
-                                        lines.iter().enumerate().take(search_line_cursor)
-                                    {
-                                        if line.to_lowercase().contains(&query) {
-                                            found = Some(idx);
-                                            break;
-                                        }
-                                    }
-                                }
-                                if let Some(idx) = found {
-                                    transcript_scroll = idx;
-                                    follow_output = false;
-                                    search_line_cursor = idx;
-                                }
-                            }
-                            continue;
-                        }
-                        match key.code {
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                break
-                            }
-                            KeyCode::Up => {
-                                if input.starts_with('/') {
-                                    let matches_len = chat_commands::slash_match_count(&input);
-                                    if matches_len > 0 {
-                                        slash_menu_index = if slash_menu_index == 0 {
-                                            matches_len - 1
-                                        } else {
-                                            slash_menu_index - 1
-                                        };
-                                    }
-                                    continue;
-                                }
-                                if !prompt_history.is_empty() {
-                                    let next = match history_idx {
-                                        None => prompt_history.len().saturating_sub(1),
-                                        Some(i) => i.saturating_sub(1),
-                                    };
-                                    history_idx = Some(next);
-                                    input = prompt_history[next].clone();
-                                }
-                            }
-                            KeyCode::Down => {
-                                if input.starts_with('/') {
-                                    let matches_len = chat_commands::slash_match_count(&input);
-                                    if matches_len > 0 {
-                                        slash_menu_index = (slash_menu_index + 1) % matches_len;
-                                    }
-                                    continue;
-                                }
-                                if !prompt_history.is_empty() {
-                                    if let Some(i) = history_idx {
-                                        let next = (i + 1).min(prompt_history.len());
-                                        if next >= prompt_history.len() {
-                                            history_idx = None;
-                                            input.clear();
-                                        } else {
-                                            history_idx = Some(next);
-                                            input = prompt_history[next].clone();
-                                        }
-                                    }
-                                }
-                            }
-                            KeyCode::PageUp => {
-                                let max_scroll = chat_runtime::transcript_max_scroll_lines(
-                                    &transcript,
-                                    &streaming_assistant,
-                                );
-                                transcript_scroll = chat_runtime::adjust_transcript_scroll(
-                                    transcript_scroll,
-                                    -12,
-                                    max_scroll,
-                                );
-                                follow_output = false;
-                            }
-                            KeyCode::PageDown => {
-                                let max_scroll = chat_runtime::transcript_max_scroll_lines(
-                                    &transcript,
-                                    &streaming_assistant,
-                                );
-                                transcript_scroll = chat_runtime::adjust_transcript_scroll(
-                                    transcript_scroll,
-                                    12,
-                                    max_scroll,
-                                );
-                                follow_output = false;
-                            }
-                            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                let max_scroll = chat_runtime::transcript_max_scroll_lines(
-                                    &transcript,
-                                    &streaming_assistant,
-                                );
-                                transcript_scroll = chat_runtime::adjust_transcript_scroll(
-                                    transcript_scroll,
-                                    -10,
-                                    max_scroll,
-                                );
-                                follow_output = false;
-                            }
-                            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                let max_scroll = chat_runtime::transcript_max_scroll_lines(
-                                    &transcript,
-                                    &streaming_assistant,
-                                );
-                                transcript_scroll = chat_runtime::adjust_transcript_scroll(
-                                    transcript_scroll,
-                                    10,
-                                    max_scroll,
-                                );
-                                follow_output = false;
-                            }
-                            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                show_tools = !show_tools;
-                            }
-                            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                show_approvals = !show_approvals;
-                            }
-                            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                show_logs = !show_logs;
-                            }
-                            KeyCode::Tab => {
-                                if show_tools && show_approvals {
-                                    tools_focus = !tools_focus;
-                                }
-                            }
-                            KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                show_tools = !show_tools;
-                            }
-                            KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                show_approvals = !show_approvals;
-                            }
-                            KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                show_logs = !show_logs;
-                            }
-                            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if show_tools && (!show_approvals || tools_focus) {
-                                    if tools_selected + 1 < visible_tool_count {
-                                        tools_selected += 1;
-                                    }
-                                } else if approvals_selected + 1 < ui_state.pending_approvals.len()
-                                {
-                                    approvals_selected += 1;
-                                }
-                            }
-                            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if show_tools && (!show_approvals || tools_focus) {
-                                    tools_selected = tools_selected.saturating_sub(1);
-                                } else {
-                                    approvals_selected = approvals_selected.saturating_sub(1);
-                                }
-                            }
-                            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if let Err(e) = ui_state.refresh_approvals(&paths.approvals_path) {
-                                    logs.push(format!("approvals refresh failed: {e}"));
-                                }
-                            }
-                            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if let Some(row) =
-                                    ui_state.pending_approvals.get(approvals_selected)
-                                {
-                                    let store = ApprovalsStore::new(paths.approvals_path.clone());
-                                    if let Err(e) = store.approve(&row.id, None, None) {
-                                        logs.push(format!("approve failed: {e}"));
-                                    } else {
-                                        logs.push(format!("approved {}", row.id));
-                                    }
-                                    let _ = ui_state.refresh_approvals(&paths.approvals_path);
-                                }
-                            }
-                            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if let Some(row) =
-                                    ui_state.pending_approvals.get(approvals_selected)
-                                {
-                                    let store = ApprovalsStore::new(paths.approvals_path.clone());
-                                    if let Err(e) = store.deny(&row.id) {
-                                        logs.push(format!("deny failed: {e}"));
-                                    } else {
-                                        logs.push(format!("denied {}", row.id));
-                                    }
-                                    let _ = ui_state.refresh_approvals(&paths.approvals_path);
-                                }
-                            }
-                            KeyCode::Enter => {
+                        match handle_tui_outer_key_dispatch(TuiOuterKeyDispatchInput {
+                            key,
+                            input: &mut input,
+                            prompt_history: &mut prompt_history,
+                            history_idx: &mut history_idx,
+                            slash_menu_index: &mut slash_menu_index,
+                            palette_open: &mut palette_open,
+                            palette_items: &palette_items,
+                            palette_selected: &mut palette_selected,
+                            search_mode: &mut search_mode,
+                            search_query: &mut search_query,
+                            search_line_cursor: &mut search_line_cursor,
+                            transcript: &mut transcript,
+                            streaming_assistant: &mut streaming_assistant,
+                            transcript_scroll: &mut transcript_scroll,
+                            follow_output: &mut follow_output,
+                            ui_state: &mut ui_state,
+                            visible_tool_count,
+                            show_tools: &mut show_tools,
+                            show_approvals: &mut show_approvals,
+                            show_logs: &mut show_logs,
+                            compact_tools: &mut compact_tools,
+                            tools_selected: &mut tools_selected,
+                            tools_focus: &mut tools_focus,
+                            approvals_selected: &mut approvals_selected,
+                            paths,
+                            logs: &mut logs,
+                        }) {
+                            TuiOuterKeyDispatchOutcome::BreakLoop => break,
+                            TuiOuterKeyDispatchOutcome::ContinueLoop => continue,
+                            TuiOuterKeyDispatchOutcome::Handled => {}
+                            TuiOuterKeyDispatchOutcome::EnterInline => {
                                 let line = input.trim().to_string();
                                 input.clear();
                                 history_idx = None;
@@ -1659,33 +1784,30 @@ pub(crate) async fn run_chat_tui(
                                 })?;
                                 ui_tick = ui_tick.saturating_add(1);
 
-                                let TuiSubmitLaunch {
-                                    rx,
-                                    queue_tx,
-                                    fut,
-                                } = match build_tui_normal_submit_launch(
-                                    TuiNormalSubmitLaunchInput {
-                                        provider_kind,
-                                        base_url: &base_url,
-                                        model: &model,
-                                        line: &line,
-                                        active_run: &active_run,
-                                        paths,
-                                        logs: &mut logs,
-                                        show_logs: &mut show_logs,
-                                        transcript: &mut transcript,
-                                        status: &mut status,
-                                        status_detail: &mut status_detail,
-                                        follow_output: &follow_output,
-                                        transcript_scroll: &mut transcript_scroll,
-                                        shared_chat_mcp_registry: &mut shared_chat_mcp_registry,
-                                    },
-                                )
-                                .await?
-                                {
-                                    Some(launch) => launch,
-                                    None => continue,
-                                };
+                                let TuiSubmitLaunch { rx, queue_tx, fut } =
+                                    match build_tui_normal_submit_launch(
+                                        TuiNormalSubmitLaunchInput {
+                                            provider_kind,
+                                            base_url: &base_url,
+                                            model: &model,
+                                            line: &line,
+                                            active_run: &active_run,
+                                            paths,
+                                            logs: &mut logs,
+                                            show_logs: &mut show_logs,
+                                            transcript: &mut transcript,
+                                            status: &mut status,
+                                            status_detail: &mut status_detail,
+                                            follow_output: &follow_output,
+                                            transcript_scroll: &mut transcript_scroll,
+                                            shared_chat_mcp_registry: &mut shared_chat_mcp_registry,
+                                        },
+                                    )
+                                    .await?
+                                    {
+                                        Some(launch) => launch,
+                                        None => continue,
+                                    };
 
                                 drive_tui_active_turn_loop(TuiActiveTurnLoopInput {
                                     terminal: &mut terminal,
@@ -1729,19 +1851,6 @@ pub(crate) async fn run_chat_tui(
                                 })
                                 .await?;
                             }
-                            KeyCode::Backspace => {
-                                input.pop();
-                                slash_menu_index = 0;
-                            }
-                            KeyCode::Char(c) => {
-                                if chat_runtime::is_text_input_mods(key.modifiers) {
-                                    input.push(c);
-                                    if c == '/' && input.len() == 1 {
-                                        slash_menu_index = 0;
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
                         if logs.len() > max_logs {
                             let drop_n = logs.len() - max_logs;
