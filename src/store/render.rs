@@ -97,3 +97,59 @@ pub fn extract_session_messages(messages: &[Message]) -> Vec<Message> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::extract_session_messages;
+    use crate::types::{Message, Role};
+
+    fn msg(role: Role, content: &str) -> Message {
+        Message {
+            role,
+            content: Some(content.to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        }
+    }
+
+    #[test]
+    fn extract_session_messages_skips_agent_prologue_task_memory_and_planner_handoff() {
+        let msgs = vec![
+            msg(
+                Role::System,
+                "You are an agent that may call tools to gather information.",
+            ),
+            msg(
+                Role::Developer,
+                "TASK MEMORY (user-authored, authoritative)\n- [1] foo: bar",
+            ),
+            msg(
+                Role::Developer,
+                "PLANNER HANDOFF (openagent.plan.v1)\n{\"schema_version\":\"openagent.plan.v1\"}",
+            ),
+            msg(Role::User, "hello"),
+            msg(Role::Assistant, "hi"),
+        ];
+
+        let out = extract_session_messages(&msgs);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0].role, Role::User));
+        assert!(matches!(out[1].role, Role::Assistant));
+    }
+
+    #[test]
+    fn extract_session_messages_keeps_non_matching_system_and_developer_messages() {
+        let msgs = vec![
+            msg(Role::System, "custom system prompt"),
+            msg(Role::Developer, "normal developer instruction"),
+            msg(Role::User, "hello"),
+        ];
+
+        let out = extract_session_messages(&msgs);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0].role, Role::System));
+        assert!(matches!(out[1].role, Role::Developer));
+        assert!(matches!(out[2].role, Role::User));
+    }
+}

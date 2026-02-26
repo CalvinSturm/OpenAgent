@@ -65,3 +65,61 @@ pub fn hash_tool_schema(schema: &Value) -> String {
         .unwrap_or_else(|_| serde_json::to_string(schema).unwrap_or_else(|_| "null".to_string()));
     sha256_hex(canonical.as_bytes())
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{hash_tool_schema, mcp_tool_snapshot_hash_hex, sha256_hex};
+    use crate::store::McpToolSnapshotEntry;
+
+    #[test]
+    fn sha256_hex_matches_known_value() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn hash_tool_schema_is_stable_for_semantically_equivalent_json() {
+        let a = json!({
+            "type": "object",
+            "properties": {
+                "x": {"type":"string"},
+                "y": {"type":"number"}
+            },
+            "required": ["x"]
+        });
+        let b = json!({
+            "required": ["x"],
+            "properties": {
+                "y": {"type":"number"},
+                "x": {"type":"string"}
+            },
+            "type": "object"
+        });
+
+        assert_eq!(hash_tool_schema(&a), hash_tool_schema(&b));
+    }
+
+    #[test]
+    fn mcp_tool_snapshot_hash_is_sorted_by_name() {
+        let a = vec![
+            McpToolSnapshotEntry {
+                name: "mcp.a.beta".to_string(),
+                parameters: json!({"type":"object","properties":{"b":{"type":"string"}}}),
+            },
+            McpToolSnapshotEntry {
+                name: "mcp.a.alpha".to_string(),
+                parameters: json!({"type":"object","properties":{"a":{"type":"string"}}}),
+            },
+        ];
+        let mut b = a.clone();
+        b.reverse();
+
+        let ha = mcp_tool_snapshot_hash_hex(&a).expect("hash a");
+        let hb = mcp_tool_snapshot_hash_hex(&b).expect("hash b");
+        assert_eq!(ha, hb);
+    }
+}
