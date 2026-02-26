@@ -948,18 +948,14 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
             worker.step_result_error = step_result_error;
         }
     }
-    if let Some(h) = ui_join {
-        if let Err(_e) = h.join() {
-            eprintln!("WARN: tui thread ended unexpectedly");
-        }
-    }
-    if !args.no_session {
-        session_data.messages = extract_session_messages(&outcome.messages);
-        session_data.settings = settings_from_run(&resolved_settings);
-        if let Err(e) = session_store.save(&session_data, args.max_session_messages) {
-            eprintln!("WARN: failed to save session: {e}");
-        }
-    }
+    finalize_ui_and_session_state(
+        ui_join,
+        args,
+        &session_store,
+        &mut session_data,
+        &resolved_settings,
+        &outcome,
+    );
 
     if worker_record.is_none() {
         worker_record = Some(WorkerRunRecord {
@@ -1306,6 +1302,28 @@ fn finalize_early_run_result(
         outcome,
         run_artifact_path,
     })
+}
+
+fn finalize_ui_and_session_state(
+    ui_join: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    args: &RunArgs,
+    session_store: &SessionStore,
+    session_data: &mut session::SessionData,
+    resolved_settings: &session::RunSettingResolution,
+    outcome: &agent::AgentOutcome,
+) {
+    if let Some(h) = ui_join {
+        if let Err(_e) = h.join() {
+            eprintln!("WARN: tui thread ended unexpectedly");
+        }
+    }
+    if !args.no_session {
+        session_data.messages = extract_session_messages(&outcome.messages);
+        session_data.settings = settings_from_run(resolved_settings);
+        if let Err(e) = session_store.save(session_data, args.max_session_messages) {
+            eprintln!("WARN: failed to save session: {e}");
+        }
+    }
 }
 
 fn build_run_cli_config_fingerprint_bundle(
