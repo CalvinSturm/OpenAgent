@@ -220,6 +220,60 @@ pub struct Agent<P: ModelProvider> {
 }
 
 impl<P: ModelProvider> Agent<P> {
+    fn emit_run_start_events(&mut self, run_id: &str) {
+        self.emit_event(
+            run_id,
+            0,
+            EventKind::RunStart,
+            serde_json::json!({"model": self.model}),
+        );
+        if let Some(policy) = &self.policy_loaded {
+            self.emit_event(
+                run_id,
+                0,
+                EventKind::PolicyLoaded,
+                serde_json::json!({
+                    "version": policy.version,
+                    "rules_count": policy.rules_count,
+                    "includes_count": policy.includes_count,
+                    "mcp_allowlist": policy.mcp_allowlist
+                }),
+            );
+        }
+    }
+
+    fn build_initial_messages(
+        &self,
+        user_prompt: &str,
+        session_messages: Vec<Message>,
+        injected_messages: Vec<Message>,
+    ) -> Vec<Message> {
+        let mut messages = vec![Message {
+            role: Role::System,
+            content: Some(
+                "You are an agent that may call tools to gather information. Use tools when \
+                 needed, then provide a final direct answer when done. If no tools are \
+                 needed, answer immediately."
+                    .to_string(),
+            ),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        }];
+        messages.extend(session_messages);
+        for msg in injected_messages {
+            messages.push(msg);
+        }
+        messages.push(Message {
+            role: Role::User,
+            content: Some(user_prompt.to_string()),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        });
+        messages
+    }
+
     #[allow(dead_code)]
     pub fn queue_operator_message(
         &mut self,
@@ -274,48 +328,9 @@ impl<P: ModelProvider> Agent<P> {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         self.gate_ctx.run_id = Some(run_id.clone());
         let started_at = crate::trust::now_rfc3339();
-        self.emit_event(
-            &run_id,
-            0,
-            EventKind::RunStart,
-            serde_json::json!({"model": self.model}),
-        );
-        if let Some(policy) = &self.policy_loaded {
-            self.emit_event(
-                &run_id,
-                0,
-                EventKind::PolicyLoaded,
-                serde_json::json!({
-                    "version": policy.version,
-                    "rules_count": policy.rules_count,
-                    "includes_count": policy.includes_count,
-                    "mcp_allowlist": policy.mcp_allowlist
-                }),
-            );
-        }
-        let mut messages = vec![Message {
-            role: Role::System,
-            content: Some(
-                "You are an agent that may call tools to gather information. Use tools when \
-                 needed, then provide a final direct answer when done. If no tools are \
-                 needed, answer immediately."
-                    .to_string(),
-            ),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: None,
-        }];
-        messages.extend(session_messages);
-        for msg in injected_messages {
-            messages.push(msg);
-        }
-        messages.push(Message {
-            role: Role::User,
-            content: Some(user_prompt.to_string()),
-            tool_call_id: None,
-            tool_name: None,
-            tool_calls: None,
-        });
+        self.emit_run_start_events(&run_id);
+        let mut messages =
+            self.build_initial_messages(user_prompt, session_messages, injected_messages);
 
         let mut observed_tool_calls = Vec::new();
         let mut observed_tool_decisions: Vec<ToolDecisionRecord> = Vec::new();
