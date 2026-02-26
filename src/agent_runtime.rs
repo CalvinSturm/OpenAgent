@@ -73,6 +73,14 @@ struct UiRuntimeSetupInput<'a> {
     external_ui_tx: Option<Sender<Event>>,
     suppress_stdout_stream: bool,
 }
+
+struct HookToolSetup {
+    hooks_config_path: std::path::PathBuf,
+    tool_schema_hash_hex_map: std::collections::BTreeMap<String, String>,
+    hooks_config_hash_hex: Option<String>,
+    hook_manager: HookManager,
+    tool_catalog: Vec<store::ToolCatalogEntry>,
+}
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent<P: ModelProvider>(
     provider: P,
@@ -209,29 +217,15 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
     let mcp_startup_live_docs_hash_hex = prep.mcp_startup_live_docs_hash_hex;
     let mcp_snapshot_pinned = prep.mcp_snapshot_pinned;
     let mcp_pin_enforcement = format!("{:?}", args.mcp_pin_enforcement).to_lowercase();
-    let hooks_config_path = runtime_paths::resolved_hooks_config_path(args, &paths.state_dir);
-    let tool_schema_hash_hex_map = store::tool_schema_hash_hex_map(&all_tools);
+    let HookToolSetup {
+        hooks_config_path,
+        tool_schema_hash_hex_map,
+        hooks_config_hash_hex,
+        hook_manager,
+        tool_catalog,
+    } = build_hook_and_tool_setup(args, paths, &resolved_settings, &all_tools)?;
     gate_ctx.tool_schema_hashes = tool_schema_hash_hex_map.clone();
-    let hooks_config_hash_hex = ops_helpers::compute_hooks_config_hash_hex(
-        resolved_settings.hooks_mode,
-        &hooks_config_path,
-    );
     gate_ctx.hooks_config_hash_hex = hooks_config_hash_hex.clone();
-    let hook_manager = HookManager::build(HookRuntimeConfig {
-        mode: resolved_settings.hooks_mode,
-        config_path: hooks_config_path.clone(),
-        strict: args.hooks_strict,
-        timeout_ms: args.hooks_timeout_ms,
-        max_stdout_bytes: args.hooks_max_stdout_bytes,
-    })?;
-
-    let tool_catalog = all_tools
-        .iter()
-        .map(|t| store::ToolCatalogEntry {
-            name: t.name.clone(),
-            side_effects: t.side_effects,
-        })
-        .collect::<Vec<_>>();
 
     let UiRuntimeSetup {
         mut event_sink,
@@ -1430,6 +1424,41 @@ fn build_ui_runtime_setup(input: UiRuntimeSetupInput<'_>) -> anyhow::Result<UiRu
         event_sink,
         cancel_rx,
         ui_join,
+    })
+}
+
+fn build_hook_and_tool_setup(
+    args: &RunArgs,
+    paths: &store::StatePaths,
+    resolved_settings: &session::RunSettingResolution,
+    all_tools: &[crate::types::ToolDef],
+) -> anyhow::Result<HookToolSetup> {
+    let hooks_config_path = runtime_paths::resolved_hooks_config_path(args, &paths.state_dir);
+    let tool_schema_hash_hex_map = store::tool_schema_hash_hex_map(all_tools);
+    let hooks_config_hash_hex = ops_helpers::compute_hooks_config_hash_hex(
+        resolved_settings.hooks_mode,
+        &hooks_config_path,
+    );
+    let hook_manager = HookManager::build(HookRuntimeConfig {
+        mode: resolved_settings.hooks_mode,
+        config_path: hooks_config_path.clone(),
+        strict: args.hooks_strict,
+        timeout_ms: args.hooks_timeout_ms,
+        max_stdout_bytes: args.hooks_max_stdout_bytes,
+    })?;
+    let tool_catalog = all_tools
+        .iter()
+        .map(|t| store::ToolCatalogEntry {
+            name: t.name.clone(),
+            side_effects: t.side_effects,
+        })
+        .collect::<Vec<_>>();
+    Ok(HookToolSetup {
+        hooks_config_path,
+        tool_schema_hash_hex_map,
+        hooks_config_hash_hex,
+        hook_manager,
+        tool_catalog,
     })
 }
 
