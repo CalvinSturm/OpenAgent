@@ -484,13 +484,7 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                             mcp_runtime_trace: Vec::new(),
                             mcp_pin_snapshot: mcp_pin_snapshot.clone(),
                         });
-                    if let Some(h) = ui_join {
-                        let _ = h.join();
-                    }
-                    return Ok(RunExecutionResult {
-                        outcome,
-                        run_artifact_path,
-                    });
+                    return finalize_early_run_result(ui_join, outcome, run_artifact_path);
                 }
                 emit_planner_end_event(
                     &mut event_sink,
@@ -654,13 +648,7 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                     mcp_runtime_trace: Vec::new(),
                     mcp_pin_snapshot: mcp_pin_snapshot.clone(),
                 });
-                if let Some(h) = ui_join {
-                    let _ = h.join();
-                }
-                return Ok(RunExecutionResult {
-                    outcome,
-                    run_artifact_path,
-                });
+                return finalize_early_run_result(ui_join, outcome, run_artifact_path);
             }
         }
     }
@@ -1287,6 +1275,20 @@ fn write_run_artifact_with_warning(input: RunArtifactWriteInput) -> Option<std::
             None
         }
     }
+}
+
+fn finalize_early_run_result(
+    ui_join: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    outcome: agent::AgentOutcome,
+    run_artifact_path: Option<std::path::PathBuf>,
+) -> anyhow::Result<RunExecutionResult> {
+    if let Some(h) = ui_join {
+        let _ = h.join();
+    }
+    Ok(RunExecutionResult {
+        outcome,
+        run_artifact_path,
+    })
 }
 
 fn build_exec_target(args: &RunArgs) -> anyhow::Result<std::sync::Arc<dyn ExecTarget>> {
