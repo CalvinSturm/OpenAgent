@@ -118,6 +118,10 @@ pub struct McpPinSnapshotRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_live_catalog_hash_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub configured_docs_hash_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_live_docs_hash_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_config_hash_hex: Option<String>,
     pub pinned: bool,
 }

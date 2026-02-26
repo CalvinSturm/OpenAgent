@@ -15,8 +15,10 @@ pub(crate) struct PreparedTools {
     pub all_tools: Vec<types::ToolDef>,
     pub mcp_tool_snapshot: Vec<store::McpToolSnapshotEntry>,
     pub mcp_tool_catalog_hash_hex: Option<String>,
+    pub mcp_tool_docs_hash_hex: Option<String>,
     pub mcp_config_hash_hex: Option<String>,
     pub mcp_startup_live_catalog_hash_hex: Option<String>,
+    pub mcp_startup_live_docs_hash_hex: Option<String>,
     pub mcp_snapshot_pinned: bool,
     pub qualification_fallback_note: Option<String>,
 }
@@ -85,6 +87,13 @@ pub(crate) async fn prepare_tools_and_qualification<P: ModelProvider>(
     } else {
         Some(store::mcp_tool_snapshot_hash_hex(&mcp_tool_snapshot)?)
     };
+    let mcp_tool_docs_hash_hex = if mcp_tool_snapshot.is_empty() {
+        None
+    } else if let Some(reg) = mcp_registry {
+        reg.configured_tool_docs_hash_hex().ok()
+    } else {
+        None
+    };
     let mcp_config_hash_hex = if args.mcp.is_empty() {
         None
     } else {
@@ -99,12 +108,30 @@ pub(crate) async fn prepare_tools_and_qualification<P: ModelProvider>(
     } else {
         None
     };
+    let mcp_startup_live_docs_hash_hex = if matches!(
+        args.mcp_pin_enforcement,
+        crate::agent::McpPinEnforcementMode::Off
+    ) {
+        None
+    } else if let (Some(reg), Some(_expected_hash)) =
+        (mcp_registry, mcp_tool_docs_hash_hex.as_ref())
+    {
+        reg.live_tool_docs_hash_hex().await.ok()
+    } else {
+        None
+    };
     let mcp_snapshot_pinned = match (
         mcp_tool_catalog_hash_hex.as_ref(),
         mcp_startup_live_catalog_hash_hex.as_ref(),
+        mcp_tool_docs_hash_hex.as_ref(),
+        mcp_startup_live_docs_hash_hex.as_ref(),
     ) {
-        (Some(expected), Some(actual)) => expected == actual,
-        (None, _) => true,
+        (Some(expected_cat), Some(actual_cat), Some(expected_docs), Some(actual_docs)) => {
+            expected_cat == actual_cat && expected_docs == actual_docs
+        }
+        (Some(expected_cat), Some(actual_cat), None, _) => expected_cat == actual_cat,
+        (None, _, None, _) => true,
+        (None, _, Some(_), _) => false,
         _ => false,
     };
 
@@ -112,8 +139,10 @@ pub(crate) async fn prepare_tools_and_qualification<P: ModelProvider>(
         all_tools,
         mcp_tool_snapshot,
         mcp_tool_catalog_hash_hex,
+        mcp_tool_docs_hash_hex,
         mcp_config_hash_hex,
         mcp_startup_live_catalog_hash_hex,
+        mcp_startup_live_docs_hash_hex,
         mcp_snapshot_pinned,
         qualification_fallback_note,
     })

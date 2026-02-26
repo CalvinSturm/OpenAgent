@@ -238,8 +238,10 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
         eprintln!("WARN: {note}");
     }
     let mcp_tool_catalog_hash_hex = prep.mcp_tool_catalog_hash_hex;
+    let mcp_tool_docs_hash_hex = prep.mcp_tool_docs_hash_hex;
     let mcp_config_hash_hex = prep.mcp_config_hash_hex;
     let mcp_startup_live_catalog_hash_hex = prep.mcp_startup_live_catalog_hash_hex;
+    let mcp_startup_live_docs_hash_hex = prep.mcp_startup_live_docs_hash_hex;
     let mcp_snapshot_pinned = prep.mcp_snapshot_pinned;
     let mcp_pin_enforcement = format!("{:?}", args.mcp_pin_enforcement).to_lowercase();
     let hooks_config_path = runtime_paths::resolved_hooks_config_path(args, &paths.state_dir);
@@ -314,18 +316,23 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
     let mut worker_record: Option<WorkerRunRecord> = None;
     let mut planner_injected_message: Option<Message> = None;
     let mut plan_step_constraints: Vec<agent::PlanStepConstraint> = Vec::new();
-    let mcp_pin_snapshot =
-        if mcp_tool_catalog_hash_hex.is_some() || mcp_startup_live_catalog_hash_hex.is_some() {
-            Some(store::McpPinSnapshotRecord {
-                enforcement: mcp_pin_enforcement.clone(),
-                configured_catalog_hash_hex: mcp_tool_catalog_hash_hex.clone().unwrap_or_default(),
-                startup_live_catalog_hash_hex: mcp_startup_live_catalog_hash_hex.clone(),
-                mcp_config_hash_hex: mcp_config_hash_hex.clone(),
-                pinned: mcp_snapshot_pinned,
-            })
-        } else {
-            None
-        };
+    let mcp_pin_snapshot = if mcp_tool_catalog_hash_hex.is_some()
+        || mcp_startup_live_catalog_hash_hex.is_some()
+        || mcp_tool_docs_hash_hex.is_some()
+        || mcp_startup_live_docs_hash_hex.is_some()
+    {
+        Some(store::McpPinSnapshotRecord {
+            enforcement: mcp_pin_enforcement.clone(),
+            configured_catalog_hash_hex: mcp_tool_catalog_hash_hex.clone().unwrap_or_default(),
+            startup_live_catalog_hash_hex: mcp_startup_live_catalog_hash_hex.clone(),
+            configured_docs_hash_hex: mcp_tool_docs_hash_hex.clone(),
+            startup_live_docs_hash_hex: mcp_startup_live_docs_hash_hex.clone(),
+            mcp_config_hash_hex: mcp_config_hash_hex.clone(),
+            pinned: mcp_snapshot_pinned,
+        })
+    } else {
+        None
+    };
     runtime_events::emit_event(
         &mut event_sink,
         &run_id,
@@ -335,6 +342,8 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
             "enforcement": mcp_pin_enforcement,
             "configured_hash_hex": mcp_tool_catalog_hash_hex,
             "startup_live_hash_hex": mcp_startup_live_catalog_hash_hex,
+            "configured_docs_hash_hex": mcp_tool_docs_hash_hex,
+            "startup_live_docs_hash_hex": mcp_startup_live_docs_hash_hex,
             "mcp_config_hash_hex": mcp_config_hash_hex,
             "pinned": mcp_snapshot_pinned
         }),

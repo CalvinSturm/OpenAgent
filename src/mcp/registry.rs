@@ -179,7 +179,6 @@ impl McpRegistry {
         mcp_tool_snapshot_hash_hex(&snapshot)
     }
 
-    #[allow(dead_code)]
     pub fn configured_tool_docs_hash_hex(&self) -> anyhow::Result<String> {
         let mut snapshot = self
             .tool_defs
@@ -216,7 +215,6 @@ impl McpRegistry {
         mcp_tool_snapshot_hash_hex(&snapshot)
     }
 
-    #[allow(dead_code)]
     pub async fn live_tool_docs_hash_hex(&self) -> anyhow::Result<String> {
         let mut snapshot: Vec<McpToolDocsSnapshotEntry> = Vec::new();
         for (server, client) in &self.clients {
@@ -377,7 +375,6 @@ impl McpRegistry {
 
 const MCP_MAX_MODEL_RESULT_BYTES: usize = 64 * 1024;
 const MCP_MAX_RAW_DESCRIPTION_BYTES: usize = 8 * 1024;
-#[allow(dead_code)]
 const MCP_DOCS_HASH_PREVIEW_BYTES: usize = 1024;
 
 fn model_facing_mcp_tool_description(server: &str, namespaced_tool: &str) -> String {
@@ -397,14 +394,12 @@ fn build_mcp_tool_doc_meta(raw: &str) -> McpToolDocMeta {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[allow(dead_code)]
 struct McpToolDocsSnapshotEntry {
     name: String,
     parameters: serde_json::Value,
     description_preview: String,
 }
 
-#[allow(dead_code)]
 fn mcp_tool_docs_snapshot_hash_hex(
     snapshot: &[McpToolDocsSnapshotEntry],
 ) -> anyhow::Result<String> {
@@ -412,7 +407,6 @@ fn mcp_tool_docs_snapshot_hash_hex(
     Ok(sha256_hex(canonical.as_bytes()))
 }
 
-#[allow(dead_code)]
 fn normalized_description_preview(raw: &str) -> String {
     let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = collapsed.trim();
