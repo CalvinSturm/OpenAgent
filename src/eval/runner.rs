@@ -208,8 +208,7 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
             }
 
             for run_index in 0..config.runs_per_task {
-                let run_dir = create_run_workdir(config.workdir_override.as_deref())?;
-                apply_fixtures(&run_dir, &task.fixtures)?;
+                let run_dir = prepare_eval_run_workdir(&config, task)?;
 
                 let row = execute_eval_run_once(EvalSingleRunExecInput {
                     config: &config,
@@ -234,6 +233,12 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
     finalize_and_write_eval_results(&config, &out_path, &mut results)?;
     println!("eval results written: {}", out_path.display());
     Ok(out_path)
+}
+
+fn prepare_eval_run_workdir(config: &EvalConfig, task: &EvalTask) -> anyhow::Result<PathBuf> {
+    let run_dir = create_run_workdir(config.workdir_override.as_deref())?;
+    apply_fixtures(&run_dir, &task.fixtures)?;
+    Ok(run_dir)
 }
 
 struct EvalSkipGateInput<'a> {
