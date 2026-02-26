@@ -102,6 +102,23 @@ struct ReplannerPhaseLaunch<'a> {
     planner_strict: bool,
 }
 
+struct ReplanSuccessPrepInput<'a, P: ModelProvider> {
+    agent: &'a mut Agent<P>,
+    run_id: &'a str,
+    planner_model: &'a str,
+    worker_model: &'a str,
+    planner_max_steps: u32,
+    planner_output: planner::PlannerOutput,
+    planner_strict_effective: bool,
+    effective_plan_tool_enforcement: PlanToolEnforcementMode,
+    worker_record: &'a mut Option<WorkerRunRecord>,
+    planner_record: &'a mut Option<PlannerRunRecord>,
+}
+
+struct ReplanSuccessPrep {
+    replan_handoff: String,
+}
+
 struct RunArtifactWriteInput {
     paths: store::StatePaths,
     cli_config: store::RunCliConfig,
@@ -820,48 +837,21 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                     Some("replan"),
                     Some(&prior_plan_hash),
                 );
-                let replan_handoff = format!(
-                    "{}\n\n{}",
-                    planner::planner_handoff_content(&replan_out.plan_json)?,
-                    planner::planner_worker_contract_content(&replan_out.plan_json)?
-                );
-                if matches!(
-                    effective_plan_tool_enforcement,
-                    PlanToolEnforcementMode::Soft | PlanToolEnforcementMode::Hard
-                ) {
-                    if let Ok(steps) = planner::extract_plan_step_tools(&replan_out.plan_json) {
-                        agent.plan_step_constraints = steps
-                            .into_iter()
-                            .map(|s| agent::PlanStepConstraint {
-                                step_id: s.step_id,
-                                intended_tools: s.intended_tools,
-                            })
-                            .collect();
-                    }
-                }
-                planner_record = Some(PlannerRunRecord {
-                    model: planner_model.clone(),
-                    max_steps: args.planner_max_steps,
-                    strict: planner_strict_effective,
-                    output_format: format!("{:?}", args.planner_output).to_lowercase(),
-                    plan_json: replan_out.plan_json.clone(),
-                    plan_hash_hex: replan_out.plan_hash_hex.clone(),
-                    ok: replan_out.ok,
-                    raw_output: replan_out.raw_output,
-                    error: replan_out.error,
-                });
-                agent.gate_ctx.planner_hash_hex = Some(replan_out.plan_hash_hex.clone());
-                if let Some(worker) = worker_record.as_mut() {
-                    worker.injected_planner_hash_hex = Some(replan_out.plan_hash_hex.clone());
-                }
-                emit_worker_start_event(
-                    &mut agent.event_sink,
-                    &run_id,
-                    &worker_model,
-                    &replan_out.plan_hash_hex,
-                    effective_plan_tool_enforcement,
-                    Some("replan_resume"),
-                );
+                let ReplanSuccessPrep { replan_handoff } = prepare_replan_success_resume(
+                    ReplanSuccessPrepInput {
+                        agent: &mut agent,
+                        run_id: &run_id,
+                        planner_model: &planner_model,
+                        worker_model: &worker_model,
+                        planner_max_steps: args.planner_max_steps,
+                        planner_output: args.planner_output,
+                        planner_strict_effective,
+                        effective_plan_tool_enforcement,
+                        worker_record: &mut worker_record,
+                        planner_record: &mut planner_record,
+                    },
+                    replan_out,
+                )?;
                 let resume_session_messages = extract_session_messages(&outcome.messages);
                 let replan_injected = runtime_paths::merge_injected_messages(
                     base_instruction_messages.clone(),
@@ -1152,6 +1142,55 @@ async fn run_replanner_phase_with_start_event<P: ModelProvider>(
         event_sink,
     )
     .await
+}
+
+fn prepare_replan_success_resume<P: ModelProvider>(
+    input: ReplanSuccessPrepInput<'_, P>,
+    replan_out: planner_runtime::PlannerPhaseOutput,
+) -> anyhow::Result<ReplanSuccessPrep> {
+    let replan_handoff = format!(
+        "{}\n\n{}",
+        planner::planner_handoff_content(&replan_out.plan_json)?,
+        planner::planner_worker_contract_content(&replan_out.plan_json)?
+    );
+    if matches!(
+        input.effective_plan_tool_enforcement,
+        PlanToolEnforcementMode::Soft | PlanToolEnforcementMode::Hard
+    ) {
+        if let Ok(steps) = planner::extract_plan_step_tools(&replan_out.plan_json) {
+            input.agent.plan_step_constraints = steps
+                .into_iter()
+                .map(|s| agent::PlanStepConstraint {
+                    step_id: s.step_id,
+                    intended_tools: s.intended_tools,
+                })
+                .collect();
+        }
+    }
+    *input.planner_record = Some(PlannerRunRecord {
+        model: input.planner_model.to_string(),
+        max_steps: input.planner_max_steps,
+        strict: input.planner_strict_effective,
+        output_format: format!("{:?}", input.planner_output).to_lowercase(),
+        plan_json: replan_out.plan_json.clone(),
+        plan_hash_hex: replan_out.plan_hash_hex.clone(),
+        ok: replan_out.ok,
+        raw_output: replan_out.raw_output,
+        error: replan_out.error,
+    });
+    input.agent.gate_ctx.planner_hash_hex = Some(replan_out.plan_hash_hex.clone());
+    if let Some(worker) = input.worker_record.as_mut() {
+        worker.injected_planner_hash_hex = Some(replan_out.plan_hash_hex.clone());
+    }
+    emit_worker_start_event(
+        &mut input.agent.event_sink,
+        input.run_id,
+        input.worker_model,
+        &replan_out.plan_hash_hex,
+        input.effective_plan_tool_enforcement,
+        Some("replan_resume"),
+    );
+    Ok(ReplanSuccessPrep { replan_handoff })
 }
 
 fn emit_planner_end_event(
