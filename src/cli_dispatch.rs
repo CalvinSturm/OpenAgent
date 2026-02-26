@@ -1520,3 +1520,148 @@ async fn execute_check_agent_run(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{check_allowed_tools_violation, copy_check_workspace_tree};
+    use crate::agent::{AgentExitReason, AgentOutcome, ToolDecisionRecord};
+    use crate::checks::loader::LoadedCheck;
+    use crate::checks::schema::{CheckFrontmatter, PassCriteria, PassCriteriaType};
+    use crate::compaction::{CompactionMode, CompactionSettings, ToolResultPersist};
+    use crate::types::ToolCall;
+
+    fn sample_loaded_check(allowed_tools: Option<Vec<&str>>) -> LoadedCheck {
+        LoadedCheck {
+            path: "x.md".to_string(),
+            name: "x".to_string(),
+            description: None,
+            required: true,
+            body: "body".to_string(),
+            file_bytes_hash_hex: "a".to_string(),
+            frontmatter_hash_hex: "b".to_string(),
+            check_hash_hex: "c".to_string(),
+            frontmatter: CheckFrontmatter {
+                schema_version: 1,
+                name: "x".to_string(),
+                description: None,
+                required: true,
+                allowed_tools: allowed_tools
+                    .map(|v| v.into_iter().map(|s| s.to_string()).collect()),
+                required_flags: Vec::new(),
+                pass_criteria: PassCriteria {
+                    kind: PassCriteriaType::Equals,
+                    value: "ok".to_string(),
+                },
+                budget: None,
+            },
+        }
+    }
+
+    fn sample_outcome() -> AgentOutcome {
+        AgentOutcome {
+            run_id: "r".to_string(),
+            started_at: "s".to_string(),
+            finished_at: "f".to_string(),
+            exit_reason: AgentExitReason::Ok,
+            final_output: "ok".to_string(),
+            error: None,
+            messages: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_decisions: Vec::new(),
+            compaction_settings: CompactionSettings {
+                max_context_chars: 0,
+                mode: CompactionMode::Off,
+                keep_last: 0,
+                tool_result_persist: ToolResultPersist::Digest,
+            },
+            final_prompt_size_chars: 0,
+            compaction_report: None,
+            hook_invocations: Vec::new(),
+            provider_retry_count: 0,
+            provider_error_count: 0,
+            token_usage: None,
+            taint: None,
+        }
+    }
+
+    #[test]
+    fn allowed_tools_violation_uses_tool_decisions_first() {
+        let check = sample_loaded_check(Some(vec!["read_file"]));
+        let mut outcome = sample_outcome();
+        outcome.tool_decisions.push(ToolDecisionRecord {
+            step: 1,
+            tool_call_id: "tc1".to_string(),
+            tool: "shell".to_string(),
+            decision: "allow".to_string(),
+            reason: None,
+            source: None,
+            taint_overall: None,
+            taint_enforced: false,
+            escalated: false,
+            escalation_reason: None,
+        });
+
+        let got = check_allowed_tools_violation(&check, &outcome).expect("violation");
+        assert!(got.contains("tool 'shell'"));
+        assert!(got.contains("read_file"));
+    }
+
+    #[test]
+    fn allowed_tools_violation_falls_back_to_tool_calls_when_no_decisions() {
+        let check = sample_loaded_check(Some(vec!["read_file"]));
+        let mut outcome = sample_outcome();
+        outcome.tool_calls.push(ToolCall {
+            id: "tc1".to_string(),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({"path":"x","content":"y"}),
+        });
+
+        let got = check_allowed_tools_violation(&check, &outcome).expect("violation");
+        assert!(got.contains("tool 'write_file'"));
+    }
+
+    #[test]
+    fn allowed_tools_none_disables_post_run_filtering() {
+        let check = sample_loaded_check(None);
+        let mut outcome = sample_outcome();
+        outcome.tool_decisions.push(ToolDecisionRecord {
+            step: 1,
+            tool_call_id: "tc1".to_string(),
+            tool: "shell".to_string(),
+            decision: "allow".to_string(),
+            reason: None,
+            source: None,
+            taint_overall: None,
+            taint_enforced: false,
+            escalated: false,
+            escalation_reason: None,
+        });
+
+        assert!(check_allowed_tools_violation(&check, &outcome).is_none());
+    }
+
+    #[test]
+    fn scratch_copy_excludes_root_internal_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src_repo");
+        let dst = tmp.path().join("dst_repo");
+        std::fs::create_dir_all(src.join(".git")).expect("git dir");
+        std::fs::create_dir_all(src.join(".localagent")).expect("state dir");
+        std::fs::create_dir_all(src.join("target")).expect("target dir");
+        std::fs::create_dir_all(src.join("node_modules")).expect("node_modules dir");
+        std::fs::create_dir_all(src.join("subdir")).expect("subdir");
+        std::fs::write(src.join("README.md"), "ok").expect("readme");
+        std::fs::write(src.join("subdir").join("file.txt"), "ok").expect("subfile");
+        std::fs::write(src.join(".git").join("config"), "x").expect("git file");
+        std::fs::write(src.join(".localagent").join("state.json"), "x").expect("state file");
+
+        copy_check_workspace_tree(&src, &dst).expect("copy");
+
+        assert!(dst.join("README.md").exists());
+        assert!(dst.join("subdir").join("file.txt").exists());
+        assert!(!dst.join(".git").exists());
+        assert!(!dst.join(".localagent").exists());
+        assert!(!dst.join("target").exists());
+        assert!(!dst.join("node_modules").exists());
+    }
+}

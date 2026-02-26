@@ -32,9 +32,11 @@ localagent --provider lmstudio --model <model> chat --tui
 - `approvals`
 - `approve`
 - `deny`
+- `check`
 - `replay`
 - `session`
 - `eval`
+- `repo`
 - `tui`
 - `tasks`
 
@@ -223,6 +225,27 @@ localagent doctor --provider <lmstudio|llamacpp|ollama> [--base-url <URL>] [--ap
 - `localagent approve <ID> [--ttl-hours <N>] [--max-uses <N>]`
 - `localagent deny <ID>`
 
+### `check`
+
+- `localagent check run [--path <DIR_OR_FILE>] [--json-out <PATH>] [--junit-out <PATH>] [--max-checks <N>]`
+
+Notes:
+- Checks are discovered from `.localagent/checks/` by default (`*.md` with strict YAML frontmatter).
+- `check run` is fail-closed/non-interactive by default (`approval_mode=fail`, sessions disabled).
+- `write`/`shell` checks run in isolated scratch workdirs when enabled via allow flags.
+- `allowed_tools` is enforced against tools actually used during the check run.
+- Exit codes are deterministic:
+  - `0` pass
+  - `2` invalid checks / schema / loader config
+  - `3` one or more check failures
+  - `4` runner/runtime errors
+
+Example:
+
+```bash
+localagent --provider mock --model mock check run --path .localagent/checks --json-out check-report.json --junit-out check-report.xml
+```
+
 ### `replay`
 
 - `localagent replay <RUN_ID>`
@@ -258,6 +281,10 @@ Major eval-only options:
 - `--summary-md <PATH>`
 - `--cost-model <PATH>`
 - `--runs-per-task <N>`
+
+### `repo`
+
+- `localagent repo map [--print-content] [--no-write] [--max-files <N>] [--max-scan-bytes <N>] [--max-out-bytes <N>]`
 - `--timeout-seconds <N>`
 - `--min-pass-rate <0..1>`
 - `--fail-on-any`
