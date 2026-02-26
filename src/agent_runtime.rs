@@ -751,58 +751,12 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
             initial_injected_messages,
         ) => out,
         _ = tokio::signal::ctrl_c() => {
-            agent::AgentOutcome {
-                run_id: uuid::Uuid::new_v4().to_string(),
-                started_at: trust::now_rfc3339(),
-                finished_at: trust::now_rfc3339(),
-                exit_reason: AgentExitReason::Cancelled,
-                final_output: String::new(),
-                error: Some("cancelled".to_string()),
-                messages: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_decisions: Vec::new(),
-                compaction_settings: CompactionSettings {
-                    max_context_chars: resolved_settings.max_context_chars,
-                    mode: resolved_settings.compaction_mode,
-                    keep_last: resolved_settings.compaction_keep_last,
-                    tool_result_persist: resolved_settings.tool_result_persist,
-                },
-                final_prompt_size_chars: 0,
-                compaction_report: None,
-                hook_invocations: Vec::new(),
-                provider_retry_count: 0,
-                provider_error_count: 0,
-                token_usage: None,
-                taint: None,
-            }
+            cancelled_outcome(&resolved_settings)
         },
         _ = async {
             let _ = cancel_rx.changed().await;
         } => {
-            agent::AgentOutcome {
-                run_id: uuid::Uuid::new_v4().to_string(),
-                started_at: trust::now_rfc3339(),
-                finished_at: trust::now_rfc3339(),
-                exit_reason: AgentExitReason::Cancelled,
-                final_output: String::new(),
-                error: Some("cancelled".to_string()),
-                messages: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_decisions: Vec::new(),
-                compaction_settings: CompactionSettings {
-                    max_context_chars: resolved_settings.max_context_chars,
-                    mode: resolved_settings.compaction_mode,
-                    keep_last: resolved_settings.compaction_keep_last,
-                    tool_result_persist: resolved_settings.tool_result_persist,
-                },
-                final_prompt_size_chars: 0,
-                compaction_report: None,
-                hook_invocations: Vec::new(),
-                provider_retry_count: 0,
-                provider_error_count: 0,
-                token_usage: None,
-                taint: None,
-            }
+            cancelled_outcome(&resolved_settings)
         }
     };
 
@@ -916,58 +870,12 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                 outcome = tokio::select! {
                     out = agent.run(prompt, resume_session_messages, replan_injected) => out,
                     _ = tokio::signal::ctrl_c() => {
-                        agent::AgentOutcome {
-                            run_id: uuid::Uuid::new_v4().to_string(),
-                            started_at: trust::now_rfc3339(),
-                            finished_at: trust::now_rfc3339(),
-                            exit_reason: AgentExitReason::Cancelled,
-                            final_output: String::new(),
-                            error: Some("cancelled".to_string()),
-                            messages: Vec::new(),
-                            tool_calls: Vec::new(),
-                            tool_decisions: Vec::new(),
-                            compaction_settings: CompactionSettings {
-                                max_context_chars: resolved_settings.max_context_chars,
-                                mode: resolved_settings.compaction_mode,
-                                keep_last: resolved_settings.compaction_keep_last,
-                                tool_result_persist: resolved_settings.tool_result_persist,
-                            },
-                            final_prompt_size_chars: 0,
-                            compaction_report: None,
-                            hook_invocations: Vec::new(),
-                            provider_retry_count: 0,
-                            provider_error_count: 0,
-                            token_usage: None,
-                            taint: None,
-                        }
+                        cancelled_outcome(&resolved_settings)
                     },
                     _ = async {
                         let _ = cancel_rx.changed().await;
                     } => {
-                        agent::AgentOutcome {
-                            run_id: uuid::Uuid::new_v4().to_string(),
-                            started_at: trust::now_rfc3339(),
-                            finished_at: trust::now_rfc3339(),
-                            exit_reason: AgentExitReason::Cancelled,
-                            final_output: String::new(),
-                            error: Some("cancelled".to_string()),
-                            messages: Vec::new(),
-                            tool_calls: Vec::new(),
-                            tool_decisions: Vec::new(),
-                            compaction_settings: CompactionSettings {
-                                max_context_chars: resolved_settings.max_context_chars,
-                                mode: resolved_settings.compaction_mode,
-                                keep_last: resolved_settings.compaction_keep_last,
-                                tool_result_persist: resolved_settings.tool_result_persist,
-                            },
-                            final_prompt_size_chars: 0,
-                            compaction_report: None,
-                            hook_invocations: Vec::new(),
-                            provider_retry_count: 0,
-                            provider_error_count: 0,
-                            token_usage: None,
-                            taint: None,
-                        }
+                        cancelled_outcome(&resolved_settings)
                     }
                 };
             }
@@ -1327,6 +1235,33 @@ fn emit_worker_start_event(
         EventKind::WorkerStart,
         serde_json::Value::Object(payload),
     );
+}
+
+fn cancelled_outcome(resolved_settings: &session::RunSettingResolution) -> agent::AgentOutcome {
+    agent::AgentOutcome {
+        run_id: uuid::Uuid::new_v4().to_string(),
+        started_at: trust::now_rfc3339(),
+        finished_at: trust::now_rfc3339(),
+        exit_reason: AgentExitReason::Cancelled,
+        final_output: String::new(),
+        error: Some("cancelled".to_string()),
+        messages: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_decisions: Vec::new(),
+        compaction_settings: CompactionSettings {
+            max_context_chars: resolved_settings.max_context_chars,
+            mode: resolved_settings.compaction_mode,
+            keep_last: resolved_settings.compaction_keep_last,
+            tool_result_persist: resolved_settings.tool_result_persist,
+        },
+        final_prompt_size_chars: 0,
+        compaction_report: None,
+        hook_invocations: Vec::new(),
+        provider_retry_count: 0,
+        provider_error_count: 0,
+        token_usage: None,
+        taint: None,
+    }
 }
 
 fn build_exec_target(args: &RunArgs) -> anyhow::Result<std::sync::Arc<dyn ExecTarget>> {
