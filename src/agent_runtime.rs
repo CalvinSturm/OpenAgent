@@ -133,6 +133,21 @@ struct ReplanResumeRunInput<'a, P: ModelProvider> {
     cancel_rx: &'a mut watch::Receiver<bool>,
 }
 
+struct ReproSnapshotBuildInput<'a> {
+    args: &'a RunArgs,
+    provider_kind: ProviderKind,
+    base_url: &'a str,
+    worker_model: &'a str,
+    resolved_settings: &'a session::RunSettingResolution,
+    policy_hash_hex: &'a Option<String>,
+    includes_resolved: &'a Vec<String>,
+    hooks_config_hash_hex: &'a Option<String>,
+    tool_schema_hash_hex_map: &'a std::collections::BTreeMap<String, String>,
+    tool_catalog: &'a [store::ToolCatalogEntry],
+    config_hash_hex: &'a str,
+    run_id: &'a str,
+}
+
 struct RunArtifactWriteInput {
     paths: store::StatePaths,
     cli_config: store::RunCliConfig,
@@ -965,65 +980,23 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
             repo_map_resolution: repo_map_resolution.as_ref(),
             activated_packs: &activated_packs,
         })?;
-    let repro_record = repro::build_repro_record(
-        args.repro,
-        args.repro_env,
-        repro::ReproBuildInput {
-            run_id: outcome.run_id.clone(),
-            created_at: crate::trust::now_rfc3339(),
-            provider: provider_to_string(provider_kind),
-            base_url: base_url.to_string(),
-            model: worker_model.clone(),
-            caps_source: format!("{:?}", resolved_settings.caps_mode).to_lowercase(),
-            trust_mode: store::cli_trust_mode(args.trust),
-            approval_mode: format!("{:?}", args.approval_mode).to_lowercase(),
-            approval_key: args.approval_key.as_str().to_string(),
-            policy_hash_hex: policy_hash_hex.clone(),
-            includes_resolved: includes_resolved.clone(),
-            hooks_mode: format!("{:?}", resolved_settings.hooks_mode).to_lowercase(),
-            hooks_config_hash_hex: hooks_config_hash_hex.clone(),
-            taint_mode: format!("{:?}", args.taint_mode).to_lowercase(),
-            taint_policy_globs_hash_hex: policy_hash_hex.clone(),
-            tool_schema_hash_hex_map: tool_schema_hash_hex_map.clone(),
-            tool_catalog: tool_catalog.clone(),
-            exec_target: format!("{:?}", args.exec_target).to_lowercase(),
-            docker: if matches!(args.exec_target, ExecTargetKind::Docker) {
-                Some(repro::ReproDocker {
-                    image: args.docker_image.clone(),
-                    workdir: args.docker_workdir.clone(),
-                    network: format!("{:?}", args.docker_network).to_lowercase(),
-                    user: args.docker_user.clone(),
-                })
-            } else {
-                None
-            },
-            workdir: repro::stable_workdir_string(&args.workdir),
-            config_hash_hex: config_hash_hex.clone(),
+    let repro_record = build_and_emit_repro_snapshot(
+        &mut agent.event_sink,
+        ReproSnapshotBuildInput {
+            args,
+            provider_kind,
+            base_url,
+            worker_model: &worker_model,
+            resolved_settings: &resolved_settings,
+            policy_hash_hex: &policy_hash_hex,
+            includes_resolved: &includes_resolved,
+            hooks_config_hash_hex: &hooks_config_hash_hex,
+            tool_schema_hash_hex_map: &tool_schema_hash_hex_map,
+            tool_catalog: &tool_catalog,
+            config_hash_hex: &config_hash_hex,
+            run_id: &outcome.run_id,
         },
     )?;
-    if let Some(r) = &repro_record {
-        runtime_events::emit_event(
-            &mut agent.event_sink,
-            &outcome.run_id,
-            0,
-            EventKind::ReproSnapshot,
-            serde_json::json!({
-                "enabled": true,
-                "env_mode": r.env_mode,
-                "repro_hash_hex": r.repro_hash_hex
-            }),
-        );
-        if matches!(args.repro_env, ReproEnvMode::All) {
-            eprintln!(
-                "WARN: repro-env=all enabled; sensitive-like env vars are excluded from hash material."
-            );
-        }
-        if let Some(path) = &args.repro_out {
-            if let Err(e) = repro::write_repro_out(path, r) {
-                eprintln!("WARN: failed to write repro snapshot: {e}");
-            }
-        }
-    }
     agent.event_sink = None;
     let run_artifact_path = write_run_artifact_with_warning(RunArtifactWriteInput {
         paths: paths.clone(),
@@ -1408,6 +1381,72 @@ fn normalize_and_record_worker_step_result(
         worker.step_result_json = step_result_json;
         worker.step_result_error = step_result_error;
     }
+}
+
+fn build_and_emit_repro_snapshot(
+    event_sink: &mut Option<Box<dyn crate::events::EventSink>>,
+    input: ReproSnapshotBuildInput<'_>,
+) -> anyhow::Result<Option<crate::repro::RunReproRecord>> {
+    let repro_record = repro::build_repro_record(
+        input.args.repro,
+        input.args.repro_env,
+        repro::ReproBuildInput {
+            run_id: input.run_id.to_string(),
+            created_at: crate::trust::now_rfc3339(),
+            provider: provider_to_string(input.provider_kind),
+            base_url: input.base_url.to_string(),
+            model: input.worker_model.to_string(),
+            caps_source: format!("{:?}", input.resolved_settings.caps_mode).to_lowercase(),
+            trust_mode: store::cli_trust_mode(input.args.trust),
+            approval_mode: format!("{:?}", input.args.approval_mode).to_lowercase(),
+            approval_key: input.args.approval_key.as_str().to_string(),
+            policy_hash_hex: input.policy_hash_hex.clone(),
+            includes_resolved: input.includes_resolved.clone(),
+            hooks_mode: format!("{:?}", input.resolved_settings.hooks_mode).to_lowercase(),
+            hooks_config_hash_hex: input.hooks_config_hash_hex.clone(),
+            taint_mode: format!("{:?}", input.args.taint_mode).to_lowercase(),
+            taint_policy_globs_hash_hex: input.policy_hash_hex.clone(),
+            tool_schema_hash_hex_map: input.tool_schema_hash_hex_map.clone(),
+            tool_catalog: input.tool_catalog.to_vec(),
+            exec_target: format!("{:?}", input.args.exec_target).to_lowercase(),
+            docker: if matches!(input.args.exec_target, ExecTargetKind::Docker) {
+                Some(repro::ReproDocker {
+                    image: input.args.docker_image.clone(),
+                    workdir: input.args.docker_workdir.clone(),
+                    network: format!("{:?}", input.args.docker_network).to_lowercase(),
+                    user: input.args.docker_user.clone(),
+                })
+            } else {
+                None
+            },
+            workdir: repro::stable_workdir_string(&input.args.workdir),
+            config_hash_hex: input.config_hash_hex.to_string(),
+        },
+    )?;
+    if let Some(r) = &repro_record {
+        runtime_events::emit_event(
+            event_sink,
+            input.run_id,
+            0,
+            EventKind::ReproSnapshot,
+            serde_json::json!({
+                "enabled": true,
+                "env_mode": r.env_mode,
+                "repro_hash_hex": r.repro_hash_hex
+            }),
+        );
+        if matches!(input.args.repro_env, ReproEnvMode::All) {
+            eprintln!(
+                "WARN: repro-env=all enabled; sensitive-like env vars are excluded from hash material."
+            );
+        }
+        if let Some(path) = &input.args.repro_out {
+            if let Err(e) = repro::write_repro_out(path, r) {
+                eprintln!("WARN: failed to write repro snapshot: {e}");
+            }
+        }
+    }
+    Ok(repro_record)
 }
 
 fn build_run_cli_config_fingerprint_bundle(
