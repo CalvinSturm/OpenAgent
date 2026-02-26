@@ -247,31 +247,15 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
                             &run_id,
                             format!("run error: {e}"),
                         );
-                        EvalRunRow {
-                            model: model.clone(),
-                            task_id: task.id.clone(),
+                        build_eval_run_error_row(
+                            &config,
+                            model,
+                            task,
                             run_index,
-                            workdir: if config.keep_workdir || config.workdir_override.is_some() {
-                                Some(run_dir.display().to_string())
-                            } else {
-                                None
-                            },
+                            &run_dir,
                             run_id,
-                            exit_reason: "provider_error".to_string(),
-                            status: "failed".to_string(),
-                            skip_reason: None,
-                            required_flags: task.required_flags(),
-                            passed: false,
-                            failures: vec![format!("run error: {e}")],
-                            stats: EvalRunStats {
-                                steps: 0,
-                                tool_calls: 0,
-                            },
-                            metrics: None,
-                            tokens: None,
-                            estimated_cost_usd: None,
-                            verifier: None,
-                        }
+                            format!("run error: {e}"),
+                        )
                     }
                     Err(_) => {
                         let run_id = Uuid::new_v4().to_string();
@@ -282,31 +266,7 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
                             &run_id,
                             "timeout".to_string(),
                         );
-                        EvalRunRow {
-                            model: model.clone(),
-                            task_id: task.id.clone(),
-                            run_index,
-                            workdir: if config.keep_workdir || config.workdir_override.is_some() {
-                                Some(run_dir.display().to_string())
-                            } else {
-                                None
-                            },
-                            run_id,
-                            exit_reason: "timeout".to_string(),
-                            status: "failed".to_string(),
-                            skip_reason: None,
-                            required_flags: task.required_flags(),
-                            passed: false,
-                            failures: vec!["timeout".to_string()],
-                            stats: EvalRunStats {
-                                steps: 0,
-                                tool_calls: 0,
-                            },
-                            metrics: None,
-                            tokens: None,
-                            estimated_cost_usd: None,
-                            verifier: None,
-                        }
+                        build_eval_timeout_row(&config, model, task, run_index, &run_dir, run_id)
                     }
                 };
                 if config.workdir_override.is_none() && !config.keep_workdir {
@@ -347,6 +307,86 @@ fn write_eval_outputs(
         write_summary_md(md, results)?;
     }
     Ok(())
+}
+
+fn build_eval_run_error_row(
+    config: &EvalConfig,
+    model: &str,
+    task: &EvalTask,
+    run_index: usize,
+    run_dir: &Path,
+    run_id: String,
+    error: String,
+) -> EvalRunRow {
+    let input = EvalFailureRowInput {
+        config,
+        model,
+        task,
+        run_index,
+        run_dir,
+        run_id,
+    };
+    build_failed_eval_row(input, "provider_error", vec![error])
+}
+
+fn build_eval_timeout_row(
+    config: &EvalConfig,
+    model: &str,
+    task: &EvalTask,
+    run_index: usize,
+    run_dir: &Path,
+    run_id: String,
+) -> EvalRunRow {
+    let input = EvalFailureRowInput {
+        config,
+        model,
+        task,
+        run_index,
+        run_dir,
+        run_id,
+    };
+    build_failed_eval_row(input, "timeout", vec!["timeout".to_string()])
+}
+
+struct EvalFailureRowInput<'a> {
+    config: &'a EvalConfig,
+    model: &'a str,
+    task: &'a EvalTask,
+    run_index: usize,
+    run_dir: &'a Path,
+    run_id: String,
+}
+
+fn build_failed_eval_row(
+    input: EvalFailureRowInput<'_>,
+    exit_reason: &str,
+    failures: Vec<String>,
+) -> EvalRunRow {
+    EvalRunRow {
+        model: input.model.to_string(),
+        task_id: input.task.id.clone(),
+        run_index: input.run_index,
+        workdir: if input.config.keep_workdir || input.config.workdir_override.is_some() {
+            Some(input.run_dir.display().to_string())
+        } else {
+            None
+        },
+        run_id: input.run_id,
+        exit_reason: exit_reason.to_string(),
+        status: "failed".to_string(),
+        skip_reason: None,
+        required_flags: input.task.required_flags(),
+        passed: false,
+        failures,
+        stats: EvalRunStats {
+            steps: 0,
+            tool_calls: 0,
+        },
+        metrics: None,
+        tokens: None,
+        estimated_cost_usd: None,
+        verifier: None,
+    }
 }
 
 fn write_synthetic_error_artifact(
