@@ -6,15 +6,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::providers::common::{
-    build_http_client, build_tool_envelopes, truncate_error_display, truncate_for_error,
-    ToolEnvelope as SharedToolEnvelope,
+    build_http_client, build_tool_envelopes, map_token_usage_triplet, truncate_error_display,
+    truncate_for_error, ToolEnvelope as SharedToolEnvelope,
 };
 use crate::providers::http::{
     classify_reqwest_error, classify_status, deterministic_backoff_ms, HttpConfig, ProviderError,
     ProviderErrorKind, RetryRecord,
 };
-use crate::providers::{to_u32_opt, ModelProvider, StreamDelta, ToolCallFragment};
-use crate::types::{GenerateRequest, GenerateResponse, Message, Role, TokenUsage, ToolCall};
+use crate::providers::{ModelProvider, StreamDelta, ToolCallFragment};
+use crate::types::{GenerateRequest, GenerateResponse, Message, Role, ToolCall};
 
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
@@ -471,14 +471,14 @@ fn map_ollama_response(resp: OllamaResponse) -> GenerateResponse {
             tool_calls: None,
         },
         tool_calls,
-        usage: Some(TokenUsage {
-            prompt_tokens: to_u32_opt(resp.prompt_eval_count),
-            completion_tokens: to_u32_opt(resp.eval_count),
-            total_tokens: to_u32_opt(match (resp.prompt_eval_count, resp.eval_count) {
+        usage: Some(map_token_usage_triplet(
+            resp.prompt_eval_count,
+            resp.eval_count,
+            match (resp.prompt_eval_count, resp.eval_count) {
                 (Some(a), Some(b)) => Some(a.saturating_add(b)),
                 _ => None,
-            }),
-        }),
+            },
+        )),
     }
 }
 

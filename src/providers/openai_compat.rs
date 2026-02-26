@@ -6,15 +6,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::providers::common::{
-    build_http_client, build_tool_envelopes, truncate_error_display, truncate_for_error,
-    ToolEnvelope as SharedToolEnvelope,
+    build_http_client, build_tool_envelopes, map_token_usage_triplet, truncate_error_display,
+    truncate_for_error, ToolEnvelope as SharedToolEnvelope,
 };
 use crate::providers::http::{
     classify_reqwest_error, classify_status, deterministic_backoff_ms, HttpConfig, ProviderError,
     ProviderErrorKind, RetryRecord,
 };
-use crate::providers::{to_u32_opt, ModelProvider, StreamDelta, ToolCallFragment};
-use crate::types::{GenerateRequest, GenerateResponse, Message, Role, TokenUsage, ToolCall};
+use crate::providers::{ModelProvider, StreamDelta, ToolCallFragment};
+use crate::types::{GenerateRequest, GenerateResponse, Message, Role, ToolCall};
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatProvider {
@@ -518,11 +518,10 @@ fn to_request(req: GenerateRequest, stream: bool) -> OpenAiRequest {
 }
 
 fn map_openai_response(resp: OpenAiResponse) -> anyhow::Result<GenerateResponse> {
-    let usage = resp.usage.as_ref().map(|u| TokenUsage {
-        prompt_tokens: to_u32_opt(u.prompt_tokens),
-        completion_tokens: to_u32_opt(u.completion_tokens),
-        total_tokens: to_u32_opt(u.total_tokens),
-    });
+    let usage = resp
+        .usage
+        .as_ref()
+        .map(|u| map_token_usage_triplet(u.prompt_tokens, u.completion_tokens, u.total_tokens));
     let first = resp
         .choices
         .into_iter()

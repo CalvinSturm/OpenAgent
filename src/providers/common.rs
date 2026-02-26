@@ -4,6 +4,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::providers::http::HttpConfig;
+use crate::providers::to_u32_opt;
+use crate::types::TokenUsage;
 use crate::types::ToolDef;
 
 #[derive(Debug, Serialize)]
@@ -55,4 +57,16 @@ pub(crate) fn build_tool_envelopes(tools: Option<Vec<ToolDef>>) -> Option<Vec<To
             })
             .collect()
     })
+}
+
+pub(crate) fn map_token_usage_triplet(
+    prompt: Option<u64>,
+    completion: Option<u64>,
+    total: Option<u64>,
+) -> TokenUsage {
+    TokenUsage {
+        prompt_tokens: to_u32_opt(prompt),
+        completion_tokens: to_u32_opt(completion),
+        total_tokens: to_u32_opt(total),
+    }
 }
