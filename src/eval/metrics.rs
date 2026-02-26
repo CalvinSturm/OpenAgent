@@ -182,3 +182,170 @@ pub fn aggregate_rows(rows: &[&EvalRunRow]) -> EvalAggregateMetrics {
         avg_step_invariant_violations: step_violation_sum / denom,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::compute_eval_metrics;
+    use crate::eval::types::{
+        EvalMetrics, EvalResults, EvalResultsConfig, EvalRunMetrics, EvalRunRow, EvalRunStats,
+        EvalSummary, ModelSummary, TaskSummary,
+    };
+
+    fn sample_results() -> EvalResults {
+        let mut by_model = BTreeMap::new();
+        let mut model_summary = ModelSummary::default();
+        let mut task_summary = TaskSummary::default();
+
+        let run1 = EvalRunRow {
+            model: "m1".to_string(),
+            task_id: "task_a".to_string(),
+            run_index: 0,
+            workdir: None,
+            run_id: "r1".to_string(),
+            exit_reason: "ok".to_string(),
+            status: "passed".to_string(),
+            skip_reason: None,
+            required_flags: vec![],
+            passed: true,
+            failures: vec![],
+            stats: EvalRunStats {
+                steps: 2,
+                tool_calls: 1,
+            },
+            metrics: Some(EvalRunMetrics {
+                steps: 2,
+                tool_calls: 1,
+                wall_time_ms: 100,
+                provider: crate::eval::types::EvalProviderMetrics {
+                    http_retries: 1,
+                    provider_errors: 0,
+                },
+                tool_retries: 2,
+                step_invariant_violations: 1,
+                ..Default::default()
+            }),
+            tokens: None,
+            estimated_cost_usd: None,
+            verifier: None,
+        };
+        let run2 = EvalRunRow {
+            model: "m1".to_string(),
+            task_id: "task_a".to_string(),
+            run_index: 1,
+            workdir: None,
+            run_id: "r2".to_string(),
+            exit_reason: "provider_error".to_string(),
+            status: "failed".to_string(),
+            skip_reason: None,
+            required_flags: vec![],
+            passed: false,
+            failures: vec!["boom".to_string()],
+            stats: EvalRunStats {
+                steps: 4,
+                tool_calls: 3,
+            },
+            metrics: Some(EvalRunMetrics {
+                steps: 4,
+                tool_calls: 3,
+                wall_time_ms: 300,
+                provider: crate::eval::types::EvalProviderMetrics {
+                    http_retries: 3,
+                    provider_errors: 1,
+                },
+                tool_retries: 0,
+                step_invariant_violations: 0,
+                ..Default::default()
+            }),
+            tokens: None,
+            estimated_cost_usd: None,
+            verifier: None,
+        };
+        let run3 = EvalRunRow {
+            model: "m2".to_string(),
+            task_id: "task_b".to_string(),
+            run_index: 0,
+            workdir: None,
+            run_id: "r3".to_string(),
+            exit_reason: "skipped".to_string(),
+            status: "skipped".to_string(),
+            skip_reason: Some("missing capability".to_string()),
+            required_flags: vec![],
+            passed: false,
+            failures: vec![],
+            stats: EvalRunStats {
+                steps: 0,
+                tool_calls: 0,
+            },
+            metrics: None,
+            tokens: None,
+            estimated_cost_usd: None,
+            verifier: None,
+        };
+
+        model_summary.passed = 1;
+        model_summary.failed = 1;
+        model_summary.skip_rate = 0.0;
+        task_summary.passed = 1;
+        task_summary.failed = 1;
+        task_summary.runs = vec![run1.clone(), run2.clone()];
+        model_summary
+            .tasks
+            .insert("task_a".to_string(), task_summary);
+        by_model.insert("m1".to_string(), model_summary);
+
+        let mut model2_summary = ModelSummary::default();
+        model2_summary.skipped = 1;
+        let mut task2_summary = TaskSummary::default();
+        task2_summary.skipped = 1;
+        task2_summary.runs = vec![run3.clone()];
+        model2_summary
+            .tasks
+            .insert("task_b".to_string(), task2_summary);
+        by_model.insert("m2".to_string(), model2_summary);
+
+        EvalResults {
+            schema_version: "openagent.eval.v1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            config: EvalResultsConfig::minimal_for_tests(),
+            summary: EvalSummary::default(),
+            by_model,
+            runs: vec![run1, run2, run3],
+            metrics: None,
+            baseline: None,
+            regression: None,
+        }
+    }
+
+    #[test]
+    fn compute_eval_metrics_aggregates_summary_model_and_task() {
+        let results = sample_results();
+        let m: EvalMetrics = compute_eval_metrics(&results);
+
+        // summary rates over 3 runs: 1 pass, 1 fail, 1 skip
+        assert!((m.summary.pass_rate - (1.0 / 3.0)).abs() < 1e-9);
+        assert!((m.summary.fail_rate - (1.0 / 3.0)).abs() < 1e-9);
+        assert!((m.summary.skip_rate - (1.0 / 3.0)).abs() < 1e-9);
+
+        // non-skip denominator is 2 runs: avg steps=(2+4)/2, avg tools=(1+3)/2
+        assert_eq!(m.summary.avg_steps, 3.0);
+        assert_eq!(m.summary.avg_tool_calls, 2.0);
+        assert_eq!(m.summary.avg_wall_time_ms, 200.0);
+        assert_eq!(m.summary.avg_provider_retries, 2.0);
+        assert_eq!(m.summary.avg_tool_retries, 1.0);
+        assert_eq!(m.summary.avg_step_invariant_violations, 0.5);
+
+        // grouping exists and is deterministic by key
+        assert!(m.per_model.contains_key("m1"));
+        assert!(m.per_model.contains_key("m2"));
+        assert!(m.per_task.contains_key("task_a"));
+        assert!(m.per_task.contains_key("task_b"));
+
+        // all-skipped task/model yields zero averages due to skip-only denominator handling
+        let task_b = m.per_task.get("task_b").expect("task_b metrics");
+        assert_eq!(task_b.avg_steps, 0.0);
+        assert_eq!(task_b.avg_tool_calls, 0.0);
+        assert_eq!(task_b.skip_rate, 1.0);
+    }
+}
