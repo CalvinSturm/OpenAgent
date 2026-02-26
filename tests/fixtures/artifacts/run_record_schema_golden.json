@@ -1,0 +1,163 @@
+{
+  "artifact_layout": {
+    "relative_approvals_path": ".localagent/approvals.json",
+    "relative_audit_path": ".localagent/audit.jsonl",
+    "relative_policy_path": ".localagent/policy.yaml",
+    "relative_run_artifact_path": ".localagent/runs/golden_run_1.json",
+    "relative_runs_dir": ".localagent/runs",
+    "relative_sessions_dir": ".localagent/sessions",
+    "relative_state_dir": ".localagent"
+  },
+  "config_fingerprint_present": false,
+  "mcp_pin_snapshot_present": false,
+  "metadata": {
+    "exit_reason": "ok",
+    "finished_at": "2026-02-26T12:00:01Z",
+    "run_id": "golden_run_1",
+    "started_at": "2026-02-26T12:00:00Z"
+  },
+  "mode": "single",
+  "policy_source": "file",
+  "policy_version": 2,
+  "schema_keys": {
+    "cli": [
+      "allow_shell",
+      "allow_write",
+      "approval_key",
+      "approval_mode",
+      "auto_approve_scope",
+      "base_url",
+      "caps_mode",
+      "compaction_keep_last",
+      "compaction_mode",
+      "enable_write_tools",
+      "enforce_plan_tools",
+      "exec_target",
+      "hooks_config_path",
+      "hooks_max_stdout_bytes",
+      "hooks_mode",
+      "hooks_strict",
+      "hooks_timeout_ms",
+      "http_connect_timeout_ms",
+      "http_max_line_bytes",
+      "http_max_response_bytes",
+      "http_max_retries",
+      "http_stream_idle_timeout_ms",
+      "http_timeout_ms",
+      "includes_resolved",
+      "instruction_message_count",
+      "max_browser_calls",
+      "max_context_chars",
+      "max_filesystem_read_calls",
+      "max_filesystem_write_calls",
+      "max_mcp_calls",
+      "max_network_calls",
+      "max_read_bytes",
+      "max_shell_calls",
+      "max_tool_output_bytes",
+      "max_total_tool_calls",
+      "max_wall_time_ms",
+      "mcp_pin_enforcement",
+      "mcp_servers",
+      "mcp_tool_snapshot",
+      "mode",
+      "model",
+      "no_limits",
+      "policy_version",
+      "provider",
+      "repro",
+      "repro_env",
+      "resolved_settings_source",
+      "stream",
+      "taint",
+      "taint_digest_bytes",
+      "taint_mode",
+      "tool_args_strict",
+      "tool_catalog",
+      "tool_result_persist",
+      "trust_mode",
+      "tui_enabled",
+      "tui_max_log_lines",
+      "tui_refresh_ms",
+      "unsafe_bypass_allow_flags",
+      "unsafe_mode",
+      "use_session_settings"
+    ],
+    "compaction": [
+      "final_prompt_size_chars",
+      "settings"
+    ],
+    "resolved_paths": [
+      "approvals_path",
+      "audit_path",
+      "policy_path",
+      "state_dir"
+    ],
+    "top_level": [
+      "cli",
+      "compaction",
+      "config_hash_hex",
+      "error",
+      "final_output",
+      "hook_report",
+      "includes_resolved",
+      "mcp_runtime_trace",
+      "metadata",
+      "mode",
+      "policy_hash_hex",
+      "policy_source",
+      "policy_version",
+      "resolved_paths",
+      "tool_calls",
+      "tool_catalog",
+      "tool_decisions",
+      "tool_schema_hash_hex_map",
+      "transcript",
+      "worker"
+    ]
+  },
+  "tool_catalog": [
+    {
+      "name": "read_file",
+      "side_effects": "filesystem_read"
+    },
+    {
+      "name": "shell",
+      "side_effects": "shell_exec"
+    }
+  ],
+  "tool_decisions": [
+    {
+      "decision": "allow",
+      "escalated": false,
+      "reason": null,
+      "source": "policy",
+      "step": 1,
+      "taint_enforced": false,
+      "tool": "read_file",
+      "tool_call_id": "tc_allow"
+    },
+    {
+      "decision": "deny",
+      "escalated": false,
+      "reason": "dangerous command denied",
+      "source": "policy",
+      "step": 2,
+      "taint_enforced": false,
+      "taint_overall": "clean",
+      "tool": "shell",
+      "tool_call_id": "tc_deny"
+    },
+    {
+      "decision": "require_approval",
+      "escalated": false,
+      "reason": "shell requires approval",
+      "source": "policy",
+      "step": 3,
+      "taint_enforced": false,
+      "taint_overall": "clean",
+      "tool": "shell",
+      "tool_call_id": "tc_approve"
+    }
+  ]
+}
