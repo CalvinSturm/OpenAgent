@@ -482,6 +482,8 @@ pub(crate) enum LearnEvidenceKindArg {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum LearnPromoteTargetArg {
     Check,
+    Pack,
+    Agents,
 }
 
 #[derive(Debug, Subcommand)]
@@ -552,7 +554,10 @@ pub(crate) enum LearnSubcommand {
         to: LearnPromoteTargetArg,
 
         #[arg(long)]
-        slug: String,
+        slug: Option<String>,
+
+        #[arg(long = "pack-id")]
+        pack_id: Option<String>,
 
         #[arg(long, default_value_t = false)]
         force: bool,

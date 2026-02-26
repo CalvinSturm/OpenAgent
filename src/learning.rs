@@ -35,7 +35,10 @@ pub const LEARN_PROMOTE_TARGET_EXISTS_REQUIRES_FORCE: &str =
     "LEARN_PROMOTE_TARGET_EXISTS_REQUIRES_FORCE";
 #[allow(dead_code)]
 pub const LEARN_PROMOTE_INVALID_SLUG: &str = "LEARN_PROMOTE_INVALID_SLUG";
+pub const LEARN_PROMOTE_INVALID_PACK_ID: &str = "LEARN_PROMOTE_INVALID_PACK_ID";
 pub const LEARNING_PROMOTED_SCHEMA_V1: &str = "openagent.learning_promoted.v1";
+#[allow(dead_code)]
+pub const LEARNED_GUIDANCE_MANAGED_SECTION_MARKER: &str = "## LocalAgent Learned Guidance";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearningEntryV1 {
@@ -132,6 +135,7 @@ pub enum LearningPromoteError {
     SensitiveRequiresForce,
     TargetExistsRequiresForce,
     InvalidSlug,
+    InvalidPackId,
 }
 
 impl LearningPromoteError {
@@ -143,6 +147,7 @@ impl LearningPromoteError {
                 LEARN_PROMOTE_TARGET_EXISTS_REQUIRES_FORCE
             }
             LearningPromoteError::InvalidSlug => LEARN_PROMOTE_INVALID_SLUG,
+            LearningPromoteError::InvalidPackId => LEARN_PROMOTE_INVALID_PACK_ID,
         }
     }
 }
@@ -161,6 +166,10 @@ impl std::fmt::Display for LearningPromoteError {
             LearningPromoteError::InvalidSlug => write!(
                 f,
                 "Invalid slug. Use lowercase letters, numbers, '_' or '-', no path separators."
+            ),
+            LearningPromoteError::InvalidPackId => write!(
+                f,
+                "Invalid pack_id. Use lowercase '/'-separated segments with [a-z0-9_-]."
             ),
         }
     }
@@ -209,6 +218,27 @@ pub struct PromoteToCheckResult {
     pub target_file_sha256_hex: String,
     pub forced: bool,
     pub entry_hash_hex: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedInsertResult {
+    pub text: String,
+    pub changed: bool,
+    pub already_present: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromoteToTargetResult {
+    pub learning_id: String,
+    pub target: String,
+    pub target_path: PathBuf,
+    pub target_file_sha256_hex: String,
+    pub forced: bool,
+    pub entry_hash_hex: String,
+    pub changed: bool,
+    pub noop: bool,
+    pub pack_id: Option<String>,
 }
 
 pub fn capture_learning_entry(
@@ -359,6 +389,56 @@ pub fn render_promote_to_check_confirmation(out: &PromoteToCheckResult) -> Strin
     )
 }
 
+pub fn render_promote_to_target_confirmation(out: &PromoteToTargetResult) -> String {
+    let pack_suffix = out
+        .pack_id
+        .as_deref()
+        .map(|p| format!(", pack_id={p}"))
+        .unwrap_or_default();
+    if out.noop {
+        return format!(
+            "Already promoted (noop): LEARN-{} already present in managed section (target={}, path={}{} )",
+            out.learning_id,
+            out.target,
+            out.target_path.display(),
+            pack_suffix
+        )
+        .replace(" )", ")");
+    }
+    format!(
+        "Promoted learning {} -> {} (path={}, hash={}, entry_hash={}, forced={}, changed={}{} )",
+        out.learning_id,
+        out.target,
+        out.target_path.display(),
+        out.target_file_sha256_hex,
+        out.entry_hash_hex,
+        out.forced,
+        out.changed,
+        pack_suffix
+    )
+    .replace(" )", ")")
+}
+
+pub fn promote_learning_to_agents(
+    state_dir: &Path,
+    id: &str,
+    force: bool,
+) -> anyhow::Result<PromoteToTargetResult> {
+    let target_path = learning_agents_target_path(state_dir);
+    promote_learning_to_managed_target(state_dir, id, force, "agents", &target_path, None)
+}
+
+pub fn promote_learning_to_pack(
+    state_dir: &Path,
+    id: &str,
+    pack_id: &str,
+    force: bool,
+) -> anyhow::Result<PromoteToTargetResult> {
+    validate_promote_pack_id(pack_id)?;
+    let target_path = learning_pack_target_path(state_dir, pack_id);
+    promote_learning_to_managed_target(state_dir, id, force, "pack", &target_path, Some(pack_id))
+}
+
 pub fn render_learning_to_check_markdown(
     entry: &LearningEntryV1,
     slug: &str,
@@ -443,6 +523,176 @@ fn render_generated_check_body(entry: &LearningEntryV1, slug: &str) -> String {
     out
 }
 
+fn promote_learning_to_managed_target(
+    state_dir: &Path,
+    id: &str,
+    force: bool,
+    target: &str,
+    target_path: &Path,
+    pack_id: Option<&str>,
+) -> anyhow::Result<PromoteToTargetResult> {
+    let mut entry = load_learning_entry(state_dir, id)?;
+    require_force_for_sensitive_promotion(&entry, force)?;
+
+    let existing = if target_path.exists() {
+        fs::read_to_string(target_path)
+            .with_context(|| format!("failed to read target file {}", target_path.display()))?
+    } else {
+        String::new()
+    };
+    let block = render_learning_to_guidance_block(&entry, force);
+    let insert = insert_managed_learning_block(&existing, &entry.id, &block);
+
+    if insert.changed {
+        write_text_atomic(target_path, &insert.text)
+            .with_context(|| format!("failed to write target file {}", target_path.display()))?;
+        let target_file_sha256_hex = compute_file_sha256_hex(target_path)?;
+        update_learning_status(state_dir, &mut entry, LearningStatusV1::Promoted)?;
+        emit_learning_promoted_event(
+            state_dir,
+            &entry,
+            target,
+            target_path,
+            force,
+            &target_file_sha256_hex,
+            None,
+            pack_id,
+            false,
+        )?;
+        return Ok(PromoteToTargetResult {
+            learning_id: entry.id.clone(),
+            target: target.to_string(),
+            target_path: target_path.to_path_buf(),
+            target_file_sha256_hex,
+            forced: force,
+            entry_hash_hex: entry.entry_hash_hex.clone(),
+            changed: true,
+            noop: false,
+            pack_id: pack_id.map(ToOwned::to_owned),
+        });
+    }
+
+    let target_file_sha256_hex = if target_path.exists() {
+        compute_file_sha256_hex(target_path)?
+    } else {
+        String::new()
+    };
+    Ok(PromoteToTargetResult {
+        learning_id: entry.id.clone(),
+        target: target.to_string(),
+        target_path: target_path.to_path_buf(),
+        target_file_sha256_hex,
+        forced: force,
+        entry_hash_hex: entry.entry_hash_hex.clone(),
+        changed: false,
+        noop: true,
+        pack_id: pack_id.map(ToOwned::to_owned),
+    })
+}
+
+#[allow(dead_code)]
+pub fn render_learning_to_guidance_block(entry: &LearningEntryV1, forced: bool) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("### LEARN-{}\n", entry.id));
+    out.push_str(&format!("learning_id: {}\n", entry.id));
+    out.push_str(&format!("entry_hash_hex: {}\n", entry.entry_hash_hex));
+    out.push_str(&format!(
+        "category: {}\n",
+        learning_category_str(&entry.category)
+    ));
+    out.push_str(&format!("forced: {}\n\n", forced));
+    let body = entry
+        .proposed_memory
+        .guidance_text
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(normalize_newlines)
+        .unwrap_or_else(|| {
+            format!(
+                "Learned guidance placeholder (deterministic draft)\n\nSummary:\n{}\n",
+                normalize_newlines(&entry.summary)
+            )
+        });
+    out.push_str(&body);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+#[allow(dead_code)]
+pub fn insert_managed_learning_block(
+    input: &str,
+    learning_id: &str,
+    block: &str,
+) -> ManagedInsertResult {
+    let normalized_input = normalize_newlines(input);
+    let mut normalized_block = normalize_newlines(block);
+    if !normalized_block.ends_with('\n') {
+        normalized_block.push('\n');
+    }
+    let header = format!("### LEARN-{learning_id}");
+
+    if let Some(marker_pos) = normalized_input.find(LEARNED_GUIDANCE_MANAGED_SECTION_MARKER) {
+        let section_start = marker_pos;
+        let after_marker_idx = marker_pos + LEARNED_GUIDANCE_MANAGED_SECTION_MARKER.len();
+        let tail_after_marker = &normalized_input[after_marker_idx..];
+        let next_section_rel = tail_after_marker.find("\n## ").map(|i| i + 1);
+        let section_end = next_section_rel
+            .map(|rel| after_marker_idx + rel)
+            .unwrap_or(normalized_input.len());
+        let section = &normalized_input[section_start..section_end];
+        if section.contains(&header) {
+            return ManagedInsertResult {
+                text: ensure_trailing_newline(normalized_input),
+                changed: false,
+                already_present: true,
+            };
+        }
+
+        let mut new_section = section.to_string();
+        if !new_section.ends_with('\n') {
+            new_section.push('\n');
+        }
+        if new_section == LEARNED_GUIDANCE_MANAGED_SECTION_MARKER {
+            new_section.push('\n');
+        }
+        if !new_section.ends_with("\n\n") {
+            if new_section.ends_with('\n') {
+                new_section.push('\n');
+            } else {
+                new_section.push_str("\n\n");
+            }
+        }
+        new_section.push_str(&normalized_block);
+        let mut rebuilt = String::new();
+        rebuilt.push_str(&normalized_input[..section_start]);
+        rebuilt.push_str(&new_section);
+        rebuilt.push_str(&normalized_input[section_end..]);
+        return ManagedInsertResult {
+            text: ensure_trailing_newline(rebuilt),
+            changed: true,
+            already_present: false,
+        };
+    }
+
+    let mut out = normalized_input;
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str(LEARNED_GUIDANCE_MANAGED_SECTION_MARKER);
+    out.push_str("\n\n");
+    out.push_str(&normalized_block);
+    ManagedInsertResult {
+        text: ensure_trailing_newline(out),
+        changed: true,
+        already_present: false,
+    }
+}
+
 fn update_learning_status(
     state_dir: &Path,
     entry: &mut LearningEntryV1,
@@ -472,17 +722,50 @@ fn emit_learning_promoted_event_for_check(
     forced: bool,
     target_file_sha256_hex: &str,
 ) -> anyhow::Result<()> {
+    emit_learning_promoted_event(
+        state_dir,
+        entry,
+        "check",
+        target_path,
+        forced,
+        target_file_sha256_hex,
+        Some(slug),
+        None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_learning_promoted_event(
+    state_dir: &Path,
+    entry: &LearningEntryV1,
+    target: &str,
+    target_path: &Path,
+    forced: bool,
+    target_file_sha256_hex: &str,
+    slug: Option<&str>,
+    pack_id: Option<&str>,
+    noop: bool,
+) -> anyhow::Result<()> {
     let mut sink = JsonlFileSink::new(&learning_events_path(state_dir))?;
-    let data = serde_json::json!({
+    let mut data = serde_json::json!({
         "schema": LEARNING_PROMOTED_SCHEMA_V1,
         "learning_id": entry.id,
         "entry_hash_hex": entry.entry_hash_hex,
-        "target": "check",
+        "target": target,
         "target_path": stable_learning_target_path(state_dir, target_path),
-        "slug": slug,
         "forced": forced,
         "target_file_sha256_hex": target_file_sha256_hex,
     });
+    if let Some(slug) = slug {
+        data["slug"] = serde_json::Value::String(slug.to_string());
+    }
+    if let Some(pack_id) = pack_id {
+        data["pack_id"] = serde_json::Value::String(pack_id.to_string());
+    }
+    if noop {
+        data["noop"] = serde_json::Value::Bool(true);
+    }
     sink.emit(Event::new(
         format!("learn:{}", entry.id),
         0,
@@ -506,6 +789,18 @@ pub fn learning_events_path(state_dir: &Path) -> PathBuf {
 
 fn learning_check_path(state_dir: &Path, slug: &str) -> PathBuf {
     state_dir.join("checks").join(format!("{slug}.md"))
+}
+
+fn learning_agents_target_path(state_dir: &Path) -> PathBuf {
+    state_dir.parent().unwrap_or(state_dir).join("AGENTS.md")
+}
+
+fn learning_pack_target_path(state_dir: &Path, pack_id: &str) -> PathBuf {
+    let mut path = state_dir.join("packs");
+    for segment in pack_id.split('/') {
+        path = path.join(segment);
+    }
+    path.join("PACK.md")
 }
 
 pub fn load_learning_entry(state_dir: &Path, id: &str) -> anyhow::Result<LearningEntryV1> {
@@ -1043,6 +1338,26 @@ fn promote_slug_pattern() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[a-z0-9][a-z0-9_-]{0,63}$").expect("promote slug regex"))
 }
 
+fn validate_promote_pack_id(pack_id: &str) -> anyhow::Result<()> {
+    if pack_id.is_empty()
+        || pack_id.starts_with('/')
+        || pack_id.contains('\\')
+        || pack_id.contains(':')
+        || pack_id.contains("//")
+    {
+        return Err(LearningPromoteError::InvalidPackId.into());
+    }
+    for segment in pack_id.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(LearningPromoteError::InvalidPackId.into());
+        }
+        if !promote_slug_pattern().is_match(segment) {
+            return Err(LearningPromoteError::InvalidPackId.into());
+        }
+    }
+    Ok(())
+}
+
 fn collect_secret_matches(input: &str) -> Vec<MatchRange> {
     let mut out = Vec::new();
     for re in secret_detection_patterns() {
@@ -1102,8 +1417,38 @@ fn stable_learning_target_path(state_dir: &Path, target_path: &Path) -> String {
     stable_forward_slash_path(rel)
 }
 
+fn write_text_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
+    use uuid::Uuid;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension(format!("tmp.{}", Uuid::new_v4()));
+    fs::write(&tmp_path, content)?;
+    if let Err(rename_err) = fs::rename(&tmp_path, path) {
+        #[cfg(windows)]
+        {
+            if path.exists() {
+                let _ = fs::remove_file(path);
+                fs::rename(&tmp_path, path)?;
+                return Ok(());
+            }
+        }
+        return Err(rename_err.into());
+    }
+    Ok(())
+}
+
 fn normalize_newlines(input: &str) -> String {
     input.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+#[allow(dead_code)]
+fn ensure_trailing_newline(mut input: String) -> String {
+    if !input.ends_with('\n') {
+        input.push('\n');
+    }
+    input
 }
 
 fn truncate_utf8_chars(input: &str, max_chars: usize) -> String {
@@ -1653,5 +1998,190 @@ mod tests {
         assert_eq!(check.frontmatter.schema_version, 1);
         assert_eq!(check.frontmatter.allowed_tools, Some(vec![]));
         assert_eq!(check.frontmatter.required_flags, Vec::<String>::new());
+    }
+
+    #[test]
+    fn managed_insert_creates_section_when_missing() {
+        let e = sample_check_candidate_learning_entry();
+        let block = render_learning_to_guidance_block(&e, false);
+        let out = insert_managed_learning_block("", &e.id, &block);
+        assert!(out.changed);
+        assert!(!out.already_present);
+        assert!(out
+            .text
+            .starts_with(LEARNED_GUIDANCE_MANAGED_SECTION_MARKER));
+        assert!(out.text.contains(&format!("### LEARN-{}", e.id)));
+        assert!(out.text.ends_with('\n'));
+    }
+
+    #[test]
+    fn managed_insert_is_idempotent_for_same_learning_id() {
+        let e = sample_check_candidate_learning_entry();
+        let block = render_learning_to_guidance_block(&e, true);
+        let a = insert_managed_learning_block("", &e.id, &block);
+        let b = insert_managed_learning_block(&a.text, &e.id, &block);
+        assert!(a.changed);
+        assert!(!a.already_present);
+        assert!(!b.changed);
+        assert!(b.already_present);
+        assert_eq!(a.text, b.text);
+        assert_eq!(b.text.matches(&format!("### LEARN-{}", e.id)).count(), 1);
+    }
+
+    #[test]
+    fn managed_insert_preserves_unmanaged_content_outside_section() {
+        let e1 = sample_check_candidate_learning_entry();
+        let mut e2 = sample_check_candidate_learning_entry();
+        e2.id = "01JPR4OTHER".to_string();
+        e2.entry_hash_hex = compute_entry_hash_hex(&e2).expect("hash");
+
+        let existing_block = render_learning_to_guidance_block(&e1, false);
+        let new_block = render_learning_to_guidance_block(&e2, true);
+        let original = format!(
+            "PRELUDE line 1\nPRELUDE line 2\n\n{marker}\n\n{existing}## User Section\nkeep this exact\n",
+            marker = LEARNED_GUIDANCE_MANAGED_SECTION_MARKER,
+            existing = existing_block
+        );
+
+        let out = insert_managed_learning_block(&original, &e2.id, &new_block);
+        assert!(out.changed);
+        assert!(!out.already_present);
+        assert!(out.text.starts_with("PRELUDE line 1\nPRELUDE line 2\n\n"));
+        assert!(out.text.contains("\n## User Section\nkeep this exact\n"));
+        assert_eq!(
+            out.text
+                .matches(LEARNED_GUIDANCE_MANAGED_SECTION_MARKER)
+                .count(),
+            1
+        );
+        assert_eq!(out.text.matches(&format!("### LEARN-{}", e1.id)).count(), 1);
+        assert_eq!(out.text.matches(&format!("### LEARN-{}", e2.id)).count(), 1);
+    }
+
+    #[test]
+    fn promote_to_agents_creates_agents_md_and_emits_event() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.proposed_memory.guidance_text = Some("Use ripgrep before grep.\n".to_string());
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+
+        let out = promote_learning_to_agents(&state_dir, &e.id, false).expect("promote agents");
+        assert_eq!(out.target, "agents");
+        assert!(out.changed);
+        assert!(!out.noop);
+        let agents = tmp.path().join("AGENTS.md");
+        let text = fs::read_to_string(&agents).expect("read agents");
+        assert!(text.contains(LEARNED_GUIDANCE_MANAGED_SECTION_MARKER));
+        assert!(text.contains(&format!("### LEARN-{}", e.id)));
+
+        let updated = load_learning_entry(&state_dir, &e.id).expect("load updated");
+        assert_eq!(updated.status, LearningStatusV1::Promoted);
+
+        let lines = read_learning_events_lines(&state_dir);
+        let v: serde_json::Value =
+            serde_json::from_str(lines.last().expect("event line")).expect("event json");
+        assert_eq!(v["data"]["target"], "agents");
+        assert_eq!(v["data"]["target_path"], "AGENTS.md");
+    }
+
+    #[test]
+    fn promote_to_agents_rerun_is_noop_and_does_not_emit_event() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.proposed_memory.guidance_text = Some("Always confirm assumptions.\n".to_string());
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+
+        let first = promote_learning_to_agents(&state_dir, &e.id, false).expect("first");
+        assert!(first.changed);
+        let event_count_before = read_learning_events_lines(&state_dir).len();
+
+        let second = promote_learning_to_agents(&state_dir, &e.id, false).expect("second");
+        assert!(!second.changed);
+        assert!(second.noop);
+        assert_eq!(
+            read_learning_events_lines(&state_dir).len(),
+            event_count_before
+        );
+        let msg = render_promote_to_target_confirmation(&second);
+        assert!(msg.contains("Already promoted (noop)"));
+    }
+
+    #[test]
+    fn pack_id_validation_rejects_invalid_and_allows_hierarchical_safe_segments() {
+        for bad in [
+            "",
+            "../x",
+            "x/../y",
+            "/abs",
+            "web\\play",
+            "web//play",
+            "UPPER",
+        ] {
+            let err = validate_promote_pack_id(bad).expect_err("invalid pack id");
+            let typed = err
+                .downcast_ref::<LearningPromoteError>()
+                .expect("typed pack id error");
+            assert_eq!(typed.code(), LEARN_PROMOTE_INVALID_PACK_ID);
+        }
+        validate_promote_pack_id("web/playwright").expect("valid hierarchical");
+        validate_promote_pack_id("a_b/c-d").expect("valid segments");
+    }
+
+    #[test]
+    fn promote_to_pack_creates_nested_pack_md_and_emits_event_with_pack_id() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.proposed_memory.guidance_text =
+            Some("Use Playwright MCP for browser checks.\n".to_string());
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+
+        let out = promote_learning_to_pack(&state_dir, &e.id, "web/playwright", false)
+            .expect("promote pack");
+        assert_eq!(out.target, "pack");
+        assert_eq!(out.pack_id.as_deref(), Some("web/playwright"));
+        let pack_md = state_dir
+            .join("packs")
+            .join("web")
+            .join("playwright")
+            .join("PACK.md");
+        assert!(pack_md.exists());
+        let text = fs::read_to_string(&pack_md).expect("read pack");
+        assert!(text.contains(LEARNED_GUIDANCE_MANAGED_SECTION_MARKER));
+        assert!(text.contains(&format!("### LEARN-{}", e.id)));
+
+        let lines = read_learning_events_lines(&state_dir);
+        let v: serde_json::Value =
+            serde_json::from_str(lines.last().expect("event line")).expect("event json");
+        assert_eq!(v["data"]["target"], "pack");
+        assert_eq!(v["data"]["pack_id"], "web/playwright");
+        assert_eq!(
+            v["data"]["target_path"],
+            ".localagent/packs/web/playwright/PACK.md"
+        );
+    }
+
+    #[test]
+    fn promote_to_pack_path_safety_only_expected_files_modified() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+
+        let _ = promote_learning_to_pack(&state_dir, &e.id, "web/playwright", false)
+            .expect("promote pack");
+        let after = collect_state_files(&state_dir);
+        let expected = BTreeSet::from([
+            format!("learn/entries/{}.json", e.id),
+            "learn/events.jsonl".to_string(),
+            "packs/web/playwright/PACK.md".to_string(),
+        ]);
+        assert_eq!(after, expected);
     }
 }

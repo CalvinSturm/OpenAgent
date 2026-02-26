@@ -145,14 +145,33 @@ pub(crate) async fn handle_learn_command(
             id,
             to,
             slug,
+            pack_id,
             force,
         } => match to {
             LearnPromoteTargetArg::Check => {
+                let slug = slug
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--slug is required for --to check"))?;
                 let out = learning::promote_learning_to_check(&paths.state_dir, id, slug, *force)
                     .with_context(|| {
                     format!("failed to promote learning entry {id} to check")
                 })?;
                 println!("{}", learning::render_promote_to_check_confirmation(&out));
+                Ok(())
+            }
+            LearnPromoteTargetArg::Pack => {
+                let pack_id = pack_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--pack-id is required for --to pack"))?;
+                let out = learning::promote_learning_to_pack(&paths.state_dir, id, pack_id, *force)
+                    .with_context(|| format!("failed to promote learning entry {id} to pack"))?;
+                println!("{}", learning::render_promote_to_target_confirmation(&out));
+                Ok(())
+            }
+            LearnPromoteTargetArg::Agents => {
+                let out = learning::promote_learning_to_agents(&paths.state_dir, id, *force)
+                    .with_context(|| format!("failed to promote learning entry {id} to agents"))?;
+                println!("{}", learning::render_promote_to_target_confirmation(&out));
                 Ok(())
             }
         },
