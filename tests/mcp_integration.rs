@@ -48,10 +48,27 @@ async fn mcp_tool_naming_and_schema_conversion() {
             .expect("start registry");
     let names = reg
         .tool_defs()
-        .into_iter()
-        .map(|t| t.name)
+        .iter()
+        .map(|t| t.name.clone())
         .collect::<Vec<_>>();
     assert!(names.iter().any(|n| n == "mcp.stub.echo"));
+    let def = reg
+        .tool_defs()
+        .into_iter()
+        .find(|t| t.name == "mcp.stub.echo")
+        .expect("mcp stub tool def");
+    assert_eq!(
+        def.description,
+        "MCP tool from stub. Use /tool docs mcp.stub.echo for details."
+    );
+    let docs = reg.tool_doc_meta("mcp.stub.echo").expect("doc meta");
+    assert_eq!(docs.raw_description.as_deref(), Some("Echo arguments"));
+    assert!(!docs.raw_description_truncated);
+    let expected_hash = localagent::store::sha256_hex("Echo arguments".as_bytes());
+    assert_eq!(
+        docs.raw_description_hash.as_deref(),
+        Some(expected_hash.as_str())
+    );
 }
 
 #[tokio::test]

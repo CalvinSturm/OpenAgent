@@ -20,9 +20,19 @@ pub struct McpRegistry {
     clients: BTreeMap<String, McpClient>,
     tool_map: BTreeMap<String, (String, String)>,
     tool_schema_map: BTreeMap<String, Option<serde_json::Value>>,
+    #[allow(dead_code)]
+    tool_doc_meta_map: BTreeMap<String, McpToolDocMeta>,
     tool_defs: Vec<ToolDef>,
     timeout: Duration,
     mcp_spool_dir: PathBuf,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct McpToolDocMeta {
+    pub raw_description: Option<String>,
+    pub raw_description_hash: Option<String>,
+    pub raw_description_truncated: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -48,6 +58,7 @@ impl McpRegistry {
         let mut clients = BTreeMap::new();
         let mut tool_map = BTreeMap::new();
         let mut tool_schema_map = BTreeMap::new();
+        let mut tool_doc_meta_map = BTreeMap::new();
         let mut tool_defs = Vec::new();
         let mcp_spool_dir = path
             .parent()
@@ -65,11 +76,13 @@ impl McpRegistry {
             let tools = client.tools_list(timeout).await?;
             for tool in &tools {
                 let namespaced = format!("mcp.{}.{}", name, tool.name);
+                let raw_doc = build_mcp_tool_doc_meta(&tool.description);
                 tool_map.insert(namespaced.clone(), (name.clone(), tool.name.clone()));
                 tool_schema_map.insert(namespaced.clone(), tool.input_schema.clone());
+                tool_doc_meta_map.insert(namespaced.clone(), raw_doc.clone());
                 tool_defs.push(ToolDef {
-                    name: namespaced,
-                    description: tool.description.clone(),
+                    name: namespaced.clone(),
+                    description: model_facing_mcp_tool_description(name, &namespaced),
                     parameters: tool
                         .input_schema
                         .clone()
@@ -85,6 +98,7 @@ impl McpRegistry {
             clients,
             tool_map,
             tool_schema_map,
+            tool_doc_meta_map,
             tool_defs,
             timeout,
             mcp_spool_dir,
@@ -93,6 +107,11 @@ impl McpRegistry {
 
     pub fn tool_defs(&self) -> Vec<ToolDef> {
         self.tool_defs.clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn tool_doc_meta(&self, namespaced_tool: &str) -> Option<&McpToolDocMeta> {
+        self.tool_doc_meta_map.get(namespaced_tool)
     }
 
     pub fn validate_namespaced_tool_args(
@@ -255,6 +274,23 @@ impl McpRegistry {
 }
 
 const MCP_MAX_MODEL_RESULT_BYTES: usize = 64 * 1024;
+const MCP_MAX_RAW_DESCRIPTION_BYTES: usize = 8 * 1024;
+
+fn model_facing_mcp_tool_description(server: &str, namespaced_tool: &str) -> String {
+    format!("MCP tool from {server}. Use /tool docs {namespaced_tool} for details.")
+}
+
+fn build_mcp_tool_doc_meta(raw: &str) -> McpToolDocMeta {
+    if raw.is_empty() {
+        return McpToolDocMeta::default();
+    }
+    let (capped, truncated) = truncate_utf8_to_bytes(raw, MCP_MAX_RAW_DESCRIPTION_BYTES);
+    McpToolDocMeta {
+        raw_description: Some(capped),
+        raw_description_hash: Some(sha256_hex(raw.as_bytes())),
+        raw_description_truncated: truncated,
+    }
+}
 
 fn truncate_utf8_to_bytes(input: &str, max_bytes: usize) -> (String, bool) {
     if input.len() <= max_bytes {
@@ -403,6 +439,7 @@ mod tests {
             clients: BTreeMap::new(),
             tool_map: BTreeMap::new(),
             tool_schema_map: BTreeMap::new(),
+            tool_doc_meta_map: BTreeMap::new(),
             tool_defs: defs.clone(),
             timeout: std::time::Duration::from_secs(1),
             mcp_spool_dir: std::path::PathBuf::from("."),
@@ -411,6 +448,7 @@ mod tests {
             clients: BTreeMap::new(),
             tool_map: BTreeMap::new(),
             tool_schema_map: BTreeMap::new(),
+            tool_doc_meta_map: BTreeMap::new(),
             tool_defs: defs,
             timeout: std::time::Duration::from_secs(1),
             mcp_spool_dir: std::path::PathBuf::from("."),
@@ -431,5 +469,31 @@ mod tests {
         let (full, was_truncated) = super::truncate_utf8_to_bytes(input, input.len());
         assert!(!was_truncated);
         assert_eq!(full, input);
+    }
+
+    #[test]
+    fn model_facing_mcp_description_is_local_generated() {
+        let desc = super::model_facing_mcp_tool_description("stub", "mcp.stub.echo");
+        assert_eq!(
+            desc,
+            "MCP tool from stub. Use /tool docs mcp.stub.echo for details."
+        );
+    }
+
+    #[test]
+    fn raw_doc_meta_caps_but_hashes_full_description() {
+        let raw = format!(
+            "{}🙂",
+            "x".repeat(super::MCP_MAX_RAW_DESCRIPTION_BYTES + 32)
+        );
+        let meta = super::build_mcp_tool_doc_meta(&raw);
+        assert!(meta.raw_description_truncated);
+        let capped = meta.raw_description.expect("raw description");
+        assert!(capped.len() <= super::MCP_MAX_RAW_DESCRIPTION_BYTES);
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+        assert_eq!(
+            meta.raw_description_hash,
+            Some(crate::store::sha256_hex(raw.as_bytes()))
+        );
     }
 }
