@@ -190,209 +190,16 @@ impl UiState {
                 }
             }
             EventKind::ToolCallDetected => {
-                let id = ev
-                    .data
-                    .get("tool_call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let name = ev
-                    .data
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let side = ev
-                    .data
-                    .get("side_effects")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                self.upsert_tool(id, name, side, "detected");
+                self.apply_tool_call_detected_event(ev);
             }
             EventKind::ToolDecision => {
-                let id = ev
-                    .data
-                    .get("tool_call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let name = ev
-                    .data
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let side = ev
-                    .data
-                    .get("side_effects")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let decision = ev
-                    .data
-                    .get("decision")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let reason = ev
-                    .data
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let source = ev
-                    .data
-                    .get("source")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let is_mcp = is_mcp_tool(&name);
-                let is_deny = decision == "deny";
-                let is_pending = decision == "require_approval";
-                {
-                    let row = self.upsert_tool(id, name, side, "decided");
-                    row.decision = Some(decision);
-                    row.decision_source = Some(source.clone());
-                    row.reason_token = reason_token(&source, reason.as_deref()).to_string();
-                    row.decision_reason = reason;
-                    if is_deny {
-                        row.status = format!("DENY:{}", row.reason_token);
-                    } else if is_pending {
-                        row.status = "PEND:approval".to_string();
-                    }
-                }
-                if let Some(step_id) = ev.data.get("plan_step_id").and_then(|v| v.as_str()) {
-                    self.current_step_id = step_id.to_string();
-                }
-                if let Some(allowed) = ev.data.get("plan_allowed_tools").and_then(|v| v.as_array())
-                {
-                    self.current_step_allowed_tools = allowed
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect();
-                }
-                if is_deny {
-                    self.next_hint = format!("blocked({})", reason_token(&source, None));
-                } else if is_pending {
-                    self.next_hint = "pending_approval".to_string();
-                }
-                if is_mcp {
-                    if is_pending {
-                        self.mcp_lifecycle = "WAIT:APPROVAL".to_string();
-                    } else if is_deny {
-                        self.mcp_lifecycle = "DENY".to_string();
-                    }
-                }
+                self.apply_tool_decision_event(ev);
             }
             EventKind::ToolExecStart => {
-                let id = ev
-                    .data
-                    .get("tool_call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let name = ev
-                    .data
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let side = ev
-                    .data
-                    .get("side_effects")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let _ = self.upsert_tool(id, name, side, "running");
-                if is_mcp_tool(
-                    ev.data
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default(),
-                ) {
-                    self.mcp_lifecycle = "RUNNING".to_string();
-                    self.mcp_running_for_ms = 0;
-                    self.mcp_stalled = false;
-                    self.mcp_stall_notice_emitted = false;
-                }
+                self.apply_tool_exec_start_event(ev);
             }
             EventKind::ToolExecEnd => {
-                let id = ev
-                    .data
-                    .get("tool_call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let name = ev
-                    .data
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let ok = ev.data.get("ok").and_then(|v| v.as_bool());
-                let result = ev
-                    .data
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let failure_class = ev
-                    .data
-                    .get("failure_class")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("E_OTHER");
-                let side_effects = {
-                    let row = self.upsert_tool(id, name, String::new(), "done");
-                    row.ok = ok;
-                    row.short_result = truncate_chars(result, 200);
-                    row.running_since = None;
-                    row.running_for_ms = 0;
-                    if matches!(ok, Some(false)) {
-                        let mut token = class_to_reason_token(failure_class).to_string();
-                        if is_protocol_violation_text(result) {
-                            token = "protocol".to_string();
-                        }
-                        row.status = format!("FAIL:{token}");
-                        row.reason_token = token;
-                    }
-                    row.side_effects.clone()
-                };
-                if matches!(ok, Some(true)) {
-                    self.bump_usage(&side_effects);
-                    self.next_hint = "continue".to_string();
-                    if is_mcp_tool(
-                        ev.data
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default(),
-                    ) {
-                        self.mcp_lifecycle = "DONE".to_string();
-                        self.mcp_running_for_ms = 0;
-                        self.mcp_stalled = false;
-                        self.mcp_stall_notice_emitted = false;
-                    }
-                } else if is_mcp_tool(
-                    ev.data
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default(),
-                ) {
-                    self.mcp_lifecycle = "FAIL".to_string();
-                    self.mcp_running_for_ms = 0;
-                    self.mcp_stalled = false;
-                    self.mcp_stall_notice_emitted = false;
-                }
-                self.last_tool_retry_count = ev
-                    .data
-                    .get("retry_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                self.last_failure_class = ev
-                    .data
-                    .get("failure_class")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("-")
-                    .to_string();
+                self.apply_tool_exec_end_event(ev);
             }
             EventKind::PolicyLoaded => {
                 if let Some(hash) = ev.data.get("policy_hash_hex").and_then(|v| v.as_str()) {
@@ -739,6 +546,214 @@ impl UiState {
                 }
             }
         }
+    }
+
+    fn apply_tool_call_detected_event(&mut self, ev: &Event) {
+        let id = ev
+            .data
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let name = ev
+            .data
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let side = ev
+            .data
+            .get("side_effects")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        self.upsert_tool(id, name, side, "detected");
+    }
+
+    fn apply_tool_decision_event(&mut self, ev: &Event) {
+        let id = ev
+            .data
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let name = ev
+            .data
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let side = ev
+            .data
+            .get("side_effects")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let decision = ev
+            .data
+            .get("decision")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let reason = ev
+            .data
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let source = ev
+            .data
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let is_mcp = is_mcp_tool(&name);
+        let is_deny = decision == "deny";
+        let is_pending = decision == "require_approval";
+        {
+            let row = self.upsert_tool(id, name, side, "decided");
+            row.decision = Some(decision);
+            row.decision_source = Some(source.clone());
+            row.reason_token = reason_token(&source, reason.as_deref()).to_string();
+            row.decision_reason = reason;
+            if is_deny {
+                row.status = format!("DENY:{}", row.reason_token);
+            } else if is_pending {
+                row.status = "PEND:approval".to_string();
+            }
+        }
+        if let Some(step_id) = ev.data.get("plan_step_id").and_then(|v| v.as_str()) {
+            self.current_step_id = step_id.to_string();
+        }
+        if let Some(allowed) = ev.data.get("plan_allowed_tools").and_then(|v| v.as_array()) {
+            self.current_step_allowed_tools = allowed
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+        if is_deny {
+            self.next_hint = format!("blocked({})", reason_token(&source, None));
+        } else if is_pending {
+            self.next_hint = "pending_approval".to_string();
+        }
+        if is_mcp {
+            if is_pending {
+                self.mcp_lifecycle = "WAIT:APPROVAL".to_string();
+            } else if is_deny {
+                self.mcp_lifecycle = "DENY".to_string();
+            }
+        }
+    }
+
+    fn apply_tool_exec_start_event(&mut self, ev: &Event) {
+        let id = ev
+            .data
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let name = ev
+            .data
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let side = ev
+            .data
+            .get("side_effects")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let _ = self.upsert_tool(id, name, side, "running");
+        if is_mcp_tool(
+            ev.data
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+        ) {
+            self.mcp_lifecycle = "RUNNING".to_string();
+            self.mcp_running_for_ms = 0;
+            self.mcp_stalled = false;
+            self.mcp_stall_notice_emitted = false;
+        }
+    }
+
+    fn apply_tool_exec_end_event(&mut self, ev: &Event) {
+        let id = ev
+            .data
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let name = ev
+            .data
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let ok = ev.data.get("ok").and_then(|v| v.as_bool());
+        let result = ev
+            .data
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let failure_class = ev
+            .data
+            .get("failure_class")
+            .and_then(|v| v.as_str())
+            .unwrap_or("E_OTHER");
+        let side_effects = {
+            let row = self.upsert_tool(id, name, String::new(), "done");
+            row.ok = ok;
+            row.short_result = truncate_chars(result, 200);
+            row.running_since = None;
+            row.running_for_ms = 0;
+            if matches!(ok, Some(false)) {
+                let mut token = class_to_reason_token(failure_class).to_string();
+                if is_protocol_violation_text(result) {
+                    token = "protocol".to_string();
+                }
+                row.status = format!("FAIL:{token}");
+                row.reason_token = token;
+            }
+            row.side_effects.clone()
+        };
+        if matches!(ok, Some(true)) {
+            self.bump_usage(&side_effects);
+            self.next_hint = "continue".to_string();
+            if is_mcp_tool(
+                ev.data
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            ) {
+                self.mcp_lifecycle = "DONE".to_string();
+                self.mcp_running_for_ms = 0;
+                self.mcp_stalled = false;
+                self.mcp_stall_notice_emitted = false;
+            }
+        } else if is_mcp_tool(
+            ev.data
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+        ) {
+            self.mcp_lifecycle = "FAIL".to_string();
+            self.mcp_running_for_ms = 0;
+            self.mcp_stalled = false;
+            self.mcp_stall_notice_emitted = false;
+        }
+        self.last_tool_retry_count = ev
+            .data
+            .get("retry_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        self.last_failure_class = ev
+            .data
+            .get("failure_class")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("-")
+            .to_string();
     }
 
     fn bump_usage(&mut self, side_effects: &str) {
