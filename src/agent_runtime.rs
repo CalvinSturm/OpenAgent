@@ -119,6 +119,20 @@ struct ReplanSuccessPrep {
     replan_handoff: String,
 }
 
+struct ReplanResumeRunInput<'a, P: ModelProvider> {
+    agent: &'a mut Agent<P>,
+    prompt: &'a str,
+    prior_outcome: &'a agent::AgentOutcome,
+    base_instruction_messages: &'a [Message],
+    project_guidance_message: &'a Option<Message>,
+    repo_map_message: &'a Option<Message>,
+    pack_guidance_message: &'a Option<Message>,
+    base_task_memory: &'a Option<Message>,
+    replan_handoff: String,
+    resolved_settings: &'a session::RunSettingResolution,
+    cancel_rx: &'a mut watch::Receiver<bool>,
+}
+
 struct RunArtifactWriteInput {
     paths: store::StatePaths,
     cli_config: store::RunCliConfig,
@@ -852,32 +866,20 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                     },
                     replan_out,
                 )?;
-                let resume_session_messages = extract_session_messages(&outcome.messages);
-                let replan_injected = runtime_paths::merge_injected_messages(
-                    base_instruction_messages.clone(),
-                    project_guidance_message.clone(),
-                    repo_map_message.clone(),
-                    pack_guidance_message.clone(),
-                    base_task_memory.clone(),
-                    Some(Message {
-                        role: Role::Developer,
-                        content: Some(replan_handoff),
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_calls: None,
-                    }),
-                );
-                outcome = tokio::select! {
-                    out = agent.run(prompt, resume_session_messages, replan_injected) => out,
-                    _ = tokio::signal::ctrl_c() => {
-                        cancelled_outcome(&resolved_settings)
-                    },
-                    _ = async {
-                        let _ = cancel_rx.changed().await;
-                    } => {
-                        cancelled_outcome(&resolved_settings)
-                    }
-                };
+                outcome = run_replan_resume_with_cancel(ReplanResumeRunInput {
+                    agent: &mut agent,
+                    prompt,
+                    prior_outcome: &outcome,
+                    base_instruction_messages: &base_instruction_messages,
+                    project_guidance_message: &project_guidance_message,
+                    repo_map_message: &repo_map_message,
+                    pack_guidance_message: &pack_guidance_message,
+                    base_task_memory: &base_task_memory,
+                    replan_handoff,
+                    resolved_settings: &resolved_settings,
+                    cancel_rx: &mut cancel_rx,
+                })
+                .await;
             }
             Ok(replan_out) => {
                 outcome.exit_reason = AgentExitReason::PlannerError;
@@ -1191,6 +1193,37 @@ fn prepare_replan_success_resume<P: ModelProvider>(
         Some("replan_resume"),
     );
     Ok(ReplanSuccessPrep { replan_handoff })
+}
+
+async fn run_replan_resume_with_cancel<P: ModelProvider>(
+    input: ReplanResumeRunInput<'_, P>,
+) -> agent::AgentOutcome {
+    let resume_session_messages = extract_session_messages(&input.prior_outcome.messages);
+    let replan_injected = runtime_paths::merge_injected_messages(
+        input.base_instruction_messages.to_vec(),
+        input.project_guidance_message.clone(),
+        input.repo_map_message.clone(),
+        input.pack_guidance_message.clone(),
+        input.base_task_memory.clone(),
+        Some(Message {
+            role: Role::Developer,
+            content: Some(input.replan_handoff),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: None,
+        }),
+    );
+    tokio::select! {
+        out = input.agent.run(input.prompt, resume_session_messages, replan_injected) => out,
+        _ = tokio::signal::ctrl_c() => {
+            cancelled_outcome(input.resolved_settings)
+        },
+        _ = async {
+            let _ = input.cancel_rx.changed().await;
+        } => {
+            cancelled_outcome(input.resolved_settings)
+        }
+    }
 }
 
 fn emit_planner_end_event(
