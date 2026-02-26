@@ -1,6 +1,7 @@
 #![deny(unreachable_pub)]
 
 pub mod agent;
+pub(crate) mod agent_budget;
 pub(crate) mod agent_events;
 pub(crate) mod agent_impl_guard;
 pub(crate) mod agent_queue_runtime;
