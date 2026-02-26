@@ -21,18 +21,32 @@ pub(crate) struct PreparedTools {
     pub qualification_fallback_note: Option<String>,
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct PrepareToolsInput<'a, P: ModelProvider> {
+    pub provider: &'a P,
+    pub provider_kind: ProviderKind,
+    pub base_url: &'a str,
+    pub worker_model: &'a str,
+    pub args: &'a RunArgs,
+    pub state_dir: &'a std::path::Path,
+    pub mcp_config_path: &'a std::path::Path,
+    pub mcp_registry: Option<&'a Arc<McpRegistry>>,
+    pub policy_for_exposure: Option<&'a Policy>,
+}
+
 pub(crate) async fn prepare_tools_and_qualification<P: ModelProvider>(
-    provider: &P,
-    provider_kind: ProviderKind,
-    base_url: &str,
-    worker_model: &str,
-    args: &RunArgs,
-    state_dir: &std::path::Path,
-    mcp_config_path: &std::path::Path,
-    mcp_registry: Option<&Arc<McpRegistry>>,
-    policy_for_exposure: Option<&Policy>,
+    input: PrepareToolsInput<'_, P>,
 ) -> anyhow::Result<PreparedTools> {
+    let PrepareToolsInput {
+        provider,
+        provider_kind,
+        base_url,
+        worker_model,
+        args,
+        state_dir,
+        mcp_config_path,
+        mcp_registry,
+        policy_for_exposure,
+    } = input;
     let mut all_tools = builtin_tools_enabled(
         args.enable_write_tools,
         args.allow_shell || args.allow_shell_in_workdir,

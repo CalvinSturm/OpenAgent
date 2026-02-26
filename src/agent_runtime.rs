@@ -219,17 +219,17 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
         ))
     };
 
-    let prep = run_prep::prepare_tools_and_qualification(
-        &provider,
+    let prep = run_prep::prepare_tools_and_qualification(run_prep::PrepareToolsInput {
+        provider: &provider,
         provider_kind,
         base_url,
-        &worker_model,
+        worker_model: &worker_model,
         args,
-        &paths.state_dir,
-        &mcp_config_path,
-        mcp_registry.as_ref(),
-        gate_build.policy_for_exposure.as_ref(),
-    )
+        state_dir: &paths.state_dir,
+        mcp_config_path: &mcp_config_path,
+        mcp_registry: mcp_registry.as_ref(),
+        policy_for_exposure: gate_build.policy_for_exposure.as_ref(),
+    })
     .await?;
     let all_tools = prep.all_tools;
     let mcp_tool_snapshot = prep.mcp_tool_snapshot;
@@ -439,29 +439,34 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                         step_result_json: None,
                         step_result_error: None,
                     });
-                    let cli_config = runtime_paths::build_run_cli_config(
-                        provider_kind,
-                        base_url,
-                        &worker_model,
-                        args,
-                        &resolved_settings,
-                        &hooks_config_path,
-                        &mcp_config_path,
-                        tool_catalog.clone(),
-                        mcp_tool_snapshot.clone(),
-                        mcp_tool_catalog_hash_hex.clone(),
-                        policy_version,
-                        includes_resolved.clone(),
-                        mcp_allowlist.clone(),
-                        args.mode,
-                        Some(planner_model.clone()),
-                        Some(worker_model.clone()),
-                        Some(args.planner_max_steps),
-                        Some(format!("{:?}", args.planner_output).to_lowercase()),
-                        Some(planner_strict_effective),
-                        Some(format!("{:?}", effective_plan_tool_enforcement).to_lowercase()),
-                        &instruction_resolution,
-                    );
+                    let cli_config =
+                        runtime_paths::build_run_cli_config(runtime_paths::RunCliConfigInput {
+                            provider_kind,
+                            base_url,
+                            model: &worker_model,
+                            args,
+                            resolved_settings: &resolved_settings,
+                            hooks_config_path: &hooks_config_path,
+                            mcp_config_path: &mcp_config_path,
+                            tool_catalog: tool_catalog.clone(),
+                            mcp_tool_snapshot: mcp_tool_snapshot.clone(),
+                            mcp_tool_catalog_hash_hex: mcp_tool_catalog_hash_hex.clone(),
+                            policy_version,
+                            includes_resolved: includes_resolved.clone(),
+                            mcp_allowlist: mcp_allowlist.clone(),
+                            mode: args.mode,
+                            planner_model: Some(planner_model.clone()),
+                            worker_model: Some(worker_model.clone()),
+                            planner_max_steps: Some(args.planner_max_steps),
+                            planner_output: Some(
+                                format!("{:?}", args.planner_output).to_lowercase(),
+                            ),
+                            planner_strict: Some(planner_strict_effective),
+                            enforce_plan_tools: Some(
+                                format!("{:?}", effective_plan_tool_enforcement).to_lowercase(),
+                            ),
+                            instructions: &instruction_resolution,
+                        });
                     let config_fingerprint = runtime_paths::build_config_fingerprint(
                         &cli_config,
                         args,
@@ -621,29 +626,32 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                     token_usage: None,
                     taint: None,
                 };
-                let cli_config = runtime_paths::build_run_cli_config(
-                    provider_kind,
-                    base_url,
-                    &worker_model,
-                    args,
-                    &resolved_settings,
-                    &hooks_config_path,
-                    &mcp_config_path,
-                    tool_catalog.clone(),
-                    mcp_tool_snapshot.clone(),
-                    mcp_tool_catalog_hash_hex.clone(),
-                    policy_version,
-                    includes_resolved.clone(),
-                    mcp_allowlist.clone(),
-                    args.mode,
-                    Some(planner_model.clone()),
-                    Some(worker_model.clone()),
-                    Some(args.planner_max_steps),
-                    Some(format!("{:?}", args.planner_output).to_lowercase()),
-                    Some(planner_strict_effective),
-                    Some(format!("{:?}", effective_plan_tool_enforcement).to_lowercase()),
-                    &instruction_resolution,
-                );
+                let cli_config =
+                    runtime_paths::build_run_cli_config(runtime_paths::RunCliConfigInput {
+                        provider_kind,
+                        base_url,
+                        model: &worker_model,
+                        args,
+                        resolved_settings: &resolved_settings,
+                        hooks_config_path: &hooks_config_path,
+                        mcp_config_path: &mcp_config_path,
+                        tool_catalog: tool_catalog.clone(),
+                        mcp_tool_snapshot: mcp_tool_snapshot.clone(),
+                        mcp_tool_catalog_hash_hex: mcp_tool_catalog_hash_hex.clone(),
+                        policy_version,
+                        includes_resolved: includes_resolved.clone(),
+                        mcp_allowlist: mcp_allowlist.clone(),
+                        mode: args.mode,
+                        planner_model: Some(planner_model.clone()),
+                        worker_model: Some(worker_model.clone()),
+                        planner_max_steps: Some(args.planner_max_steps),
+                        planner_output: Some(format!("{:?}", args.planner_output).to_lowercase()),
+                        planner_strict: Some(planner_strict_effective),
+                        enforce_plan_tools: Some(
+                            format!("{:?}", effective_plan_tool_enforcement).to_lowercase(),
+                        ),
+                        instructions: &instruction_resolution,
+                    });
                 let config_fingerprint = runtime_paths::build_config_fingerprint(
                     &cli_config,
                     args,
@@ -1081,29 +1089,29 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
             step_result_error: None,
         });
     }
-    let cli_config = runtime_paths::build_run_cli_config(
+    let cli_config = runtime_paths::build_run_cli_config(runtime_paths::RunCliConfigInput {
         provider_kind,
         base_url,
-        &worker_model,
+        model: &worker_model,
         args,
-        &resolved_settings,
-        &hooks_config_path,
-        &mcp_config_path,
-        tool_catalog.clone(),
-        mcp_tool_snapshot.clone(),
-        mcp_tool_catalog_hash_hex.clone(),
+        resolved_settings: &resolved_settings,
+        hooks_config_path: &hooks_config_path,
+        mcp_config_path: &mcp_config_path,
+        tool_catalog: tool_catalog.clone(),
+        mcp_tool_snapshot: mcp_tool_snapshot.clone(),
+        mcp_tool_catalog_hash_hex: mcp_tool_catalog_hash_hex.clone(),
         policy_version,
-        includes_resolved.clone(),
-        mcp_allowlist.clone(),
-        args.mode,
-        Some(planner_model.clone()),
-        Some(worker_model.clone()),
-        Some(args.planner_max_steps),
-        Some(format!("{:?}", args.planner_output).to_lowercase()),
-        Some(planner_strict_effective),
-        Some(format!("{:?}", effective_plan_tool_enforcement).to_lowercase()),
-        &instruction_resolution,
-    );
+        includes_resolved: includes_resolved.clone(),
+        mcp_allowlist: mcp_allowlist.clone(),
+        mode: args.mode,
+        planner_model: Some(planner_model.clone()),
+        worker_model: Some(worker_model.clone()),
+        planner_max_steps: Some(args.planner_max_steps),
+        planner_output: Some(format!("{:?}", args.planner_output).to_lowercase()),
+        planner_strict: Some(planner_strict_effective),
+        enforce_plan_tools: Some(format!("{:?}", effective_plan_tool_enforcement).to_lowercase()),
+        instructions: &instruction_resolution,
+    });
     let config_fingerprint =
         runtime_paths::build_config_fingerprint(&cli_config, args, &worker_model, paths);
     let config_hash_hex = config_hash_hex(&config_fingerprint)?;
