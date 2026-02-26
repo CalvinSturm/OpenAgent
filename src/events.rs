@@ -49,6 +49,7 @@ pub enum EventKind {
     QueueSubmitted,
     QueueDelivered,
     QueueInterrupt,
+    LearningCaptured,
     Error,
 }
 
@@ -256,5 +257,17 @@ mod tests {
             let s = serde_json::to_string(&ev).expect("serialize");
             assert!(s.contains("\"queue_"));
         }
+    }
+
+    #[test]
+    fn learning_captured_kind_serializes() {
+        let ev = Event::new(
+            "learn".to_string(),
+            0,
+            EventKind::LearningCaptured,
+            serde_json::json!({"learning_id":"01H..."}),
+        );
+        let s = serde_json::to_string(&ev).expect("serialize");
+        assert!(s.contains("\"learning_captured\""));
     }
 }

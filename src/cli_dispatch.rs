@@ -333,7 +333,7 @@ pub(crate) async fn run_cli() -> anyhow::Result<()> {
         }
 
         Some(Commands::Learn(args)) => {
-            crate::cli_dispatch_learn::handle_learn_command(args).await?;
+            crate::cli_dispatch_learn::handle_learn_command(args, &paths).await?;
             return Ok(());
         }
 
