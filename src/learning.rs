@@ -30,6 +30,12 @@ const MAX_SCAN_BUNDLE_BYTES: usize = 64 * 1024;
 const REDACTED_SECRET_TOKEN: &str = "[REDACTED_SECRET]";
 #[allow(dead_code)]
 pub const LEARN_PROMOTE_SENSITIVE_REQUIRES_FORCE: &str = "LEARN_PROMOTE_SENSITIVE_REQUIRES_FORCE";
+#[allow(dead_code)]
+pub const LEARN_PROMOTE_TARGET_EXISTS_REQUIRES_FORCE: &str =
+    "LEARN_PROMOTE_TARGET_EXISTS_REQUIRES_FORCE";
+#[allow(dead_code)]
+pub const LEARN_PROMOTE_INVALID_SLUG: &str = "LEARN_PROMOTE_INVALID_SLUG";
+pub const LEARNING_PROMOTED_SCHEMA_V1: &str = "openagent.learning_promoted.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearningEntryV1 {
@@ -124,6 +130,8 @@ pub struct FieldTruncationV1 {
 #[allow(dead_code)]
 pub enum LearningPromoteError {
     SensitiveRequiresForce,
+    TargetExistsRequiresForce,
+    InvalidSlug,
 }
 
 impl LearningPromoteError {
@@ -131,6 +139,10 @@ impl LearningPromoteError {
     pub fn code(&self) -> &'static str {
         match self {
             LearningPromoteError::SensitiveRequiresForce => LEARN_PROMOTE_SENSITIVE_REQUIRES_FORCE,
+            LearningPromoteError::TargetExistsRequiresForce => {
+                LEARN_PROMOTE_TARGET_EXISTS_REQUIRES_FORCE
+            }
+            LearningPromoteError::InvalidSlug => LEARN_PROMOTE_INVALID_SLUG,
         }
     }
 }
@@ -141,6 +153,14 @@ impl std::fmt::Display for LearningPromoteError {
             LearningPromoteError::SensitiveRequiresForce => write!(
                 f,
                 "Sensitive content suspected (contains_secrets_suspected). Re-run with --force to promote."
+            ),
+            LearningPromoteError::TargetExistsRequiresForce => write!(
+                f,
+                "Promotion target already exists. Re-run with --force to overwrite."
+            ),
+            LearningPromoteError::InvalidSlug => write!(
+                f,
+                "Invalid slug. Use lowercase letters, numbers, '_' or '-', no path separators."
             ),
         }
     }
@@ -179,6 +199,16 @@ pub struct CaptureLearningInput {
 #[derive(Debug, Clone)]
 pub struct CaptureLearningOutput {
     pub entry: LearningEntryV1,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromoteToCheckResult {
+    pub learning_id: String,
+    pub slug: String,
+    pub target_path: PathBuf,
+    pub target_file_sha256_hex: String,
+    pub forced: bool,
+    pub entry_hash_hex: String,
 }
 
 pub fn capture_learning_entry(
@@ -273,6 +303,195 @@ pub fn emit_learning_captured_event(
     Ok(())
 }
 
+pub fn promote_learning_to_check(
+    state_dir: &Path,
+    id: &str,
+    slug: &str,
+    force: bool,
+) -> anyhow::Result<PromoteToCheckResult> {
+    validate_promote_slug(slug)?;
+    let mut entry = load_learning_entry(state_dir, id)?;
+    require_force_for_sensitive_promotion(&entry, force)?;
+
+    let target_path = learning_check_path(state_dir, slug);
+    if target_path.exists() && !force {
+        return Err(LearningPromoteError::TargetExistsRequiresForce.into());
+    }
+
+    let markdown = render_learning_to_check_markdown(&entry, slug)?;
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create check dir {}", parent.display()))?;
+    }
+    fs::write(&target_path, markdown.as_bytes())
+        .with_context(|| format!("failed to write check file {}", target_path.display()))?;
+    let target_file_sha256_hex = compute_file_sha256_hex(&target_path)?;
+
+    update_learning_status(state_dir, &mut entry, LearningStatusV1::Promoted)?;
+    emit_learning_promoted_event_for_check(
+        state_dir,
+        &entry,
+        slug,
+        &target_path,
+        force,
+        &target_file_sha256_hex,
+    )?;
+
+    Ok(PromoteToCheckResult {
+        learning_id: entry.id.clone(),
+        slug: slug.to_string(),
+        target_path,
+        target_file_sha256_hex,
+        forced: force,
+        entry_hash_hex: entry.entry_hash_hex.clone(),
+    })
+}
+
+pub fn render_promote_to_check_confirmation(out: &PromoteToCheckResult) -> String {
+    format!(
+        "Promoted learning {} -> check {} (path={}, hash={}, entry_hash={}, forced={})",
+        out.learning_id,
+        out.slug,
+        out.target_path.display(),
+        out.target_file_sha256_hex,
+        out.entry_hash_hex,
+        out.forced
+    )
+}
+
+pub fn render_learning_to_check_markdown(
+    entry: &LearningEntryV1,
+    slug: &str,
+) -> anyhow::Result<String> {
+    let fm = build_generated_check_from_learning(entry, slug);
+    crate::checks::schema::validate_frontmatter(&fm)?;
+
+    let name = serde_json::to_string(&fm.name)?;
+    let description = serde_json::to_string(fm.description.as_deref().unwrap_or(""))?;
+    let pass_value = serde_json::to_string(&fm.pass_criteria.value)?;
+    let pass_kind = match fm.pass_criteria.kind {
+        crate::checks::schema::PassCriteriaType::Contains => "output_contains",
+        crate::checks::schema::PassCriteriaType::NotContains => "output_not_contains",
+        crate::checks::schema::PassCriteriaType::Equals => "output_equals",
+    };
+
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str(&format!("schema_version: {}\n", fm.schema_version));
+    out.push_str(&format!("name: {name}\n"));
+    out.push_str(&format!("description: {description}\n"));
+    out.push_str(&format!("required: {}\n", fm.required));
+    out.push_str("allowed_tools: []\n");
+    out.push_str("pass_criteria:\n");
+    out.push_str(&format!("  type: {pass_kind}\n"));
+    out.push_str(&format!("  value: {pass_value}\n"));
+    out.push_str("---\n");
+    out.push_str(&render_generated_check_body(entry, slug));
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+fn build_generated_check_from_learning(
+    entry: &LearningEntryV1,
+    slug: &str,
+) -> crate::checks::schema::CheckFrontmatter {
+    let summary_one_line = entry
+        .summary
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let description = if summary_one_line.is_empty() {
+        format!("Learned check candidate from learning {}", entry.id)
+    } else {
+        truncate_utf8_chars(&summary_one_line, 240)
+    };
+    crate::checks::schema::CheckFrontmatter {
+        schema_version: 1,
+        name: format!("learn_{slug}"),
+        description: Some(description),
+        required: false,
+        allowed_tools: Some(vec![]),
+        required_flags: Vec::new(),
+        pass_criteria: crate::checks::schema::PassCriteria {
+            kind: crate::checks::schema::PassCriteriaType::Contains,
+            value: "TODO".to_string(),
+        },
+        budget: None,
+    }
+}
+
+fn render_generated_check_body(entry: &LearningEntryV1, slug: &str) -> String {
+    if let Some(text) = &entry.proposed_memory.check_text {
+        let normalized = normalize_newlines(text);
+        if !normalized.trim().is_empty() {
+            return normalized;
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("# Learned Check Draft\n\n");
+    out.push_str(&format!("Learning ID: {}\n", entry.id));
+    out.push_str(&format!("Slug: {slug}\n\n"));
+    out.push_str("Summary:\n");
+    out.push_str(&normalize_newlines(&entry.summary));
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("\nTODO: Replace this placeholder with concrete check instructions and pass criteria evidence expectations.\n");
+    out
+}
+
+fn update_learning_status(
+    state_dir: &Path,
+    entry: &mut LearningEntryV1,
+    status: LearningStatusV1,
+) -> anyhow::Result<()> {
+    entry.status = status;
+    write_learning_entry(state_dir, entry)
+}
+
+fn write_learning_entry(state_dir: &Path, entry: &LearningEntryV1) -> anyhow::Result<()> {
+    let path = learning_entry_path(state_dir, &entry.id);
+    store::write_json_atomic(&path, entry)
+        .with_context(|| format!("failed to write learning entry {}", path.display()))
+}
+
+fn compute_file_sha256_hex(path: &Path) -> anyhow::Result<String> {
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read file {}", path.display()))?;
+    Ok(store::sha256_hex(&bytes))
+}
+
+fn emit_learning_promoted_event_for_check(
+    state_dir: &Path,
+    entry: &LearningEntryV1,
+    slug: &str,
+    target_path: &Path,
+    forced: bool,
+    target_file_sha256_hex: &str,
+) -> anyhow::Result<()> {
+    let mut sink = JsonlFileSink::new(&learning_events_path(state_dir))?;
+    let data = serde_json::json!({
+        "schema": LEARNING_PROMOTED_SCHEMA_V1,
+        "learning_id": entry.id,
+        "entry_hash_hex": entry.entry_hash_hex,
+        "target": "check",
+        "target_path": stable_learning_target_path(state_dir, target_path),
+        "slug": slug,
+        "forced": forced,
+        "target_file_sha256_hex": target_file_sha256_hex,
+    });
+    sink.emit(Event::new(
+        format!("learn:{}", entry.id),
+        0,
+        EventKind::LearningPromoted,
+        data,
+    ))?;
+    Ok(())
+}
+
 pub fn learning_entries_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("learn").join("entries")
 }
@@ -283,6 +502,10 @@ pub fn learning_entry_path(state_dir: &Path, id: &str) -> PathBuf {
 
 pub fn learning_events_path(state_dir: &Path) -> PathBuf {
     state_dir.join("learn").join("events.jsonl")
+}
+
+fn learning_check_path(state_dir: &Path, slug: &str) -> PathBuf {
+    state_dir.join("checks").join(format!("{slug}.md"))
 }
 
 pub fn load_learning_entry(state_dir: &Path, id: &str) -> anyhow::Result<LearningEntryV1> {
@@ -800,6 +1023,26 @@ fn detect_contains_paths(text: &str) -> bool {
     unix_path_pattern().is_match(text) || text.contains("~/")
 }
 
+fn validate_promote_slug(slug: &str) -> anyhow::Result<()> {
+    if slug.is_empty()
+        || slug.contains("..")
+        || slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains(':')
+    {
+        return Err(LearningPromoteError::InvalidSlug.into());
+    }
+    if !promote_slug_pattern().is_match(slug) {
+        return Err(LearningPromoteError::InvalidSlug.into());
+    }
+    Ok(())
+}
+
+fn promote_slug_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[a-z0-9][a-z0-9_-]{0,63}$").expect("promote slug regex"))
+}
+
 fn collect_secret_matches(input: &str) -> Vec<MatchRange> {
     let mut out = Vec::new();
     for re in secret_detection_patterns() {
@@ -847,6 +1090,27 @@ pub fn require_force_for_sensitive_promotion(
         return Err(LearningPromoteError::SensitiveRequiresForce.into());
     }
     Ok(())
+}
+
+fn stable_forward_slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn stable_learning_target_path(state_dir: &Path, target_path: &Path) -> String {
+    let base = state_dir.parent().unwrap_or(state_dir);
+    let rel = target_path.strip_prefix(base).unwrap_or(target_path);
+    stable_forward_slash_path(rel)
+}
+
+fn normalize_newlines(input: &str) -> String {
+    input.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn truncate_utf8_chars(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    input.chars().take(max_chars).collect()
 }
 
 fn truncate_utf8_bytes(input: String, max_bytes: usize) -> String {
@@ -1153,5 +1417,241 @@ mod tests {
             &ProposedMemoryV1::default(),
         );
         assert!(bundle.len() <= MAX_SCAN_BUNDLE_BYTES + "\n...[truncated]".len());
+    }
+
+    fn sample_check_candidate_learning_entry() -> LearningEntryV1 {
+        let mut e = sample_entry();
+        e.id = "01JPR3ENTRY".to_string();
+        e.summary = "Ensure output includes success marker".to_string();
+        e.proposed_memory.check_text = Some("Check body line 1\nCheck body line 2\n".to_string());
+        e
+    }
+
+    fn read_learning_events_lines(state_dir: &Path) -> Vec<String> {
+        let path = learning_events_path(state_dir);
+        if !path.exists() {
+            return Vec::new();
+        }
+        fs::read_to_string(path)
+            .expect("read events")
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn collect_state_files(state_dir: &Path) -> BTreeSet<String> {
+        fn walk(dir: &Path, root: &Path, out: &mut BTreeSet<String>) {
+            if let Ok(rd) = fs::read_dir(dir) {
+                for ent in rd.flatten() {
+                    let path = ent.path();
+                    if path.is_dir() {
+                        walk(&path, root, out);
+                    } else if path.is_file() {
+                        let rel = path
+                            .strip_prefix(root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        out.insert(rel);
+                    }
+                }
+            }
+        }
+        let mut out = BTreeSet::new();
+        if state_dir.exists() {
+            walk(state_dir, state_dir, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn render_learning_to_check_markdown_is_deterministic_and_canonical() {
+        let e = sample_check_candidate_learning_entry();
+        let a = render_learning_to_check_markdown(&e, "my_check").expect("render a");
+        let b = render_learning_to_check_markdown(&e, "my_check").expect("render b");
+        assert_eq!(a, b);
+        assert!(a.contains("\nallowed_tools: []\n"));
+        assert!(a.ends_with('\n'));
+        assert!(!a.contains("\r\n"));
+        let i_schema = a.find("schema_version: 1\n").expect("schema");
+        let i_name = a.find("\nname: ").expect("name");
+        let i_desc = a.find("\ndescription: ").expect("desc");
+        let i_required = a.find("\nrequired: false\n").expect("required");
+        let i_allowed = a.find("\nallowed_tools: []\n").expect("allowed");
+        let i_pass = a.find("\npass_criteria:\n").expect("pass");
+        assert!(i_schema < i_name);
+        assert!(i_name < i_desc);
+        assert!(i_desc < i_required);
+        assert!(i_required < i_allowed);
+        assert!(i_allowed < i_pass);
+        assert!(!a.contains("\nrequired_flags:"));
+        assert!(!a.contains("\nbudget:"));
+    }
+
+    #[test]
+    fn promote_to_check_creates_target_file_and_updates_status() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+
+        let out = promote_learning_to_check(&state_dir, &e.id, "my_check", false).expect("promote");
+        assert_eq!(out.slug, "my_check");
+        assert!(out.target_path.exists());
+
+        let updated = load_learning_entry(&state_dir, &e.id).expect("load updated");
+        assert_eq!(updated.status, LearningStatusV1::Promoted);
+    }
+
+    #[test]
+    fn promote_to_check_enforces_sensitive_requires_force() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.sensitivity_flags.contains_secrets_suspected = true;
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+
+        let err = promote_learning_to_check(&state_dir, &e.id, "secure_check", false)
+            .expect_err("must fail");
+        let typed = err
+            .downcast_ref::<LearningPromoteError>()
+            .expect("typed promote error");
+        assert_eq!(typed.code(), LEARN_PROMOTE_SENSITIVE_REQUIRES_FORCE);
+
+        let ok = promote_learning_to_check(&state_dir, &e.id, "secure_check", true);
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn promote_to_check_enforces_overwrite_requires_force() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+        let target = learning_check_path(&state_dir, "dup");
+        fs::create_dir_all(target.parent().expect("parent")).expect("mkdirs");
+        fs::write(&target, "existing").expect("seed target");
+
+        let err =
+            promote_learning_to_check(&state_dir, &e.id, "dup", false).expect_err("must fail");
+        let typed = err
+            .downcast_ref::<LearningPromoteError>()
+            .expect("typed promote error");
+        assert_eq!(typed.code(), LEARN_PROMOTE_TARGET_EXISTS_REQUIRES_FORCE);
+
+        promote_learning_to_check(&state_dir, &e.id, "dup", true).expect("overwrite promote");
+        let body = fs::read_to_string(&target).expect("read target");
+        assert!(body.contains("allowed_tools: []"));
+    }
+
+    #[test]
+    fn promote_to_check_rejects_invalid_slug_with_stable_code() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+
+        let err = promote_learning_to_check(&state_dir, &e.id, "../bad", false)
+            .expect_err("invalid slug");
+        let typed = err
+            .downcast_ref::<LearningPromoteError>()
+            .expect("typed promote error");
+        assert_eq!(typed.code(), LEARN_PROMOTE_INVALID_SLUG);
+    }
+
+    #[test]
+    fn promote_to_check_emits_learning_promoted_event_with_target_file_hash() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+
+        let out =
+            promote_learning_to_check(&state_dir, &e.id, "event_check", false).expect("promote");
+        let lines = read_learning_events_lines(&state_dir);
+        let last = lines.last().expect("event line");
+        let v: serde_json::Value = serde_json::from_str(last).expect("parse event");
+        assert_eq!(v["kind"], "learning_promoted");
+        assert_eq!(v["data"]["schema"], LEARNING_PROMOTED_SCHEMA_V1);
+        assert_eq!(v["data"]["learning_id"], e.id);
+        assert_eq!(v["data"]["target"], "check");
+        assert_eq!(v["data"]["slug"], "event_check");
+        assert_eq!(
+            v["data"]["target_file_sha256_hex"],
+            out.target_file_sha256_hex
+        );
+    }
+
+    #[test]
+    fn promote_to_check_failed_check_write_is_atomic_no_status_no_event() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+
+        let checks_path = state_dir.join("checks");
+        if let Some(parent) = checks_path.parent() {
+            fs::create_dir_all(parent).expect("parent");
+        }
+        fs::write(&checks_path, "not a dir").expect("poison checks path");
+
+        let err = promote_learning_to_check(&state_dir, &e.id, "will_fail", false)
+            .expect_err("write should fail");
+        assert!(err.to_string().contains("failed to create check dir"));
+
+        let updated = load_learning_entry(&state_dir, &e.id).expect("reload");
+        assert_eq!(updated.status, LearningStatusV1::Captured);
+        assert!(read_learning_events_lines(&state_dir).is_empty());
+    }
+
+    #[test]
+    fn promote_to_check_path_safety_only_expected_files_modified() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+
+        let before = collect_state_files(&state_dir);
+        assert_eq!(
+            before,
+            BTreeSet::from([format!("learn/entries/{}.json", e.id)])
+        );
+
+        let _ = promote_learning_to_check(&state_dir, &e.id, "safe_paths", false).expect("promote");
+        let after = collect_state_files(&state_dir);
+        let expected = BTreeSet::from([
+            format!("learn/entries/{}.json", e.id),
+            "learn/events.jsonl".to_string(),
+            "checks/safe_paths.md".to_string(),
+        ]);
+        assert_eq!(after, expected);
+    }
+
+    #[test]
+    fn promote_to_check_generated_file_loads_as_schema_valid_check() {
+        let tmp = tempdir().expect("tempdir");
+        let state_dir = tmp.path().join(".localagent");
+        let mut e = sample_check_candidate_learning_entry();
+        e.entry_hash_hex = compute_entry_hash_hex(&e).expect("hash");
+        write_entry(&state_dir, e.clone());
+
+        promote_learning_to_check(&state_dir, &e.id, "schema_valid", false).expect("promote");
+        let loaded = crate::checks::loader::load_checks(tmp.path(), None);
+        assert!(loaded.errors.is_empty(), "errors: {:?}", loaded.errors);
+        let check = loaded
+            .checks
+            .iter()
+            .find(|c| c.path == ".localagent/checks/schema_valid.md")
+            .expect("generated check");
+        assert_eq!(check.frontmatter.schema_version, 1);
+        assert_eq!(check.frontmatter.allowed_tools, Some(vec![]));
+        assert_eq!(check.frontmatter.required_flags, Vec::<String>::new());
     }
 }

@@ -479,6 +479,11 @@ pub(crate) enum LearnEvidenceKindArg {
     ExitReason,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum LearnPromoteTargetArg {
+    Check,
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum LearnSubcommand {
     Capture {
@@ -539,6 +544,18 @@ pub(crate) enum LearnSubcommand {
 
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         show_proposed: bool,
+    },
+    Promote {
+        id: String,
+
+        #[arg(long, value_enum)]
+        to: LearnPromoteTargetArg,
+
+        #[arg(long)]
+        slug: String,
+
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 

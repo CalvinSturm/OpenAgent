@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context};
 
-use crate::cli_args::{LearnArgs, LearnCategoryArg, LearnStatusArg, LearnSubcommand};
+use crate::cli_args::{
+    LearnArgs, LearnCategoryArg, LearnPromoteTargetArg, LearnStatusArg, LearnSubcommand,
+};
 use crate::learning;
 use crate::store::StatePaths;
 
@@ -139,5 +141,20 @@ pub(crate) async fn handle_learn_command(
                 )),
             }
         }
+        LearnSubcommand::Promote {
+            id,
+            to,
+            slug,
+            force,
+        } => match to {
+            LearnPromoteTargetArg::Check => {
+                let out = learning::promote_learning_to_check(&paths.state_dir, id, slug, *force)
+                    .with_context(|| {
+                    format!("failed to promote learning entry {id} to check")
+                })?;
+                println!("{}", learning::render_promote_to_check_confirmation(&out));
+                Ok(())
+            }
+        },
     }
 }
