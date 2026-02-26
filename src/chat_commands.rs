@@ -20,6 +20,11 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "enable summary compaction mode",
     ),
     ("/dismiss", "dismiss timeout notification"),
+    ("/tool docs", "show usage for tool docs"),
+    (
+        "/tool docs mcp.stub.echo",
+        "show MCP tool docs from local registry snapshot",
+    ),
     ("/clear", "clear transcript (and session if enabled)"),
     ("/exit", "exit chat"),
     ("/hide tools", "hide tools pane"),
@@ -120,6 +125,10 @@ pub(crate) fn keybinds_overlay_text() -> Option<String> {
         ),
         ("/params <key> <value>", "adjust live agent tuning settings"),
         ("/dismiss", "dismiss timeout notification"),
+        (
+            "/tool docs <name>",
+            "show tool docs from local registry snapshot",
+        ),
         ("/...", "slash commands dropdown"),
         ("?", "show this keybinds panel"),
     ];

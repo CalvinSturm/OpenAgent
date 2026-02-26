@@ -1,14 +1,18 @@
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
 
 use crate::chat_runtime;
 use crate::chat_tui_runtime;
+use crate::mcp::registry::McpRegistry;
 use crate::provider_runtime;
 use crate::providers::mock::MockProvider;
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::openai_compat::OpenAiCompatProvider;
 use crate::runtime_config;
+use crate::runtime_paths;
 use crate::session::SessionStore;
 use crate::store;
 use crate::{run_agent, AgentExitReason, ChatArgs, ProviderKind, RunArgs};
@@ -36,6 +40,7 @@ pub(crate) async fn run_chat_repl(
     let mut pending_timeout_input = false;
     let mut pending_params_input = false;
     let mut timeout_notice_active = false;
+    let mut shared_chat_mcp_registry: Option<Arc<McpRegistry>> = None;
 
     println!(
         "LocalAgent chat started (provider={} model={} tui={}).",
@@ -44,7 +49,7 @@ pub(crate) async fn run_chat_repl(
         chat.tui
     );
     println!(
-        "Commands: /help, /mode <safe|coding|web|custom>, /timeout [seconds|+N|-N|off], /params [key value], /dismiss, /exit, /clear"
+        "Commands: /help, /mode <safe|coding|web|custom>, /timeout [seconds|+N|-N|off], /params [key value], /tool docs <name>, /dismiss, /exit, /clear"
     );
 
     loop {
@@ -107,6 +112,7 @@ pub(crate) async fn run_chat_repl(
                         "/params  show current tuning params and wait for '<key> <value>' input"
                     );
                     println!("/params <key> <value>  set a tuning param");
+                    println!("/tool docs <name>  show tool docs from local MCP registry snapshot");
                     println!("/dismiss  dismiss timeout notification");
                     println!("/clear clear current session messages");
                     println!("/exit  quit chat");
@@ -137,6 +143,9 @@ pub(crate) async fn run_chat_repl(
                     } else {
                         println!("no active timeout notification");
                     }
+                }
+                "/tool docs" => {
+                    println!("usage: /tool docs <name> (example: /tool docs mcp.stub.echo)");
                 }
                 "/clear" => {
                     if active_run.no_session {
@@ -173,6 +182,39 @@ pub(crate) async fn run_chat_repl(
                     match runtime_config::apply_params_input(&mut active_run, value) {
                         Ok(msg) => println!("{msg}"),
                         Err(msg) => println!("{msg}"),
+                    }
+                }
+                _ if input.starts_with("/tool docs ") => {
+                    let tool_name = input["/tool docs ".len()..].trim();
+                    if tool_name.is_empty() {
+                        println!("usage: /tool docs <name> (example: /tool docs mcp.stub.echo)");
+                        continue;
+                    }
+                    if active_run.mcp.is_empty() {
+                        println!("MCP registry unavailable: no MCP servers enabled for this chat session");
+                        continue;
+                    }
+                    if shared_chat_mcp_registry.is_none() {
+                        let mcp_config_path =
+                            runtime_paths::resolved_mcp_config_path(&active_run, &paths.state_dir);
+                        match McpRegistry::from_config_path(
+                            &mcp_config_path,
+                            &active_run.mcp,
+                            Duration::from_secs(30),
+                        )
+                        .await
+                        {
+                            Ok(reg) => shared_chat_mcp_registry = Some(Arc::new(reg)),
+                            Err(e) => {
+                                println!("failed to initialize MCP session: {e}");
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(reg) = shared_chat_mcp_registry.as_ref() {
+                        println!("{}", reg.render_tool_docs_text(tool_name));
+                    } else {
+                        println!("MCP registry unavailable: failed to initialize");
                     }
                 }
                 _ => println!("unknown command: {input}"),

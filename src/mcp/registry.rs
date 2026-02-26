@@ -21,14 +21,12 @@ pub struct McpRegistry {
     clients: BTreeMap<String, McpClient>,
     tool_map: BTreeMap<String, (String, String)>,
     tool_schema_map: BTreeMap<String, Option<serde_json::Value>>,
-    #[allow(dead_code)]
     tool_doc_meta_map: BTreeMap<String, McpToolDocMeta>,
     tool_defs: Vec<ToolDef>,
     timeout: Duration,
     mcp_spool_dir: PathBuf,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct McpToolDocMeta {
     pub raw_description: Option<String>,
@@ -110,9 +108,54 @@ impl McpRegistry {
         self.tool_defs.clone()
     }
 
-    #[allow(dead_code)]
     pub fn tool_doc_meta(&self, namespaced_tool: &str) -> Option<&McpToolDocMeta> {
         self.tool_doc_meta_map.get(namespaced_tool)
+    }
+
+    pub fn render_tool_docs_text(&self, tool_name: &str) -> String {
+        let defs = self.tool_defs();
+        let mut names = defs.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        names.sort();
+        let Some(def) = defs.into_iter().find(|t| t.name == tool_name) else {
+            let suggestions = closest_tool_matches(&names, tool_name, 10);
+            if suggestions.is_empty() {
+                return format!("unknown tool: {tool_name}");
+            }
+            return format!(
+                "unknown tool: {tool_name}\nclosest_matches: {}",
+                suggestions.join(", ")
+            );
+        };
+        let params = serde_json::to_string_pretty(&def.parameters)
+            .unwrap_or_else(|e| format!("{{\"error\":\"schema serialize failed: {e}\"}}"));
+        let (source, server) = parse_mcp_tool_source(&def.name);
+        let raw_meta = self.tool_doc_meta(&def.name).cloned().unwrap_or_default();
+        let raw_preview = raw_meta
+            .raw_description
+            .unwrap_or_else(|| "no docs available".to_string());
+        let raw_hash = raw_meta
+            .raw_description_hash
+            .unwrap_or_else(|| "-".to_string());
+        let docs_hash = self
+            .tool_docs_hash_hex(&def.name)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "-".to_string());
+        let catalog_hash = self
+            .configured_tool_catalog_hash_hex()
+            .unwrap_or_else(|_| "-".to_string());
+        format!(
+            "tool_name: {tool}\nsource: {source}\nserver: {server}\ndocs_hash_v1: {docs_hash}\ncatalog_hash_v1: {catalog_hash}\nraw_description_hash: {raw_hash}\nraw_description_truncated: {raw_truncated}\nraw_description_preview:\n{raw_preview}\nparameters:\n{params}",
+            tool = def.name,
+            source = source,
+            server = server.unwrap_or("-"),
+            docs_hash = docs_hash,
+            catalog_hash = catalog_hash,
+            raw_hash = raw_hash,
+            raw_truncated = raw_meta.raw_description_truncated,
+            raw_preview = indent_block(&raw_preview, 2),
+            params = indent_block(&params, 2),
+        )
     }
 
     pub fn validate_namespaced_tool_args(
@@ -191,6 +234,24 @@ impl McpRegistry {
         }
         snapshot.sort_by(|a, b| a.name.cmp(&b.name));
         mcp_tool_docs_snapshot_hash_hex(&snapshot)
+    }
+
+    pub fn tool_docs_hash_hex(&self, namespaced_tool: &str) -> anyhow::Result<Option<String>> {
+        let Some(def) = self.tool_defs.iter().find(|t| t.name == namespaced_tool) else {
+            return Ok(None);
+        };
+        let preview = self
+            .tool_doc_meta_map
+            .get(namespaced_tool)
+            .and_then(|m| m.raw_description.as_deref())
+            .map(normalized_description_preview)
+            .unwrap_or_default();
+        let snapshot = [McpToolDocsSnapshotEntry {
+            name: def.name.clone(),
+            parameters: def.parameters.clone(),
+            description_preview: preview,
+        }];
+        Ok(Some(mcp_tool_docs_snapshot_hash_hex(&snapshot)?))
     }
 
     pub async fn call_namespaced_tool(
@@ -408,6 +469,39 @@ fn sanitize_filename_component(value: &str) -> String {
     } else {
         out
     }
+}
+
+fn parse_mcp_tool_source(tool_name: &str) -> (&'static str, Option<&str>) {
+    if let Some(rest) = tool_name.strip_prefix("mcp.") {
+        let server = rest.split('.').next();
+        ("mcp", server)
+    } else {
+        ("builtin", None)
+    }
+}
+
+fn closest_tool_matches(tool_names: &[String], query: &str, limit: usize) -> Vec<String> {
+    let q = query.to_ascii_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = tool_names
+        .iter()
+        .filter(|name| name.to_ascii_lowercase().contains(&q))
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.truncate(limit);
+    matches
+}
+
+fn indent_block(input: &str, spaces: usize) -> String {
+    let pad = " ".repeat(spaces);
+    input
+        .lines()
+        .map(|line| format!("{pad}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn default_config() -> McpConfigFile {
@@ -629,5 +723,100 @@ mod tests {
         let b = super::normalized_description_preview("Line1 Line2 Line3");
         assert_eq!(a, "Line1 Line2 Line3");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn render_tool_docs_text_includes_docs_hash_and_preview() {
+        let defs = vec![ToolDef {
+            name: "mcp.stub.echo".to_string(),
+            description: "MCP tool from stub. Use /tool docs mcp.stub.echo for details."
+                .to_string(),
+            parameters: json!({"type":"object","properties":{"msg":{"type":"string"}}}),
+            side_effects: SideEffects::Network,
+        }];
+        let mut docs = BTreeMap::new();
+        docs.insert(
+            "mcp.stub.echo".to_string(),
+            super::McpToolDocMeta {
+                raw_description: Some("Echo arguments".to_string()),
+                raw_description_hash: Some(crate::store::sha256_hex("Echo arguments".as_bytes())),
+                raw_description_truncated: false,
+            },
+        );
+        let reg = super::McpRegistry {
+            clients: BTreeMap::new(),
+            tool_map: BTreeMap::new(),
+            tool_schema_map: BTreeMap::new(),
+            tool_doc_meta_map: docs,
+            tool_defs: defs,
+            timeout: std::time::Duration::from_secs(1),
+            mcp_spool_dir: std::path::PathBuf::from("."),
+        };
+        let rendered = reg.render_tool_docs_text("mcp.stub.echo");
+        assert!(rendered.contains("tool_name: mcp.stub.echo"));
+        assert!(rendered.contains("docs_hash_v1: "));
+        assert!(rendered.contains("raw_description_preview:\n  Echo arguments"));
+        assert!(rendered.contains("parameters:\n  {"));
+    }
+
+    #[test]
+    fn render_tool_docs_text_unknown_tool_shows_sorted_capped_matches() {
+        let defs = vec![
+            ToolDef {
+                name: "mcp.alpha.echo".to_string(),
+                description: "x".to_string(),
+                parameters: json!({"type":"object"}),
+                side_effects: SideEffects::Network,
+            },
+            ToolDef {
+                name: "mcp.beta.echo".to_string(),
+                description: "x".to_string(),
+                parameters: json!({"type":"object"}),
+                side_effects: SideEffects::Network,
+            },
+            ToolDef {
+                name: "mcp.gamma.exec".to_string(),
+                description: "x".to_string(),
+                parameters: json!({"type":"object"}),
+                side_effects: SideEffects::Network,
+            },
+        ];
+        let reg = super::McpRegistry {
+            clients: BTreeMap::new(),
+            tool_map: BTreeMap::new(),
+            tool_schema_map: BTreeMap::new(),
+            tool_doc_meta_map: BTreeMap::new(),
+            tool_defs: defs,
+            timeout: std::time::Duration::from_secs(1),
+            mcp_spool_dir: std::path::PathBuf::from("."),
+        };
+        let rendered = reg.render_tool_docs_text("echo");
+        assert!(rendered.starts_with("unknown tool: echo"));
+        assert!(rendered.contains("closest_matches: mcp.alpha.echo, mcp.beta.echo"));
+        assert!(!rendered.contains("mcp.gamma.exec"));
+    }
+
+    #[test]
+    fn render_tool_docs_text_handles_missing_raw_docs() {
+        let defs = vec![ToolDef {
+            name: "mcp.stub.empty".to_string(),
+            description: "MCP tool from stub. Use /tool docs mcp.stub.empty for details."
+                .to_string(),
+            parameters: json!({"type":"object"}),
+            side_effects: SideEffects::Network,
+        }];
+        let reg = super::McpRegistry {
+            clients: BTreeMap::new(),
+            tool_map: BTreeMap::new(),
+            tool_schema_map: BTreeMap::new(),
+            tool_doc_meta_map: BTreeMap::new(),
+            tool_defs: defs,
+            timeout: std::time::Duration::from_secs(1),
+            mcp_spool_dir: std::path::PathBuf::from("."),
+        };
+        let rendered = reg.render_tool_docs_text("mcp.stub.empty");
+        assert!(rendered.contains("raw_description_hash: -"));
+        assert!(rendered.contains("raw_description_truncated: false"));
+        assert!(rendered.contains("raw_description_preview:\n  no docs available"));
     }
 }

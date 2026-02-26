@@ -506,7 +506,7 @@ pub(crate) async fn run_chat_tui(
                                     "/exit" => break,
                                     "/help" => {
                                         logs.push(
-                                            "commands: /help /mode <safe|coding|web|custom> /timeout [seconds|+N|-N|off] /params [key value] /dismiss /clear /exit /hide tools|approvals|logs /show tools|approvals|logs|all ; slash dropdown: type / then Up/Down + Enter ; panes: Ctrl+T/Ctrl+Y/Ctrl+G (Ctrl+1/2/3 aliases, terminal-dependent) ; scroll: PgUp/PgDn, Ctrl+U/Ctrl+D, mouse wheel ; approvals: Ctrl+J/K select, Ctrl+A approve, Ctrl+X deny, Ctrl+R refresh ; history: Up/Down ; Esc quits"
+                                            "commands: /help /mode <safe|coding|web|custom> /timeout [seconds|+N|-N|off] /params [key value] /tool docs <name> /dismiss /clear /exit /hide tools|approvals|logs /show tools|approvals|logs|all ; slash dropdown: type / then Up/Down + Enter ; panes: Ctrl+T/Ctrl+Y/Ctrl+G (Ctrl+1/2/3 aliases, terminal-dependent) ; scroll: PgUp/PgDn, Ctrl+U/Ctrl+D, mouse wheel ; approvals: Ctrl+J/K select, Ctrl+A approve, Ctrl+X deny, Ctrl+R refresh ; history: Up/Down ; Esc quits"
                                                 .to_string(),
                                         );
                                         show_logs = true;
@@ -548,6 +548,13 @@ pub(crate) async fn run_chat_tui(
                                         } else {
                                             logs.push("no active timeout notification".to_string());
                                         }
+                                        show_logs = true;
+                                    }
+                                    "/tool docs" => {
+                                        logs.push(
+                                            "usage: /tool docs <name> (example: /tool docs mcp.stub.echo)"
+                                                .to_string(),
+                                        );
                                         show_logs = true;
                                     }
                                     "/clear" => {
@@ -617,6 +624,59 @@ pub(crate) async fn run_chat_tui(
                                         match runtime_config::apply_params_input(&mut active_run, value) {
                                             Ok(msg) => logs.push(msg),
                                             Err(msg) => logs.push(msg),
+                                        }
+                                        show_logs = true;
+                                    }
+                                    _ if line.starts_with("/tool docs ") => {
+                                        let tool_name = line["/tool docs ".len()..].trim();
+                                        if tool_name.is_empty() {
+                                            logs.push(
+                                                "usage: /tool docs <name> (example: /tool docs mcp.stub.echo)"
+                                                    .to_string(),
+                                            );
+                                            show_logs = true;
+                                            continue;
+                                        }
+                                        if active_run.mcp.is_empty() {
+                                            logs.push(
+                                                "MCP registry unavailable: no MCP servers enabled for this chat session"
+                                                    .to_string(),
+                                            );
+                                            show_logs = true;
+                                            continue;
+                                        }
+                                        if shared_chat_mcp_registry.is_none() {
+                                            let mcp_config_path = runtime_paths::resolved_mcp_config_path(
+                                                &active_run,
+                                                &paths.state_dir,
+                                            );
+                                            match McpRegistry::from_config_path(
+                                                &mcp_config_path,
+                                                &active_run.mcp,
+                                                Duration::from_secs(30),
+                                            )
+                                            .await
+                                            {
+                                                Ok(reg) => {
+                                                    shared_chat_mcp_registry =
+                                                        Some(std::sync::Arc::new(reg));
+                                                }
+                                                Err(e) => {
+                                                    logs.push(format!(
+                                                        "failed to initialize MCP session: {e}"
+                                                    ));
+                                                    show_logs = true;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        if let Some(reg) = shared_chat_mcp_registry.as_ref() {
+                                            logs.push(reg.render_tool_docs_text(tool_name));
+                                        } else {
+                                            logs.push(
+                                                "MCP registry unavailable: failed to initialize"
+                                                    .to_string(),
+                                            );
                                         }
                                         show_logs = true;
                                     }
