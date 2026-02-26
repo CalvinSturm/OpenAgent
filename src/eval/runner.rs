@@ -197,22 +197,13 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
 
     for model in &config.models {
         for task in &tasks {
-            if task.optional {
-                continue;
-            }
-            let mcp_enabled = enabled_mcp.iter().any(|m| m == "playwright");
-            if let Some(reason) = missing_capability_reason(task, &config, mcp_enabled) {
-                let row = skipped_row(model, task, 0, &reason);
-                print_row(&row);
-                push_row(&mut results, row);
-                continue;
-            }
-            if let Some(reason) =
-                missing_required_tool_reason(task, config.enable_write_tools, &enabled_mcp)
-            {
-                let row = skipped_row(model, task, 0, &reason);
-                print_row(&row);
-                push_row(&mut results, row);
+            if handle_eval_skip_gates(EvalSkipGateInput {
+                config: &config,
+                enabled_mcp: &enabled_mcp,
+                model,
+                task,
+                results: &mut results,
+            }) {
                 continue;
             }
 
@@ -243,6 +234,38 @@ pub async fn run_eval(config: EvalConfig, cwd: &Path) -> anyhow::Result<PathBuf>
     finalize_and_write_eval_results(&config, &out_path, &mut results)?;
     println!("eval results written: {}", out_path.display());
     Ok(out_path)
+}
+
+struct EvalSkipGateInput<'a> {
+    config: &'a EvalConfig,
+    enabled_mcp: &'a [String],
+    model: &'a str,
+    task: &'a EvalTask,
+    results: &'a mut EvalResults,
+}
+
+fn handle_eval_skip_gates(input: EvalSkipGateInput<'_>) -> bool {
+    if input.task.optional {
+        return true;
+    }
+    let mcp_enabled = input.enabled_mcp.iter().any(|m| m == "playwright");
+    if let Some(reason) = missing_capability_reason(input.task, input.config, mcp_enabled) {
+        let row = skipped_row(input.model, input.task, 0, &reason);
+        print_row(&row);
+        push_row(input.results, row);
+        return true;
+    }
+    if let Some(reason) = missing_required_tool_reason(
+        input.task,
+        input.config.enable_write_tools,
+        input.enabled_mcp,
+    ) {
+        let row = skipped_row(input.model, input.task, 0, &reason);
+        print_row(&row);
+        push_row(input.results, row);
+        return true;
+    }
+    false
 }
 
 struct EvalSingleRunExecInput<'a> {
