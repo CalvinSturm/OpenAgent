@@ -121,73 +121,16 @@ impl UiState {
         }
         match ev.kind {
             EventKind::RunStart => {
-                self.model = ev
-                    .data
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if let Some(mode) = ev
-                    .data
-                    .get("enforce_plan_tools_effective")
-                    .and_then(|v| v.as_str())
-                {
-                    self.enforce_plan_tools_effective = mode.to_string();
-                }
-                self.net_status = "OK".to_string();
-                self.mcp_lifecycle = "IDLE".to_string();
-                self.mcp_pin_state = "-".to_string();
-                self.mcp_running_for_ms = 0;
-                self.mcp_stalled = false;
-                self.mcp_stall_notice_emitted = false;
-                self.cancel_lifecycle = "NONE".to_string();
+                self.apply_run_start_event(ev);
             }
             EventKind::RunEnd => {
-                let exit_reason = ev
-                    .data
-                    .get("exit_reason")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                self.exit_reason = exit_reason.clone();
-                if self.cancel_lifecycle == "REQUESTED"
-                    || exit_reason.as_deref() == Some("cancelled")
-                {
-                    self.cancel_lifecycle = "COMPLETE".to_string();
-                }
-                if exit_reason.as_deref() == Some("cancelled") {
-                    if self.tool_calls.iter().any(|t| {
-                        is_mcp_tool(&t.tool_name) && (t.status == "running" || t.status == "STALL")
-                    }) {
-                        self.mcp_lifecycle = "CANCELLED".to_string();
-                    }
-                    for row in &mut self.tool_calls {
-                        if is_mcp_tool(&row.tool_name)
-                            && (row.status == "running" || row.status == "STALL")
-                        {
-                            row.status = "CANCEL:user".to_string();
-                            row.reason_token = "user".to_string();
-                            row.running_since = None;
-                            row.running_for_ms = 0;
-                            row.ok = Some(false);
-                        }
-                    }
-                    self.mcp_running_for_ms = 0;
-                    self.mcp_stalled = false;
-                    self.mcp_stall_notice_emitted = false;
-                }
-                self.next_hint = "done".to_string();
+                self.apply_run_end_event(ev);
             }
             EventKind::ModelDelta => {
-                if let Some(delta) = ev.data.get("delta").and_then(|v| v.as_str()) {
-                    self.assistant_text.push_str(delta);
-                }
+                self.apply_model_delta_event(ev);
             }
             EventKind::ModelResponseEnd => {
-                if self.assistant_text.is_empty() {
-                    if let Some(content) = ev.data.get("content").and_then(|v| v.as_str()) {
-                        self.assistant_text.push_str(content);
-                    }
-                }
+                self.apply_model_response_end_event(ev);
             }
             EventKind::ToolCallDetected => {
                 self.apply_tool_call_detected_event(ev);
@@ -202,21 +145,10 @@ impl UiState {
                 self.apply_tool_exec_end_event(ev);
             }
             EventKind::PolicyLoaded => {
-                if let Some(hash) = ev.data.get("policy_hash_hex").and_then(|v| v.as_str()) {
-                    self.policy_hash = hash.to_string();
-                }
+                self.apply_policy_loaded_event(ev);
             }
             EventKind::PlannerStart | EventKind::WorkerStart => {
-                if let Some(mode) = ev
-                    .data
-                    .get("enforce_plan_tools_effective")
-                    .and_then(|v| v.as_str())
-                {
-                    self.enforce_plan_tools_effective = mode.to_string();
-                }
-                if let Some(step_id) = ev.data.get("plan_step_id").and_then(|v| v.as_str()) {
-                    self.current_step_id = step_id.to_string();
-                }
+                self.apply_plan_lifecycle_event(ev);
             }
             EventKind::ProviderError => {
                 self.apply_provider_error_event(ev);
@@ -280,6 +212,95 @@ impl UiState {
             .unwrap_or_default()
             .to_string();
         self.upsert_tool(id, name, side, "detected");
+    }
+
+    fn apply_run_start_event(&mut self, ev: &Event) {
+        self.model = ev
+            .data
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if let Some(mode) = ev
+            .data
+            .get("enforce_plan_tools_effective")
+            .and_then(|v| v.as_str())
+        {
+            self.enforce_plan_tools_effective = mode.to_string();
+        }
+        self.net_status = "OK".to_string();
+        self.mcp_lifecycle = "IDLE".to_string();
+        self.mcp_pin_state = "-".to_string();
+        self.mcp_running_for_ms = 0;
+        self.mcp_stalled = false;
+        self.mcp_stall_notice_emitted = false;
+        self.cancel_lifecycle = "NONE".to_string();
+    }
+
+    fn apply_run_end_event(&mut self, ev: &Event) {
+        let exit_reason = ev
+            .data
+            .get("exit_reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        self.exit_reason = exit_reason.clone();
+        if self.cancel_lifecycle == "REQUESTED" || exit_reason.as_deref() == Some("cancelled") {
+            self.cancel_lifecycle = "COMPLETE".to_string();
+        }
+        if exit_reason.as_deref() == Some("cancelled") {
+            if self.tool_calls.iter().any(|t| {
+                is_mcp_tool(&t.tool_name) && (t.status == "running" || t.status == "STALL")
+            }) {
+                self.mcp_lifecycle = "CANCELLED".to_string();
+            }
+            for row in &mut self.tool_calls {
+                if is_mcp_tool(&row.tool_name) && (row.status == "running" || row.status == "STALL")
+                {
+                    row.status = "CANCEL:user".to_string();
+                    row.reason_token = "user".to_string();
+                    row.running_since = None;
+                    row.running_for_ms = 0;
+                    row.ok = Some(false);
+                }
+            }
+            self.mcp_running_for_ms = 0;
+            self.mcp_stalled = false;
+            self.mcp_stall_notice_emitted = false;
+        }
+        self.next_hint = "done".to_string();
+    }
+
+    fn apply_model_delta_event(&mut self, ev: &Event) {
+        if let Some(delta) = ev.data.get("delta").and_then(|v| v.as_str()) {
+            self.assistant_text.push_str(delta);
+        }
+    }
+
+    fn apply_model_response_end_event(&mut self, ev: &Event) {
+        if self.assistant_text.is_empty() {
+            if let Some(content) = ev.data.get("content").and_then(|v| v.as_str()) {
+                self.assistant_text.push_str(content);
+            }
+        }
+    }
+
+    fn apply_policy_loaded_event(&mut self, ev: &Event) {
+        if let Some(hash) = ev.data.get("policy_hash_hex").and_then(|v| v.as_str()) {
+            self.policy_hash = hash.to_string();
+        }
+    }
+
+    fn apply_plan_lifecycle_event(&mut self, ev: &Event) {
+        if let Some(mode) = ev
+            .data
+            .get("enforce_plan_tools_effective")
+            .and_then(|v| v.as_str())
+        {
+            self.enforce_plan_tools_effective = mode.to_string();
+        }
+        if let Some(step_id) = ev.data.get("plan_step_id").and_then(|v| v.as_str()) {
+            self.current_step_id = step_id.to_string();
+        }
     }
 
     fn apply_tool_decision_event(&mut self, ev: &Event) {
