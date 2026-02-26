@@ -539,16 +539,16 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                     raw_output: out.raw_output,
                     error: out.error,
                 });
-                runtime_events::emit_event(
+                emit_worker_start_event(
                     &mut event_sink,
                     &run_id,
-                    0,
-                    EventKind::WorkerStart,
-                    serde_json::json!({
-                        "worker_model": worker_model,
-                        "planner_hash_hex": planner_record.as_ref().map(|p| p.plan_hash_hex.clone()).unwrap_or_default(),
-                        "enforce_plan_tools_effective": format!("{:?}", effective_plan_tool_enforcement).to_lowercase()
-                    }),
+                    &worker_model,
+                    &planner_record
+                        .as_ref()
+                        .map(|p| p.plan_hash_hex.clone())
+                        .unwrap_or_default(),
+                    effective_plan_tool_enforcement,
+                    None,
                 );
             }
             Err(e) => {
@@ -890,17 +890,13 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                 if let Some(worker) = worker_record.as_mut() {
                     worker.injected_planner_hash_hex = Some(replan_out.plan_hash_hex.clone());
                 }
-                runtime_events::emit_event(
+                emit_worker_start_event(
                     &mut agent.event_sink,
                     &run_id,
-                    0,
-                    EventKind::WorkerStart,
-                    serde_json::json!({
-                        "phase": "replan_resume",
-                        "worker_model": worker_model,
-                        "planner_hash_hex": replan_out.plan_hash_hex,
-                        "enforce_plan_tools_effective": format!("{:?}", effective_plan_tool_enforcement).to_lowercase()
-                    }),
+                    &worker_model,
+                    &replan_out.plan_hash_hex,
+                    effective_plan_tool_enforcement,
+                    Some("replan_resume"),
                 );
                 let resume_session_messages = extract_session_messages(&outcome.messages);
                 let replan_injected = runtime_paths::merge_injected_messages(
@@ -1293,6 +1289,42 @@ fn emit_planner_end_event(
         run_id,
         0,
         EventKind::PlannerEnd,
+        serde_json::Value::Object(payload),
+    );
+}
+
+fn emit_worker_start_event(
+    event_sink: &mut Option<Box<dyn crate::events::EventSink>>,
+    run_id: &str,
+    worker_model: &str,
+    planner_hash_hex: &str,
+    effective_plan_tool_enforcement: PlanToolEnforcementMode,
+    phase: Option<&str>,
+) {
+    let mut payload = serde_json::Map::new();
+    if let Some(phase) = phase {
+        payload.insert(
+            "phase".to_string(),
+            serde_json::Value::String(phase.to_string()),
+        );
+    }
+    payload.insert(
+        "worker_model".to_string(),
+        serde_json::Value::String(worker_model.to_string()),
+    );
+    payload.insert(
+        "planner_hash_hex".to_string(),
+        serde_json::Value::String(planner_hash_hex.to_string()),
+    );
+    payload.insert(
+        "enforce_plan_tools_effective".to_string(),
+        serde_json::Value::String(format!("{:?}", effective_plan_tool_enforcement).to_lowercase()),
+    );
+    runtime_events::emit_event(
+        event_sink,
+        run_id,
+        0,
+        EventKind::WorkerStart,
         serde_json::Value::Object(payload),
     );
 }
