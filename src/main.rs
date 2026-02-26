@@ -2,6 +2,7 @@ mod agent;
 mod agent_events;
 mod agent_queue_runtime;
 mod agent_tool_exec;
+mod agent_utils;
 
 mod agent_runtime;
 

@@ -5,6 +5,7 @@ use crate::agent_tool_exec::{
     infer_truncated_flag, is_apply_patch_invalid_format_error, make_invalid_args_tool_message,
     parse_jsonish, run_tool_once, schema_repair_instruction_message, tool_result_has_error,
 };
+use crate::agent_utils::{add_opt_u32, provider_name, sha256_hex};
 use crate::compaction::{context_size_chars, maybe_compact, CompactionReport, CompactionSettings};
 use crate::events::{EventKind, EventSink};
 use crate::gate::{ApprovalMode, AutoApproveScope, GateContext, GateDecision, GateEvent, ToolGate};
@@ -4159,31 +4160,6 @@ fn prompt_requires_tool_only(prompt: &str) -> bool {
         && (p.contains("no prose")
             || p.contains("do not output code")
             || p.contains("do not explain"))
-}
-
-fn provider_name(provider: crate::gate::ProviderKind) -> &'static str {
-    match provider {
-        crate::gate::ProviderKind::Lmstudio => "lmstudio",
-        crate::gate::ProviderKind::Llamacpp => "llamacpp",
-        crate::gate::ProviderKind::Ollama => "ollama",
-        crate::gate::ProviderKind::Mock => "mock",
-    }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-fn add_opt_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.saturating_add(y)),
-        (Some(x), None) => Some(x),
-        (None, Some(y)) => Some(y),
-        (None, None) => None,
-    }
 }
 
 fn taint_record_from_state(
