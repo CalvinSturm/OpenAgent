@@ -5,6 +5,7 @@ pub mod cost;
 pub mod fixtures;
 pub mod fixtures_repo;
 pub mod profile;
+pub mod report;
 pub mod report_compare;
 pub mod runner;
 pub mod tasks;
