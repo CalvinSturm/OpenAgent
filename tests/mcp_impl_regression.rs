@@ -1,7 +1,7 @@
 use std::path::Path;
-use std::time::Duration;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use std::{collections::BTreeMap, fs};
 
 use async_trait::async_trait;
@@ -24,10 +24,10 @@ use localagent::store::{self, PolicyRecordInfo, RunCliConfig, ToolCatalogEntry, 
 use localagent::taint::{TaintLevel, TaintMode, TaintToggle};
 use localagent::target::{ExecTargetKind, HostTarget};
 use localagent::tools::{builtin_tools_enabled, ToolArgsStrict, ToolRuntime};
-use localagent::types::SideEffects;
 use localagent::trust::approvals::ApprovalsStore;
 use localagent::trust::audit::AuditLog;
 use localagent::trust::policy::Policy;
+use localagent::types::SideEffects;
 use localagent::types::{GenerateRequest, GenerateResponse, Message, Role, ToolCall};
 use serde_json::Value;
 use tempfile::tempdir;
@@ -100,7 +100,15 @@ fn make_agent<P: ModelProvider + 'static>(
     allow_write: bool,
     enable_write_tools: bool,
 ) -> Agent<P> {
-    make_agent_with_mcp(provider, workdir, gate, allow_shell, allow_write, enable_write_tools, None)
+    make_agent_with_mcp(
+        provider,
+        workdir,
+        gate,
+        allow_shell,
+        allow_write,
+        enable_write_tools,
+        None,
+    )
 }
 
 fn make_agent_with_mcp<P: ModelProvider + 'static>(
@@ -569,9 +577,18 @@ rules:
         ],
         next: AtomicUsize::new(0),
     };
-    let mut agent =
-        make_agent_with_mcp(provider, tmp.path(), Box::new(gate), true, false, false, Some(reg));
-    let out = agent.run("Handle MCP tool output.", vec![], Vec::new()).await;
+    let mut agent = make_agent_with_mcp(
+        provider,
+        tmp.path(),
+        Box::new(gate),
+        true,
+        false,
+        false,
+        Some(reg),
+    );
+    let out = agent
+        .run("Handle MCP tool output.", vec![], Vec::new())
+        .await;
 
     assert!(matches!(out.exit_reason, AgentExitReason::ApprovalRequired));
     let tool_names = out
@@ -587,10 +604,7 @@ rules:
         .collect::<Vec<_>>();
     assert_eq!(
         decisions,
-        vec![
-            ("mcp.stub.echo", "allow"),
-            ("shell", "require_approval")
-        ]
+        vec![("mcp.stub.echo", "allow"), ("shell", "require_approval")]
     );
     let transcript = out
         .messages
@@ -639,10 +653,7 @@ rules:
         .collect::<Vec<_>>();
     assert_eq!(
         persisted,
-        vec![
-            ("mcp.stub.echo", "allow"),
-            ("shell", "require_approval")
-        ]
+        vec![("mcp.stub.echo", "allow"), ("shell", "require_approval")]
     );
 }
 
@@ -686,8 +697,15 @@ rules:
         ],
         next: AtomicUsize::new(0),
     };
-    let mut agent =
-        make_agent_with_mcp(provider, tmp.path(), Box::new(gate), false, true, true, Some(reg));
+    let mut agent = make_agent_with_mcp(
+        provider,
+        tmp.path(),
+        Box::new(gate),
+        false,
+        true,
+        true,
+        Some(reg),
+    );
     let out = agent.run("Apply MCP result.", vec![], Vec::new()).await;
 
     assert!(matches!(out.exit_reason, AgentExitReason::Denied));
@@ -696,7 +714,10 @@ rules:
         .iter()
         .map(|d| (d.tool.as_str(), d.decision.as_str()))
         .collect::<Vec<_>>();
-    assert_eq!(decisions, vec![("mcp.stub.echo", "allow"), ("write_file", "deny")]);
+    assert_eq!(
+        decisions,
+        vec![("mcp.stub.echo", "allow"), ("write_file", "deny")]
+    );
     assert!(!tmp.path().join("pwned.txt").exists());
 }
 
@@ -741,8 +762,15 @@ rules:
         ],
         next: AtomicUsize::new(0),
     };
-    let mut agent =
-        make_agent_with_mcp(provider, tmp.path(), Box::new(gate), true, false, false, Some(reg));
+    let mut agent = make_agent_with_mcp(
+        provider,
+        tmp.path(),
+        Box::new(gate),
+        true,
+        false,
+        false,
+        Some(reg),
+    );
     let out = agent.run("Process MCP content.", vec![], Vec::new()).await;
 
     assert!(matches!(out.exit_reason, AgentExitReason::ApprovalRequired));

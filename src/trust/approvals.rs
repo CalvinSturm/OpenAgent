@@ -520,7 +520,12 @@ mod tests {
         let store = ApprovalsStore::new(path);
 
         let ttl_id = store
-            .create_pending("shell", &json!({"cmd":"echo ttl"}), Some("ttl".to_string()), None)
+            .create_pending(
+                "shell",
+                &json!({"cmd":"echo ttl"}),
+                Some("ttl".to_string()),
+                None,
+            )
             .expect("ttl pending");
         store
             .approve(&ttl_id, Some(0), None)

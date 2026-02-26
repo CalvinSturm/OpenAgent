@@ -953,7 +953,10 @@ mod tests {
             }),
         ));
         assert_eq!(s.tool_calls.len(), 1);
-        assert_eq!(s.tool_calls[0].decision.as_deref(), Some("require_approval"));
+        assert_eq!(
+            s.tool_calls[0].decision.as_deref(),
+            Some("require_approval")
+        );
         assert_eq!(s.tool_calls[0].status, "PEND:approval");
         assert_eq!(s.next_hint, "pending_approval");
         assert_eq!(s.mcp_lifecycle, "WAIT:APPROVAL");

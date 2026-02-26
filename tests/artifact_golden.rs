@@ -178,7 +178,12 @@ fn build_outcome() -> AgentOutcome {
     }
 }
 
-fn build_projection(root: &Path, paths: &store::StatePaths, run_path: &Path, record: &RunRecord) -> Value {
+fn build_projection(
+    root: &Path,
+    paths: &store::StatePaths,
+    run_path: &Path,
+    record: &RunRecord,
+) -> Value {
     let record_json = serde_json::to_value(record).expect("serialize record");
     let obj = record_json.as_object().expect("record object");
     let cli = obj
@@ -276,13 +281,13 @@ fn run_artifact_schema_and_layout_golden_is_stable() {
         .expect("write fixture");
     }
 
-    let want: Value = serde_json::from_str(
-        &std::fs::read_to_string(&fixture_path).expect("read fixture golden"),
-    )
-    .expect("parse fixture");
+    let want: Value =
+        serde_json::from_str(&std::fs::read_to_string(&fixture_path).expect("read fixture golden"))
+            .expect("parse fixture");
 
     assert_eq!(
-        got, want,
+        got,
+        want,
         "artifact schema/layout golden drift detected at {}",
         fixture_path.display()
     );

@@ -180,7 +180,10 @@ rules:
 
     let cases = vec![
         ("mcp.safe.echo", PolicyDecision::Allow),
-        ("mcp.risky.browser_snapshot", PolicyDecision::RequireApproval),
+        (
+            "mcp.risky.browser_snapshot",
+            PolicyDecision::RequireApproval,
+        ),
         ("mcp.blocked.exec", PolicyDecision::Deny),
     ];
 
