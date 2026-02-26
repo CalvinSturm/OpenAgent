@@ -51,6 +51,7 @@ mod providers;
 
 mod qualification;
 
+mod reliability_profile;
 mod repo_map;
 mod repro;
 

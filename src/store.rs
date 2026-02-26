@@ -273,6 +273,12 @@ pub struct RunCliConfig {
     pub repo_map_file_count_included: u64,
     #[serde(default)]
     pub repo_map_injected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_hash_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -969,6 +975,9 @@ mod tests {
                 repo_map_bytes_kept: 0,
                 repo_map_file_count_included: 0,
                 repo_map_injected: false,
+                active_profile: None,
+                profile_source: None,
+                profile_hash_hex: None,
             },
             PolicyRecordInfo {
                 source: "none".to_string(),
@@ -1150,6 +1159,9 @@ mod tests {
                 repo_map_bytes_kept: 0,
                 repo_map_file_count_included: 0,
                 repo_map_injected: false,
+                active_profile: None,
+                profile_source: None,
+                profile_hash_hex: None,
             },
             resolved_paths: RunResolvedPaths {
                 state_dir: ".".to_string(),

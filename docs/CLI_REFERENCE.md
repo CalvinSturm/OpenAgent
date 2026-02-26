@@ -33,6 +33,7 @@ localagent --provider lmstudio --model <model> chat --tui
 - `approve`
 - `deny`
 - `check`
+- `profile`
 - `replay`
 - `session`
 - `eval`
@@ -52,6 +53,7 @@ localagent --provider lmstudio --model <model> chat --tui
 - `--state-dir <PATH>`
 - `--mcp <NAME>` (repeatable)
 - `--mcp-config <PATH>`
+- `--reliability-profile <local_small_strict|coding_balanced|web_cautious>`
 
 ### Tool/Execution Safety
 
@@ -245,6 +247,16 @@ Example:
 ```bash
 localagent --provider mock --model mock check run --path .localagent/checks --json-out check-report.json --junit-out check-report.xml
 ```
+
+### `profile`
+
+- `localagent profile list`
+- `localagent profile show <NAME>`
+
+Notes:
+- Reliability profiles are deterministic built-in presets for local-model budgets/caps and approval posture defaults.
+- Profiles do not enable shell/write or write-tool exposure; those remain explicit flags.
+- Use `--reliability-profile <NAME>` with `run` / `chat` / other run-mode flows, then override any profile-managed setting explicitly with CLI flags.
 
 ### `replay`
 

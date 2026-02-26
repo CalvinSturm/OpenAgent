@@ -789,6 +789,7 @@ fn default_run_args() -> super::RunArgs {
         use_repomap: false,
 
         repomap_max_bytes: 32 * 1024,
+        reliability_profile: None,
 
         compaction_mode: crate::compaction::CompactionMode::Off,
 
@@ -869,5 +870,7 @@ fn default_run_args() -> super::RunArgs {
         planner_strict: true,
 
         no_planner_strict: false,
+        resolved_reliability_profile_source: None,
+        resolved_reliability_profile_hash_hex: None,
     }
 }

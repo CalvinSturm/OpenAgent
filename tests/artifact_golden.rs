@@ -124,6 +124,9 @@ fn build_run_cli_config() -> RunCliConfig {
         repo_map_bytes_kept: 0,
         repo_map_file_count_included: 0,
         repo_map_injected: false,
+        active_profile: None,
+        profile_source: None,
+        profile_hash_hex: None,
     }
 }
 

@@ -49,6 +49,8 @@ pub(crate) enum Commands {
 
     Repo(RepoArgs),
 
+    Profile(ProfileArgs),
+
     Hooks(HooksArgs),
 
     Policy(PolicyArgs),
@@ -423,6 +425,18 @@ pub(crate) enum RepoSubcommand {
 pub(crate) struct RepoArgs {
     #[command(subcommand)]
     pub(crate) command: RepoSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ProfileSubcommand {
+    List,
+    Show { name: String },
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct ProfileArgs {
+    #[command(subcommand)]
+    pub(crate) command: ProfileSubcommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -931,6 +945,9 @@ pub(crate) struct RunArgs {
     #[arg(long, default_value_t = 32 * 1024)]
     pub(crate) repomap_max_bytes: usize,
 
+    #[arg(long = "reliability-profile")]
+    pub(crate) reliability_profile: Option<String>,
+
     #[arg(long, value_enum, default_value_t = CompactionMode::Off)]
     pub(crate) compaction_mode: CompactionMode,
 
@@ -1050,6 +1067,12 @@ pub(crate) struct RunArgs {
 
     #[arg(long, default_value_t = false)]
     pub(crate) no_planner_strict: bool,
+
+    #[arg(skip)]
+    pub(crate) resolved_reliability_profile_source: Option<String>,
+
+    #[arg(skip)]
+    pub(crate) resolved_reliability_profile_hash_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

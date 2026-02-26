@@ -396,6 +396,9 @@ fn minimal_cli_config_for_mcp_test() -> RunCliConfig {
         repo_map_bytes_kept: 0,
         repo_map_file_count_included: 0,
         repo_map_injected: false,
+        active_profile: None,
+        profile_source: None,
+        profile_hash_hex: None,
     }
 }
 

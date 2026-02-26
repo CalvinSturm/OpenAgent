@@ -20,7 +20,16 @@ use crate::{
 };
 
 pub(crate) async fn run_cli() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let argv = std::env::args_os().collect::<Vec<_>>();
+    let mut cli = Cli::parse_from(argv.clone());
+    let run_presence = crate::reliability_profile::detect_run_args_presence_from_argv(&argv);
+
+    if cli.run.reliability_profile.is_some() {
+        let _ = crate::reliability_profile::apply_builtin_profile_to_run_args(
+            &mut cli.run,
+            &run_presence,
+        )?;
+    }
 
     if cli.run.no_limits && !cli.run.unsafe_mode {
         return Err(anyhow!("--no-limits requires --unsafe"));
@@ -664,6 +673,20 @@ pub(crate) async fn run_cli() -> anyhow::Result<()> {
 
             session_ops::handle_session_command(&store, &args.command)?;
 
+            return Ok(());
+        }
+
+        Some(Commands::Profile(args)) => {
+            match &args.command {
+                ProfileSubcommand::List => {
+                    for p in crate::reliability_profile::list_builtin_profiles_sorted() {
+                        println!("{}\t{}", p.name, p.description);
+                    }
+                }
+                ProfileSubcommand::Show { name } => {
+                    println!("{}", crate::reliability_profile::render_profile_show(name)?);
+                }
+            }
             return Ok(());
         }
 

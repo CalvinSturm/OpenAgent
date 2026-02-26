@@ -210,6 +210,9 @@ pub(crate) fn build_run_cli_config(input: RunCliConfigInput<'_>) -> RunCliConfig
         repo_map_bytes_kept: repo_map.map(|m| m.bytes_kept).unwrap_or(0),
         repo_map_file_count_included: repo_map.map(|m| m.file_count_included).unwrap_or(0),
         repo_map_injected: repo_map.is_some(),
+        active_profile: args.reliability_profile.clone(),
+        profile_source: args.resolved_reliability_profile_source.clone(),
+        profile_hash_hex: args.resolved_reliability_profile_hash_hex.clone(),
     }
 }
 

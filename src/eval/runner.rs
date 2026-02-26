@@ -1310,6 +1310,9 @@ fn write_run_artifact_for_eval(
         repo_map_bytes_kept: 0,
         repo_map_file_count_included: 0,
         repo_map_injected: false,
+        active_profile: None,
+        profile_source: None,
+        profile_hash_hex: None,
     };
     let fingerprint = ConfigFingerprintV1 {
         schema_version: "openagent.confighash.v1".to_string(),
