@@ -101,6 +101,23 @@ struct ReplannerPhaseLaunch<'a> {
     planner_output: planner::PlannerOutput,
     planner_strict: bool,
 }
+
+struct RunArtifactWriteInput {
+    paths: store::StatePaths,
+    cli_config: store::RunCliConfig,
+    policy_info: store::PolicyRecordInfo,
+    config_hash_hex: String,
+    outcome: agent::AgentOutcome,
+    mode: planner::RunMode,
+    planner_record: Option<PlannerRunRecord>,
+    worker_record: Option<WorkerRunRecord>,
+    tool_schema_hash_hex_map: std::collections::BTreeMap<String, String>,
+    hooks_config_hash_hex: Option<String>,
+    config_fingerprint: Option<store::ConfigFingerprintV1>,
+    repro_record: Option<crate::repro::RunReproRecord>,
+    mcp_runtime_trace: Vec<crate::agent::McpRuntimeTraceEntry>,
+    mcp_pin_snapshot: Option<store::McpPinSnapshotRecord>,
+}
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent<P: ModelProvider>(
     provider: P,
@@ -444,34 +461,29 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                         paths,
                     );
                     let cfg_hash = config_hash_hex(&config_fingerprint)?;
-                    let run_artifact_path = match store::write_run_record(
-                        paths,
-                        cli_config,
-                        store::PolicyRecordInfo {
-                            source: policy_source,
-                            hash_hex: policy_hash_hex,
-                            version: policy_version,
-                            includes_resolved,
-                            mcp_allowlist,
-                        },
-                        cfg_hash,
-                        &outcome,
-                        args.mode,
-                        planner_record,
-                        worker_record,
-                        tool_schema_hash_hex_map.clone(),
-                        hooks_config_hash_hex.clone(),
-                        Some(config_fingerprint.clone()),
-                        None,
-                        Vec::new(),
-                        mcp_pin_snapshot.clone(),
-                    ) {
-                        Ok(p) => Some(p),
-                        Err(write_err) => {
-                            eprintln!("WARN: failed to write run artifact: {write_err}");
-                            None
-                        }
-                    };
+                    let run_artifact_path =
+                        write_run_artifact_with_warning(RunArtifactWriteInput {
+                            paths: paths.clone(),
+                            cli_config,
+                            policy_info: store::PolicyRecordInfo {
+                                source: policy_source,
+                                hash_hex: policy_hash_hex,
+                                version: policy_version,
+                                includes_resolved,
+                                mcp_allowlist,
+                            },
+                            config_hash_hex: cfg_hash,
+                            outcome: outcome.clone(),
+                            mode: args.mode,
+                            planner_record,
+                            worker_record,
+                            tool_schema_hash_hex_map: tool_schema_hash_hex_map.clone(),
+                            hooks_config_hash_hex: hooks_config_hash_hex.clone(),
+                            config_fingerprint: Some(config_fingerprint.clone()),
+                            repro_record: None,
+                            mcp_runtime_trace: Vec::new(),
+                            mcp_pin_snapshot: mcp_pin_snapshot.clone(),
+                        });
                     if let Some(h) = ui_join {
                         let _ = h.join();
                     }
@@ -620,34 +632,28 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                     paths,
                 );
                 let cfg_hash = config_hash_hex(&config_fingerprint)?;
-                let run_artifact_path = match store::write_run_record(
-                    paths,
+                let run_artifact_path = write_run_artifact_with_warning(RunArtifactWriteInput {
+                    paths: paths.clone(),
                     cli_config,
-                    store::PolicyRecordInfo {
+                    policy_info: store::PolicyRecordInfo {
                         source: policy_source,
                         hash_hex: policy_hash_hex,
                         version: policy_version,
                         includes_resolved,
                         mcp_allowlist,
                     },
-                    cfg_hash,
-                    &outcome,
-                    args.mode,
+                    config_hash_hex: cfg_hash,
+                    outcome: outcome.clone(),
+                    mode: args.mode,
                     planner_record,
                     worker_record,
-                    tool_schema_hash_hex_map.clone(),
-                    hooks_config_hash_hex.clone(),
-                    Some(config_fingerprint.clone()),
-                    None,
-                    Vec::new(),
-                    mcp_pin_snapshot.clone(),
-                ) {
-                    Ok(p) => Some(p),
-                    Err(write_err) => {
-                        eprintln!("WARN: failed to write run artifact: {write_err}");
-                        None
-                    }
-                };
+                    tool_schema_hash_hex_map: tool_schema_hash_hex_map.clone(),
+                    hooks_config_hash_hex: hooks_config_hash_hex.clone(),
+                    config_fingerprint: Some(config_fingerprint.clone()),
+                    repro_record: None,
+                    mcp_runtime_trace: Vec::new(),
+                    mcp_pin_snapshot: mcp_pin_snapshot.clone(),
+                });
                 if let Some(h) = ui_join {
                     let _ = h.join();
                 }
@@ -1049,10 +1055,10 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
         }
     }
     agent.event_sink = None;
-    let run_artifact_path = match store::write_run_record(
-        paths,
+    let run_artifact_path = write_run_artifact_with_warning(RunArtifactWriteInput {
+        paths: paths.clone(),
         cli_config,
-        store::PolicyRecordInfo {
+        policy_info: store::PolicyRecordInfo {
             source: policy_source,
             hash_hex: policy_hash_hex,
             version: policy_version,
@@ -1060,23 +1066,17 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
             mcp_allowlist,
         },
         config_hash_hex,
-        &outcome,
-        args.mode,
+        outcome: outcome.clone(),
+        mode: args.mode,
         planner_record,
         worker_record,
         tool_schema_hash_hex_map,
         hooks_config_hash_hex,
-        Some(config_fingerprint.clone()),
+        config_fingerprint: Some(config_fingerprint.clone()),
         repro_record,
-        agent.mcp_runtime_trace.clone(),
+        mcp_runtime_trace: agent.mcp_runtime_trace.clone(),
         mcp_pin_snapshot,
-    ) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            eprintln!("WARN: failed to write run artifact: {e}");
-            None
-        }
-    };
+    });
 
     if !suppress_stdout_stream {
         if args.tui {
@@ -1261,6 +1261,31 @@ fn cancelled_outcome(resolved_settings: &session::RunSettingResolution) -> agent
         provider_error_count: 0,
         token_usage: None,
         taint: None,
+    }
+}
+
+fn write_run_artifact_with_warning(input: RunArtifactWriteInput) -> Option<std::path::PathBuf> {
+    match store::write_run_record(
+        &input.paths,
+        input.cli_config,
+        input.policy_info,
+        input.config_hash_hex,
+        &input.outcome,
+        input.mode,
+        input.planner_record,
+        input.worker_record,
+        input.tool_schema_hash_hex_map,
+        input.hooks_config_hash_hex,
+        input.config_fingerprint,
+        input.repro_record,
+        input.mcp_runtime_trace,
+        input.mcp_pin_snapshot,
+    ) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("WARN: failed to write run artifact: {e}");
+            None
+        }
     }
 }
 
