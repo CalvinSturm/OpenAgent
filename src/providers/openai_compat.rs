@@ -7,8 +7,9 @@ use serde_json::Value;
 
 use crate::providers::common::{
     build_http_client, build_tool_envelopes, format_http_error_body, map_token_usage_triplet,
-    record_retry_and_sleep, truncate_error_display, ProviderRetryStepInput,
-    ToolEnvelope as SharedToolEnvelope,
+    provider_payload_too_large_error, provider_stream_incomplete_error,
+    provider_stream_payload_too_large_error, record_retry_and_sleep, truncate_error_display,
+    ProviderRetryStepInput, ToolEnvelope as SharedToolEnvelope,
 };
 use crate::providers::http::{
     classify_reqwest_error, classify_status, HttpConfig, ProviderError, ProviderErrorKind,
@@ -188,19 +189,14 @@ impl ModelProvider for OpenAiCompatProvider {
                 .await
                 .context("failed to read OpenAI-compatible response body")?;
             if bytes.len() > self.http.max_response_bytes {
-                return Err(anyhow!(ProviderError {
-                    kind: ProviderErrorKind::PayloadTooLarge,
-                    http_status: Some(status.as_u16()),
-                    retryable: false,
+                return Err(anyhow!(provider_payload_too_large_error(
+                    status.as_u16(),
                     attempt,
                     max_attempts,
-                    message: format!(
-                        "response exceeded max bytes: {} > {}",
-                        bytes.len(),
-                        self.http.max_response_bytes
-                    ),
+                    bytes.len(),
+                    self.http.max_response_bytes,
                     retries,
-                }));
+                )));
             }
             let resp: OpenAiResponse = serde_json::from_slice(&bytes)
                 .context("failed to parse OpenAI-compatible JSON response")?;
@@ -380,18 +376,14 @@ impl ModelProvider for OpenAiCompatProvider {
 
                 total_bytes = total_bytes.saturating_add(chunk.len());
                 if total_bytes > self.http.max_response_bytes {
-                    return Err(anyhow!(ProviderError {
-                        kind: ProviderErrorKind::PayloadTooLarge,
-                        http_status: Some(status.as_u16()),
-                        retryable: false,
+                    return Err(anyhow!(provider_stream_payload_too_large_error(
+                        status.as_u16(),
                         attempt,
                         max_attempts,
-                        message: format!(
-                            "stream exceeded max bytes: {} > {}",
-                            total_bytes, self.http.max_response_bytes
-                        ),
+                        total_bytes,
+                        self.http.max_response_bytes,
                         retries,
-                    }));
+                    )));
                 }
 
                 let mut chunk_text = String::from_utf8_lossy(&chunk).to_string();
@@ -491,15 +483,7 @@ impl ModelProvider for OpenAiCompatProvider {
             });
         }
 
-        Err(anyhow!(ProviderError {
-            kind: ProviderErrorKind::Other,
-            http_status: None,
-            retryable: false,
-            attempt: self.http.http_max_retries + 1,
-            max_attempts: self.http.http_max_retries + 1,
-            message: "stream ended before response completed".to_string(),
-            retries: Vec::new(),
-        }))
+        Err(anyhow!(provider_stream_incomplete_error(self.http)))
     }
 }
 

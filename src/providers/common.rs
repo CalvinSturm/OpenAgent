@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::providers::http::{
-    deterministic_backoff_ms, HttpConfig, ProviderErrorKind, RetryRecord,
+    deterministic_backoff_ms, HttpConfig, ProviderError, ProviderErrorKind, RetryRecord,
 };
 use crate::providers::to_u32_opt;
 use crate::types::TokenUsage;
@@ -98,4 +98,61 @@ pub(crate) async fn record_retry_and_sleep(input: ProviderRetryStepInput<'_>) {
         backoff_ms: backoff,
     });
     tokio::time::sleep(Duration::from_millis(backoff)).await;
+}
+
+pub(crate) fn provider_payload_too_large_error(
+    status: u16,
+    attempt: u32,
+    max_attempts: u32,
+    actual_bytes: usize,
+    max_bytes: usize,
+    retries: Vec<RetryRecord>,
+) -> ProviderError {
+    ProviderError {
+        kind: ProviderErrorKind::PayloadTooLarge,
+        http_status: Some(status),
+        retryable: false,
+        attempt,
+        max_attempts,
+        message: format!(
+            "response exceeded max bytes: {} > {}",
+            actual_bytes, max_bytes
+        ),
+        retries,
+    }
+}
+
+pub(crate) fn provider_stream_payload_too_large_error(
+    status: u16,
+    attempt: u32,
+    max_attempts: u32,
+    actual_bytes: usize,
+    max_bytes: usize,
+    retries: Vec<RetryRecord>,
+) -> ProviderError {
+    ProviderError {
+        kind: ProviderErrorKind::PayloadTooLarge,
+        http_status: Some(status),
+        retryable: false,
+        attempt,
+        max_attempts,
+        message: format!(
+            "stream exceeded max bytes: {} > {}",
+            actual_bytes, max_bytes
+        ),
+        retries,
+    }
+}
+
+pub(crate) fn provider_stream_incomplete_error(http: HttpConfig) -> ProviderError {
+    let max_attempts = http.http_max_retries + 1;
+    ProviderError {
+        kind: ProviderErrorKind::Other,
+        http_status: None,
+        retryable: false,
+        attempt: max_attempts,
+        max_attempts,
+        message: "stream ended before response completed".to_string(),
+        retries: Vec::new(),
+    }
 }
