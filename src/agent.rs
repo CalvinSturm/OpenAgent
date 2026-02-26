@@ -347,6 +347,28 @@ impl<P: ModelProvider> Agent<P> {
         *announced_plan_step_id = Some(step_constraint.step_id.clone());
     }
 
+    fn record_detected_tool_call(
+        &mut self,
+        run_id: &str,
+        step: u32,
+        tc: &ToolCall,
+        observed_tool_calls: &mut Vec<ToolCall>,
+    ) {
+        observed_tool_calls.push(tc.clone());
+        self.emit_event(
+            run_id,
+            step,
+            EventKind::ToolCallDetected,
+            serde_json::json!({
+                "tool_call_id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments,
+                "side_effects": tool_side_effects(&tc.name),
+                "tool_args_strict": if self.tool_rt.tool_args_strict.is_enabled() { "on" } else { "off" }
+            }),
+        );
+    }
+
     fn check_wall_time_budget_exceeded(
         &mut self,
         run_id: &str,
@@ -1819,19 +1841,7 @@ impl<P: ModelProvider> Agent<P> {
             }
 
             for tc in &resp.tool_calls {
-                observed_tool_calls.push(tc.clone());
-                self.emit_event(
-                    &run_id,
-                    step as u32,
-                    EventKind::ToolCallDetected,
-                    serde_json::json!({
-                        "tool_call_id": tc.id,
-                        "name": tc.name,
-                        "arguments": tc.arguments,
-                        "side_effects": tool_side_effects(&tc.name),
-                        "tool_args_strict": if self.tool_rt.tool_args_strict.is_enabled() { "on" } else { "off" }
-                    }),
-                );
+                self.record_detected_tool_call(&run_id, step as u32, tc, &mut observed_tool_calls);
                 if tc.name.starts_with("mcp.") {
                     if matches!(self.mcp_pin_enforcement, McpPinEnforcementMode::Off) {
                         // Drift probing disabled by configuration.
