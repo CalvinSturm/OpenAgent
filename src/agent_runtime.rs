@@ -337,16 +337,16 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
         match planner_out {
             Ok(out) => {
                 if planner_strict_effective && !out.ok {
-                    runtime_events::emit_event(
+                    emit_planner_end_event(
                         &mut event_sink,
                         &run_id,
-                        0,
-                        EventKind::PlannerEnd,
-                        serde_json::json!({
-                            "ok": false,
-                            "planner_hash_hex": out.plan_hash_hex,
-                            "error_short": out.error.clone().unwrap_or_else(|| "planner validation failed".to_string())
-                        }),
+                        false,
+                        &out.plan_hash_hex,
+                        &out.error
+                            .clone()
+                            .unwrap_or_else(|| "planner validation failed".to_string()),
+                        None,
+                        None,
                     );
                     let outcome = agent::AgentOutcome {
                         run_id: run_id.clone(),
@@ -470,16 +470,14 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
                         run_artifact_path,
                     });
                 }
-                runtime_events::emit_event(
+                emit_planner_end_event(
                     &mut event_sink,
                     &run_id,
-                    0,
-                    EventKind::PlannerEnd,
-                    serde_json::json!({
-                        "ok": out.ok,
-                        "planner_hash_hex": out.plan_hash_hex,
-                        "error_short": out.error.clone().unwrap_or_default()
-                    }),
+                    out.ok,
+                    &out.plan_hash_hex,
+                    &out.error.clone().unwrap_or_default(),
+                    None,
+                    None,
                 );
                 let handoff = format!(
                     "{}\n\n{}",
@@ -545,17 +543,7 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
             }
             Err(e) => {
                 let err_short = e.to_string();
-                runtime_events::emit_event(
-                    &mut event_sink,
-                    &run_id,
-                    0,
-                    EventKind::PlannerEnd,
-                    serde_json::json!({
-                        "ok": false,
-                        "planner_hash_hex": "",
-                        "error_short": err_short
-                    }),
-                );
+                emit_planner_end_event(&mut event_sink, &run_id, false, "", &err_short, None, None);
                 let outcome = agent::AgentOutcome {
                     run_id: run_id.clone(),
                     started_at: trust::now_rfc3339(),
@@ -856,17 +844,14 @@ pub(crate) async fn run_agent_with_ui<P: ModelProvider>(
         .await
         {
             Ok(replan_out) if !planner_strict_effective || replan_out.ok => {
-                runtime_events::emit_event(
+                emit_planner_end_event(
                     &mut agent.event_sink,
                     &run_id,
-                    0,
-                    EventKind::PlannerEnd,
-                    serde_json::json!({
-                        "phase": "replan",
-                        "ok": replan_out.ok,
-                        "planner_hash_hex": replan_out.plan_hash_hex,
-                        "lineage_parent_plan_hash_hex": prior_plan_hash
-                    }),
+                    replan_out.ok,
+                    &replan_out.plan_hash_hex,
+                    "",
+                    Some("replan"),
+                    Some(&prior_plan_hash),
                 );
                 let replan_handoff = format!(
                     "{}\n\n{}",
@@ -1231,6 +1216,54 @@ async fn run_planner_phase_with_start_event<P: ModelProvider>(
         event_sink,
     )
     .await
+}
+
+fn emit_planner_end_event(
+    event_sink: &mut Option<Box<dyn crate::events::EventSink>>,
+    run_id: &str,
+    ok: bool,
+    planner_hash_hex: &str,
+    error_short: &str,
+    phase: Option<&str>,
+    lineage_parent_plan_hash_hex: Option<&str>,
+) {
+    let mut payload = serde_json::Map::new();
+    if let Some(phase) = phase {
+        payload.insert(
+            "phase".to_string(),
+            serde_json::Value::String(phase.to_string()),
+        );
+    }
+    payload.insert("ok".to_string(), serde_json::Value::Bool(ok));
+    payload.insert(
+        "planner_hash_hex".to_string(),
+        serde_json::Value::String(planner_hash_hex.to_string()),
+    );
+    if !error_short.is_empty() {
+        payload.insert(
+            "error_short".to_string(),
+            serde_json::Value::String(error_short.to_string()),
+        );
+    } else if phase.is_none() {
+        // Preserve the non-replan PlannerEnd payload shape in existing call sites.
+        payload.insert(
+            "error_short".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+    }
+    if let Some(parent) = lineage_parent_plan_hash_hex {
+        payload.insert(
+            "lineage_parent_plan_hash_hex".to_string(),
+            serde_json::Value::String(parent.to_string()),
+        );
+    }
+    runtime_events::emit_event(
+        event_sink,
+        run_id,
+        0,
+        EventKind::PlannerEnd,
+        serde_json::Value::Object(payload),
+    );
 }
 
 fn build_exec_target(args: &RunArgs) -> anyhow::Result<std::sync::Arc<dyn ExecTarget>> {
