@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context};
+use std::path::PathBuf;
 
 use clap::Parser;
 
@@ -275,13 +276,48 @@ pub(crate) async fn run_cli() -> anyhow::Result<()> {
                         }
                     }
 
+                    let mut isolated_paths = None;
+                    let mut _scratch_guard = None;
+                    if check_requires_scratch_isolation(&check) {
+                        match prepare_check_scratch_workspace(&workdir) {
+                            Ok((scratch_guard, scratch_workdir)) => {
+                                run_args.workdir = scratch_workdir.clone();
+                                isolated_paths = Some(resolve_state_paths(
+                                    &scratch_workdir,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                ));
+                                _scratch_guard = Some(scratch_guard);
+                            }
+                            Err(e) => {
+                                results.push(checks::report::CheckRunResult {
+                                    name: check.name,
+                                    path: check.path,
+                                    description: check.description,
+                                    status: "error".to_string(),
+                                    reason_code: Some("CHECK_RUNNER_INTERNAL_ERROR".to_string()),
+                                    summary: format!(
+                                        "failed to prepare isolated scratch workspace: {e}"
+                                    ),
+                                    required: check.required,
+                                    file_bytes_hash_hex: check.file_bytes_hash_hex,
+                                    frontmatter_hash_hex: check.frontmatter_hash_hex,
+                                    check_hash_hex: check.check_hash_hex,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+
                     let run_res = execute_check_agent_run(
                         provider_kind,
                         &base_url,
                         &model,
                         &check.body,
                         &run_args,
-                        &paths,
+                        isolated_paths.as_ref().unwrap_or(&paths),
                     )
                     .await;
 
@@ -1206,17 +1242,12 @@ fn check_capability_denial(
     for flag in &check.frontmatter.required_flags {
         match flag.as_str() {
             "shell" => {
-                if !run.allow_shell {
+                if !(run.allow_shell || run.allow_shell_in_workdir) {
                     return Some((
                         if check.required { "failed" } else { "skipped" },
-                        "shell capability not enabled (requires --allow-shell)".to_string(),
+                        "shell capability not enabled (requires --allow-shell or --allow-shell-in-workdir)".to_string(),
                     ));
                 }
-                return Some((
-                    if check.required { "failed" } else { "skipped" },
-                    "shell checks require isolated scratch execution (not implemented yet)"
-                        .to_string(),
-                ));
             }
             "write" => {
                 if !(run.allow_write && run.enable_write_tools) {
@@ -1226,11 +1257,6 @@ fn check_capability_denial(
                             .to_string(),
                     ));
                 }
-                return Some((
-                    if check.required { "failed" } else { "skipped" },
-                    "write checks require isolated scratch execution (not implemented yet)"
-                        .to_string(),
-                ));
             }
             other => {
                 if let Some(server) = other.strip_prefix("mcp:") {
@@ -1250,6 +1276,73 @@ fn check_capability_denial(
         }
     }
     None
+}
+
+fn check_requires_scratch_isolation(check: &checks::loader::LoadedCheck) -> bool {
+    check
+        .frontmatter
+        .required_flags
+        .iter()
+        .any(|f| f == "shell" || f == "write")
+}
+
+struct CheckScratchWorkspace {
+    root: PathBuf,
+}
+
+impl Drop for CheckScratchWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn prepare_check_scratch_workspace(
+    workdir: &std::path::Path,
+) -> anyhow::Result<(CheckScratchWorkspace, PathBuf)> {
+    let root = std::env::temp_dir().join(format!("localagent-check-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root)?;
+    let repo_copy = root.join("repo");
+    std::fs::create_dir_all(&repo_copy)?;
+    copy_check_workspace_tree(workdir, &repo_copy)?;
+    Ok((CheckScratchWorkspace { root }, repo_copy))
+}
+
+fn copy_check_workspace_tree(
+    src_root: &std::path::Path,
+    dst_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    let mut stack = vec![(src_root.to_path_buf(), dst_root.to_path_buf())];
+    while let Some((src_dir, dst_dir)) = stack.pop() {
+        std::fs::create_dir_all(&dst_dir)?;
+        let mut entries = std::fs::read_dir(&src_dir)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|e| e.file_name().to_string_lossy().to_lowercase());
+        for entry in entries {
+            let src_path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if src_dir == src_root
+                && (name_str == ".git"
+                    || name_str == ".localagent"
+                    || name_str == "target"
+                    || name_str == "node_modules")
+            {
+                continue;
+            }
+
+            let dst_path = dst_dir.join(&name);
+            if file_type.is_dir() {
+                stack.push((src_path, dst_path));
+            } else if file_type.is_file() {
+                std::fs::copy(src_path, dst_path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn execute_check_agent_run(
