@@ -1070,11 +1070,7 @@ fn handle_tui_outer_paste_event(input: TuiOuterPasteInput<'_>) {
             LearnOverlayInputFocus::PromoteId => {
                 let s = normalize_overlay_paste(input.pasted, true);
                 if !s.is_empty() && !overlay.promote_id.ends_with(&s) {
-                    append_overlay_field_bounded(
-                        &mut overlay.promote_id,
-                        &s,
-                        OVERLAY_ID_MAX_CHARS,
-                    );
+                    append_overlay_field_bounded(&mut overlay.promote_id, &s, OVERLAY_ID_MAX_CHARS);
                 }
             }
             LearnOverlayInputFocus::PromoteSlug => {

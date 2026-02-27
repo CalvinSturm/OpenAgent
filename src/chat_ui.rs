@@ -588,17 +588,14 @@ fn draw_learn_capture_form(
         1 => "prompt_guidance: prompting instruction that improves tool/model behavior",
         _ => "check_candidate: candidate check to promote into .localagent/checks/",
     };
-    let cat_text = format!(
-        "Category [Up/Down]: {}\n{}",
-        category_tokens, category_help
-    );
+    let cat_text = format!("Category [Up/Down]: {}\n{}", category_tokens, category_help);
     f.render_widget(
         Paragraph::new(soft_break_long_tokens(
             &cat_text,
             rows[1].width.saturating_sub(1) as usize,
         ))
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(Color::Yellow)),
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(Color::Yellow)),
         rows[1],
     );
     let summary_active = overlay.input_focus == "capture.summary";
