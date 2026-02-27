@@ -39,12 +39,13 @@ localagent --provider lmstudio --model <model> chat --tui
 - `eval`
 - `repo`
 - `pack`
+- `learn`
 - `tui`
 - `tasks`
 
 ## Global Options (All-Mode)
 
-- `--provider <lmstudio|llamacpp|ollama>`
+- `--provider <lmstudio|llamacpp|ollama|mock>`
 - `--model <MODEL>`
 - `--base-url <BASE_URL>`
 - `--api-key <API_KEY>`
@@ -96,6 +97,8 @@ localagent --provider lmstudio --model <model> chat --tui
 - `--reset-session`
 - `--max-session-messages <N>` (default: `40`)
 - `--use-session-settings`
+- `--use-repomap`
+- `--repomap-max-bytes <N>` (default: `32768`)
 
 ### Compaction
 
@@ -141,9 +144,9 @@ localagent --provider lmstudio --model <model> chat --tui
 ### Provider HTTP Resilience
 
 - `--http-max-retries <N>` (default: `2`)
-- `--http-timeout-ms <N>` (default: `60000`)
+- `--http-timeout-ms <N>` (default: `0`)
 - `--http-connect-timeout-ms <N>` (default: `2000`)
-- `--http-stream-idle-timeout-ms <N>` (default: `15000`)
+- `--http-stream-idle-timeout-ms <N>` (default: `0`)
 - `--http-max-response-bytes <N>` (default: `10000000`)
 - `--http-max-line-bytes <N>` (default: `200000`)
 
@@ -157,6 +160,8 @@ localagent --provider lmstudio --model <model> chat --tui
 - `--worker-model <MODEL>`
 - `--planner-max-steps <N>` (default: `2`)
 - `--planner-output <json|text>` (default: `json`)
+- `--enforce-plan-tools <off|soft|hard>` (default: `off`)
+- `--mcp-pin-enforcement <off|warn|hard>` (default: `hard`)
 - `--planner-strict <true|false>` (default: `true`)
 - `--no-planner-strict`
 
@@ -333,6 +338,19 @@ Eval groups:
 - `localagent eval baseline delete <NAME>`
 - `localagent eval baseline list`
 - `localagent eval report compare --a <RESULT_A> --b <RESULT_B> --out <MD_OUT> [--json <JSON_OUT>]`
+
+### `learn`
+
+- `localagent learn capture --category <workflow-hint|prompt-guidance|check-candidate> --summary <TEXT> [--run <RUN_ID>] [--task-summary <TEXT>] [--profile <TEXT>] [--guidance-text <TEXT>] [--check-text <TEXT>] [--tag <TAG>]... [--evidence <KIND:VALUE>]... [--evidence-note <TEXT>]... [--assist] [--write]`
+- `localagent learn list`
+- `localagent learn show <ID>`
+- `localagent learn archive <ID>`
+- `localagent learn promote <ID> --to <check|pack|agents> [--slug <SLUG>] [--pack-id <PACK_ID>] [--force] [--check-run] [--replay-verify] [--replay-verify-run-id <RUN_ID>] [--replay-verify-strict]`
+
+Notes:
+- `learn capture --assist` is preview-only unless `--write` is provided.
+- `learn promote --to check` requires `--slug`.
+- `learn promote --to pack` requires `--pack-id`.
 
 ### `tui`
 

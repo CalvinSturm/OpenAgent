@@ -167,6 +167,29 @@ localagent --provider lmstudio --model essentialai/rnj-1 chat --tui
 localagent
 ```
 
+### Learning workflow (capture and promote)
+
+```bash
+# capture
+localagent learn capture --category prompt-guidance --summary "Prefer deterministic fixtures for parser tests"
+localagent learn list
+localagent learn show <id>
+
+# promote
+localagent learn promote <id> --to check --slug parser-determinism
+localagent learn promote <id> --to pack --pack-id core
+localagent learn promote <id> --to agents
+```
+
+Assisted capture:
+
+```bash
+# preview-only by default
+localagent --provider lmstudio --model <model> learn capture --assist --category prompt-guidance --summary "..."
+# persist assisted draft
+localagent --provider lmstudio --model <model> learn capture --assist --write --category prompt-guidance --summary "..."
+```
+
 <img width="1093" height="LocalAgent chat TUI showing Code mode, connected LM Studio provider, command hints, and cwd footer (C:\\demo)." alt="Screenshot 2026-02-25 145358" src="https://github.com/user-attachments/assets/1b2c6f7e-9869-46bc-8ec8-24b70ae23268" />
 
 Startup screen controls:
@@ -255,6 +278,8 @@ In chat TUI:
 - `/mode <safe|coding|web|custom>`: switch chat runtime mode
 - `/timeout [seconds|+N|-N|off]`: show and adjust request/stream idle timeout for slow generations
 - `/dismiss`: dismiss active timeout notification
+- `/learn help`: show `/learn` command usage
+- `/learn list|show|archive|capture|promote`: learning workflows from TUI logs pane
 - `?`: show keybind help dropdown
 
 Mode naming note:

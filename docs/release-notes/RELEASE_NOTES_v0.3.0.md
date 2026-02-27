@@ -22,7 +22,11 @@ Release date: 2026-02-27
 
 - Added assisted draft flow: `learn capture --assist` (preview-only by default) and `--write` to persist.
 - Added provenance metadata fields for assisted captures.
-- Added one-shot promote+validate chaining options (`--check-run` and replay verify paths).
+- Added one-shot promote+validate chaining options:
+  - `--check-run`
+  - `--replay-verify`
+  - `--replay-verify-run-id <RUN_ID>`
+  - `--replay-verify-strict`
 
 ### Chat TUI
 
