@@ -9,6 +9,25 @@ Older releases may appear in `docs/release-notes/` before they are backfilled he
 
 - No unreleased changes yet.
 
+## v0.3.0 - 2026-02-27
+
+### Added
+
+- Learning store foundation commands: `learn capture`, `learn list`, `learn show <id>`, and `learn archive <id>`
+- Learning promotion flows:
+  - `learn promote <id> --to check --slug <slug>`
+  - `learn promote <id> --to pack --pack-id <pack_id>`
+  - `learn promote <id> --to agents`
+- Assisted capture mode with provenance metadata (`learn capture --assist [--write]`)
+- Promote+validate one-shot chaining (`--check-run`, replay verify options)
+- Chat TUI `/learn` command surface (Phase A + Phase B)
+
+### Changed
+
+- Promotion writes remain deterministic/idempotent with managed-section insertion for `AGENTS.md` and packs
+- Learning event coverage expanded (`openagent.learning_captured.v1`, `openagent.learning_promoted.v1`)
+- Runtime cancellation handling fixed so chat/TUI runs no longer exit immediately as `cancelled` due to dropped cancel sender
+
 ## v0.2.1 - 2026-02-22
 
 ### Added
