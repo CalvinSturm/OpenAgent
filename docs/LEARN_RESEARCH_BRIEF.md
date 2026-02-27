@@ -144,3 +144,39 @@ Use this for each major policy decision:
 3. Finalize eval-proof policy contract.
 4. Update docs contracts (`LEARN_OUTPUT_CONTRACT.md`, workflow reference).
 5. Implement in small PR slices with acceptance tests.
+
+## 12. R&D goals and exit criteria
+
+### Goals
+
+- Make `/learn` usable by beginner/intermediate operators without policy-authoring expertise.
+- Increase promotion quality and reduce low-value or ambiguous promoted artifacts.
+- Preserve explicit operator control, deterministic behavior, and auditability.
+
+### Exit criteria
+
+1. Usability
+- New users can complete `capture -> review -> promote` without external help.
+- Overlay provides clear next-step guidance at each step.
+
+2. Quality
+- Structured capture templates produce higher-quality candidates than freeform baseline.
+- Quality gates catch weak candidates before write.
+
+3. Reliability
+- Promotion is eval-proof-backed by default, or explicitly waived with forced audit metadata.
+- Promoted artifacts are deterministic and idempotent where required.
+
+4. Safety
+- No hidden writes in preview paths.
+- Sensitivity/overwrite/path guards remain deterministic and test-covered.
+
+5. Operability
+- Error messaging is actionable and includes stable deterministic error codes.
+- Events and entry metadata are sufficient for post-hoc audit.
+
+### Success metrics (first pass)
+
+- >=80% first-try successful capture completion in guided flow tests.
+- >=50% reduction in promotions requiring manual rework after review.
+- 100% of promotions have proof metadata (`present` or `waived`) in event payload.
