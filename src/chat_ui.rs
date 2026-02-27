@@ -504,12 +504,23 @@ fn draw_learn_overlay(f: &mut ratatui::Frame<'_>, overlay: &LearnOverlayRenderMo
         }
     }
 
-    let hints = format!(
-        "Assist: {} (Ctrl+A) | Enter: Preview/Run | Ctrl+W: Arm Write | Left/Right: Target | Ctrl+F/K/R/S: Flags | Tab: Next Field | Esc: Close | 1/2/3: Tabs",
-        if overlay.assist_on { "ON" } else { "OFF" },
-    );
+    let hints = match overlay.tab {
+        LearnOverlayTab::Capture => format!(
+            "Capture: Enter Preview/Run | Ctrl+W Arm | Ctrl+A Assist:{} | Tab Focus | Esc/Q Close | Ctrl+1/2/3 Tabs",
+            if overlay.assist_on { "ON" } else { "OFF" },
+        ),
+        LearnOverlayTab::Review => {
+            "Review: Enter Preview | Up/Down Select | Tab Focus | Esc/Q Close | Ctrl+1/2/3 Tabs"
+                .to_string()
+        }
+        LearnOverlayTab::Promote => {
+            "Promote: Left/Right Target | Ctrl+W Arm | Enter Run | Ctrl+F/K/R/S Flags | Tab Focus | Esc/Q Close | Ctrl+1/2/3 Tabs".to_string()
+        }
+    };
     f.render_widget(
-        Paragraph::new(hints).style(Style::default().fg(Color::Gray)),
+        Paragraph::new(hints)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::Gray)),
         outer[3],
     );
 
@@ -542,8 +553,10 @@ fn draw_learn_capture_form(
         .constraints([
             Constraint::Length(1),
             Constraint::Length(4),
+            Constraint::Length(2),
             Constraint::Length(1),
             Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -569,6 +582,17 @@ fn draw_learn_capture_form(
         Paragraph::new(cat_text).style(Style::default().fg(Color::Yellow)),
         rows[1],
     );
+    let category_help = match overlay.selected_category_idx {
+        0 => "workflow_hint: reusable process/pattern to follow next time",
+        1 => "prompt_guidance: prompting instruction that improves tool/model behavior",
+        _ => "check_candidate: candidate check to promote into .localagent/checks/",
+    };
+    f.render_widget(
+        Paragraph::new(category_help)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::Gray)),
+        rows[2],
+    );
     let summary_label = if overlay.input_focus == "capture.summary" {
         "Summary: <required>  [active]"
     } else {
@@ -576,7 +600,7 @@ fn draw_learn_capture_form(
     };
     f.render_widget(
         Paragraph::new(summary_label).style(Style::default().fg(Color::Gray)),
-        rows[2],
+        rows[3],
     );
     let summary = if overlay.summary.trim().is_empty() {
         "< Enter concise summary here... >".to_string()
@@ -591,7 +615,7 @@ fn draw_learn_capture_form(
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::DarkGray)),
             ),
-        rows[3],
+        rows[4],
     );
     let requirement = if overlay.summary.trim().is_empty() {
         "summary: <required>"
@@ -600,22 +624,22 @@ fn draw_learn_capture_form(
     };
     f.render_widget(
         Paragraph::new(requirement).style(Style::default().fg(Color::Gray)),
-        rows[4],
+        rows[5],
     );
     let focus_line = format!("field focus: {}", overlay.input_focus);
     f.render_widget(
         Paragraph::new(focus_line).style(Style::default().fg(Color::Gray)),
-        rows[5],
+        rows[6],
     );
     if let Some(msg) = overlay.inline_message.as_deref() {
         f.render_widget(
             Paragraph::new(msg).style(Style::default().fg(Color::Red)),
-            rows[5],
+            rows[6],
         );
     }
-    f.render_widget(Paragraph::new("▸ Advanced Parameters"), rows[6]);
-    f.render_widget(Paragraph::new("▸ Proposed Memory"), rows[7]);
-    f.render_widget(Paragraph::new("▸ Evidence Rows"), rows[8]);
+    f.render_widget(Paragraph::new("▸ Advanced Parameters"), rows[7]);
+    f.render_widget(Paragraph::new("▸ Proposed Memory"), rows[8]);
+    f.render_widget(Paragraph::new("▸ Evidence Rows"), rows[9]);
 }
 
 fn draw_learn_cli_review(
