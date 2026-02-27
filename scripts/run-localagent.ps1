@@ -45,6 +45,13 @@ function Resolve-ModelPreset {
         return $preset
     }
 
+    if ($Name -like "nanbeige4.1-3b*") {
+        # Known-good low-footprint tool-calling model preset.
+        $preset.MaxContextChars = "12000"
+        $preset.MaxSessionMessages = "16"
+        return $preset
+    }
+
     if ($Name -like "llama*") {
         $preset.MaxContextChars = "12000"
         return $preset

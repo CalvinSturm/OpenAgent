@@ -137,6 +137,32 @@ Good starting points:
 - Reasoning/planning focus: `deepseek-r1:8b` or `deepseek-r1:14b`
 - 24 GB class GPU: `qwen3:30b` or `deepseek-r1:32b`
 - Coding-focused agent: `qwen3-coder-next`
+- Small-footprint tool-calling pick: `nanbeige4.1-3b@bf16`
+
+### Known-Good Small Tool-Calling Profile
+
+If you have this model in LM Studio:
+
+- `nanbeige4.1-3b@bf16`
+
+Recommended quick run:
+
+```bash
+localagent --provider lmstudio --model nanbeige4.1-3b@bf16 chat --tui
+```
+
+Recommended smoke flow:
+
+```bash
+localagent --provider lmstudio --model nanbeige4.1-3b@bf16 --prompt "Say hi." run
+localagent --provider lmstudio --model nanbeige4.1-3b@bf16 learn list
+```
+
+PowerShell helper (repo script) now applies a tuned preset for this model:
+
+```powershell
+.\scripts\run-localagent.ps1 -Provider lmstudio -Model "nanbeige4.1-3b@bf16" -Command chat -Mode coding
+```
 
 ### Important Notes for Local Agent Reliability
 
