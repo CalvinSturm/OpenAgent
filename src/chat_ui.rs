@@ -560,8 +560,14 @@ fn draw_learn_capture_form(
             Constraint::Min(1),
         ])
         .split(inner);
+    let step_lines = [
+        "Step 1: Enter summary.",
+        "Step 2: Enter = preview only (no write, no token use).",
+        "Step 3: Ctrl+W to arm write; with Assist ON, running write calls the LLM and uses tokens.",
+    ]
+    .join("\n");
     f.render_widget(
-        Paragraph::new("Step 1: Choose category  Step 2: Type summary  Step 3: Enter preview")
+        Paragraph::new(step_lines)
             .style(Style::default().fg(Color::Gray))
             .wrap(Wrap { trim: false }),
         rows[0],

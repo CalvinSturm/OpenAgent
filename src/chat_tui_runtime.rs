@@ -122,10 +122,7 @@ impl Default for LearnOverlayState {
             promote_replay_verify_strict: false,
             promote_replay_verify_run_id: String::new(),
             input_focus: LearnOverlayInputFocus::CaptureSummary,
-            inline_message: Some(
-                "Step 1: Enter summary. Step 2: Enter = preview only (no write, no token use). Step 3: Ctrl+W to arm write; with Assist ON, running write calls the LLM and uses tokens."
-                    .to_string(),
-            ),
+            inline_message: None,
             review_rows: Vec::new(),
             review_selected_idx: 0,
             assist_on: true,
@@ -175,16 +172,14 @@ fn push_overlay_log_unique(overlay: &mut LearnOverlayState, msg: &str) {
 
 fn set_overlay_next_steps_capture(overlay: &mut LearnOverlayState) {
     let step_2 = if overlay.write_armed && overlay.assist_on {
-        "Step 2: Press Enter to run write with Assist ON (calls LLM, uses tokens). Press Ctrl+A to disable Assist."
+        "Press Enter to run write with Assist ON (calls LLM, uses tokens). Ctrl+A disables Assist."
     } else if overlay.write_armed {
-        "Step 2: Press Enter to run write locally (no LLM assist call)."
+        "Press Enter to run write locally (no LLM assist call)."
     } else {
-        "Step 2: Press Enter for preview only (no write, no token use). Press Ctrl+W to arm write."
+        "Press Enter for preview only (no write, no token use). Ctrl+W arms write."
     };
     let assist = if overlay.assist_on { "ON" } else { "OFF" };
-    overlay.inline_message = Some(format!(
-        "Step 1: Review preflight (Assist {assist}). {step_2} Step 3: Press Esc to close."
-    ));
+    overlay.inline_message = Some(format!("Assist {assist}. {step_2} Esc closes."));
 }
 
 fn set_overlay_next_steps_promote(overlay: &mut LearnOverlayState) {
@@ -3712,7 +3707,7 @@ mod tests {
             .inline_message
             .as_deref()
             .unwrap_or("")
-            .contains("Step 1: Review preflight"));
+            .contains("Press Enter for preview only"));
         assert_eq!(transcript, before);
     }
 
