@@ -559,8 +559,13 @@ fn draw_learn_capture_form(
         Paragraph::new(cat_text).style(Style::default().fg(Color::Yellow)),
         rows[1],
     );
+    let summary_label = if overlay.input_focus == "capture.summary" {
+        "Summary: <required>  [active]"
+    } else {
+        "Summary: <required>"
+    };
     f.render_widget(
-        Paragraph::new("Summary: <required>").style(Style::default().fg(Color::Gray)),
+        Paragraph::new(summary_label).style(Style::default().fg(Color::Gray)),
         rows[2],
     );
     let summary = if overlay.summary.trim().is_empty() {
@@ -679,8 +684,13 @@ fn draw_learn_review_form(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let id_label = if overlay.input_focus == "review.id" {
+        "Selected ID [active]"
+    } else {
+        "Selected ID"
+    };
     let mut text = format!(
-        "Mode: list/show\n\nSelected ID: {selected}\nField focus: {}\n\nRows:\n{rows}\n\nEnter runs read-only list/show.",
+        "Mode: list/show\n\n{id_label}: {selected}\nField focus: {}\n\nRows:\n{rows}\n\nEnter runs read-only list/show.",
         overlay.input_focus
     );
     if let Some(msg) = overlay.inline_message.as_deref() {
@@ -702,8 +712,28 @@ fn draw_learn_promote_form(
     f.render_widget(block, area);
     let targets = ["check", "pack", "agents"];
     let target = targets[overlay.promote_target_idx.min(2)];
+    let id_label = if overlay.input_focus == "promote.id" {
+        "ID (required) [active]"
+    } else {
+        "ID (required)"
+    };
+    let slug_label = if overlay.input_focus == "promote.slug" {
+        "slug [active]"
+    } else {
+        "slug"
+    };
+    let pack_label = if overlay.input_focus == "promote.pack_id" {
+        "pack_id [active]"
+    } else {
+        "pack_id"
+    };
+    let replay_id_label = if overlay.input_focus == "promote.replay_run_id" {
+        "replay_verify_run_id [active]"
+    } else {
+        "replay_verify_run_id"
+    };
     let mut text = format!(
-        "ID (required): {}\nTarget: {target}\nslug: {}\npack_id: {}\n\nforce:{}  check_run:{}  replay_verify:{}  replay_verify_strict:{}\nreplay_verify_run_id: {}",
+        "{id_label}: {}\nTarget: {target}\n{slug_label}: {}\n{pack_label}: {}\n\nforce:{}  check_run:{}  replay_verify:{}  replay_verify_strict:{}\n{replay_id_label}: {}",
         if overlay.promote_id.trim().is_empty() {
             "<required>"
         } else {

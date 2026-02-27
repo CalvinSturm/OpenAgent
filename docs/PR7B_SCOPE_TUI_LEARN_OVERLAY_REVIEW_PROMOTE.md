@@ -1,4 +1,4 @@
-# PR7B Scope: `feat: complete TUI learn overlay Review + Promote tabs`
+# PR7B Scope: `feat: complete TUI learn overlay Review + Promote tabs` (Finalized)
 
 ## Goal
 

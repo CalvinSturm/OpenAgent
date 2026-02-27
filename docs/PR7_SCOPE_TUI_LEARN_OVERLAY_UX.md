@@ -1,4 +1,4 @@
-# PR7 Scope: `feat: add TUI /learn overlay UX` (Draft)
+# PR7 Scope: `feat: add TUI /learn overlay UX` (Finalized)
 
 ## Goal
 

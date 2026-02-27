@@ -197,3 +197,46 @@ Promotion event includes target metadata including target file hash.
 - keep advanced flags in advanced disclosure
 - show friendly text plus stable error code token
 - preserve CLI/backend semantics, avoid TUI-only behavior divergence
+
+## 12. Learn Overlay (TUI)
+
+Typing `/learn` opens the Learn Overlay modal with three tabs:
+
+- `[1] Capture`
+- `[2] Review`
+- `[3] Promote`
+
+### Key controls
+
+- `Esc`: close overlay
+- `1/2/3`: switch tabs
+- `Tab` / `Shift+Tab`: cycle focused input field
+- `Enter`: preview/submit current tab action
+- `w`: toggle write state (`PREVIEW` <-> `ARMED`)
+- `a`: capture assist toggle
+- Promote tab:
+  - `t`: cycle target (`check|pack|agents`)
+  - `f`: toggle `--force`
+  - `k`: toggle `--check-run`
+  - `r`: toggle `--replay-verify`
+  - `s`: toggle `--replay-verify-strict`
+  - `i`: focus promote ID input
+  - `g`: focus slug input
+  - `p`: focus pack_id input
+  - `u`: focus replay verify run-id input
+
+### Preflight/write semantics
+
+- `PREVIEW`:
+  - shows equivalent CLI + planned target metadata
+  - performs no writes
+- `ARMED`:
+  - executes using existing `/learn ...` dispatch paths
+  - preserves backend gating/validation semantics
+
+### Busy behavior
+
+When run/tool execution is active, submit attempts are rejected with:
+
+- `System busy. Operation deferred.`
+- `ERR_TUI_BUSY_TRY_AGAIN`
