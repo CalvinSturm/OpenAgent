@@ -128,6 +128,36 @@ impl Default for LearnOverlayState {
     }
 }
 
+fn cycle_overlay_focus(overlay: &mut LearnOverlayState, reverse: bool) {
+    use LearnOverlayInputFocus as F;
+    overlay.input_focus = match overlay.tab {
+        crate::chat_ui::LearnOverlayTab::Capture => F::CaptureSummary,
+        crate::chat_ui::LearnOverlayTab::Review => F::ReviewId,
+        crate::chat_ui::LearnOverlayTab::Promote => {
+            let order = [
+                F::PromoteId,
+                F::PromoteSlug,
+                F::PromotePackId,
+                F::PromoteReplayRunId,
+            ];
+            let idx = order
+                .iter()
+                .position(|v| *v == overlay.input_focus)
+                .unwrap_or(0);
+            let next = if reverse {
+                if idx == 0 {
+                    order.len() - 1
+                } else {
+                    idx - 1
+                }
+            } else {
+                (idx + 1) % order.len()
+            };
+            order[next]
+        }
+    };
+}
+
 type TuiRunFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<RunExecutionResult>> + Send>>;
 
@@ -1319,6 +1349,49 @@ fn build_learn_overlay_render_model(
     }
 }
 
+fn build_overlay_promote_submit_line(overlay: &LearnOverlayState) -> Result<String, String> {
+    if overlay.promote_id.trim().is_empty() {
+        return Err("promote id: <required>".to_string());
+    }
+    let target = match overlay.promote_target_idx {
+        0 => "check",
+        1 => "pack",
+        _ => "agents",
+    };
+    let mut line = format!("/learn promote {} --to {target}", overlay.promote_id);
+    if target == "check" {
+        if overlay.promote_slug.trim().is_empty() {
+            return Err("slug: <required for check>".to_string());
+        }
+        line.push_str(&format!(" --slug {}", overlay.promote_slug));
+    }
+    if target == "pack" {
+        if overlay.promote_pack_id.trim().is_empty() {
+            return Err("pack_id: <required for pack>".to_string());
+        }
+        line.push_str(&format!(" --pack-id {}", overlay.promote_pack_id));
+    }
+    if overlay.promote_force {
+        line.push_str(" --force");
+    }
+    if overlay.promote_check_run {
+        line.push_str(" --check-run");
+    }
+    if overlay.promote_replay_verify {
+        line.push_str(" --replay-verify");
+    }
+    if overlay.promote_replay_verify_strict {
+        line.push_str(" --replay-verify-strict");
+    }
+    if !overlay.promote_replay_verify_run_id.trim().is_empty() {
+        line.push_str(&format!(
+            " --replay-verify-run-id {}",
+            overlay.promote_replay_verify_run_id
+        ));
+    }
+    Ok(line)
+}
+
 fn handle_tui_outer_key_dispatch(
     input: TuiOuterKeyDispatchInput<'_>,
 ) -> TuiOuterKeyDispatchOutcome {
@@ -1341,6 +1414,11 @@ fn handle_tui_outer_key_dispatch(
             KeyCode::Char('3') => {
                 overlay.tab = crate::chat_ui::LearnOverlayTab::Promote;
                 overlay.input_focus = LearnOverlayInputFocus::PromoteId;
+                return TuiOuterKeyDispatchOutcome::Handled;
+            }
+            KeyCode::Tab => {
+                let reverse = input.key.modifiers.contains(KeyModifiers::SHIFT);
+                cycle_overlay_focus(overlay, reverse);
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Up => {
@@ -1497,15 +1575,6 @@ fn handle_tui_outer_key_dispatch(
                         TuiOuterKeyDispatchOutcome::Handled
                     }
                     crate::chat_ui::LearnOverlayTab::Promote => {
-                        if overlay.promote_id.trim().is_empty() {
-                            overlay.logs.push("promote id: <required>".to_string());
-                            return TuiOuterKeyDispatchOutcome::Handled;
-                        }
-                        let target = match overlay.promote_target_idx {
-                            0 => "check",
-                            1 => "pack",
-                            _ => "agents",
-                        };
                         if !overlay.write_armed {
                             overlay.logs.push(
                                 "info: Preflight check complete. Waiting for user action."
@@ -1513,43 +1582,13 @@ fn handle_tui_outer_key_dispatch(
                             );
                             return TuiOuterKeyDispatchOutcome::Handled;
                         }
-                        let mut line =
-                            format!("/learn promote {} --to {target}", overlay.promote_id);
-                        if target == "check" {
-                            if overlay.promote_slug.trim().is_empty() {
-                                overlay.logs.push("slug: <required for check>".to_string());
+                        match build_overlay_promote_submit_line(overlay) {
+                            Ok(line) => overlay.pending_submit_line = Some(line),
+                            Err(msg) => {
+                                overlay.logs.push(msg);
                                 return TuiOuterKeyDispatchOutcome::Handled;
                             }
-                            line.push_str(&format!(" --slug {}", overlay.promote_slug));
                         }
-                        if target == "pack" {
-                            if overlay.promote_pack_id.trim().is_empty() {
-                                overlay
-                                    .logs
-                                    .push("pack_id: <required for pack>".to_string());
-                                return TuiOuterKeyDispatchOutcome::Handled;
-                            }
-                            line.push_str(&format!(" --pack-id {}", overlay.promote_pack_id));
-                        }
-                        if overlay.promote_force {
-                            line.push_str(" --force");
-                        }
-                        if overlay.promote_check_run {
-                            line.push_str(" --check-run");
-                        }
-                        if overlay.promote_replay_verify {
-                            line.push_str(" --replay-verify");
-                        }
-                        if overlay.promote_replay_verify_strict {
-                            line.push_str(" --replay-verify-strict");
-                        }
-                        if !overlay.promote_replay_verify_run_id.trim().is_empty() {
-                            line.push_str(&format!(
-                                " --replay-verify-run-id {}",
-                                overlay.promote_replay_verify_run_id
-                            ));
-                        }
-                        overlay.pending_submit_line = Some(line);
                         TuiOuterKeyDispatchOutcome::Handled
                     }
                 };
@@ -2947,5 +2986,61 @@ mod tests {
         assert!(model.equivalent_cli.contains("--pack-id core"));
         assert!(model.equivalent_cli.contains("--force"));
         assert!(model.equivalent_cli.contains("--replay-verify"));
+    }
+
+    #[test]
+    fn promote_submit_line_requires_slug_for_check() {
+        let s = LearnOverlayState {
+            tab: LearnOverlayTab::Promote,
+            category_idx: 0,
+            summary: String::new(),
+            review_id: String::new(),
+            promote_id: "01ABC".to_string(),
+            promote_target_idx: 0,
+            promote_slug: String::new(),
+            promote_pack_id: String::new(),
+            promote_force: false,
+            promote_check_run: false,
+            promote_replay_verify: false,
+            promote_replay_verify_strict: false,
+            promote_replay_verify_run_id: String::new(),
+            input_focus: LearnOverlayInputFocus::PromoteSlug,
+            assist_on: false,
+            write_armed: true,
+            logs: vec![],
+            pending_submit_line: None,
+        };
+        let err = super::build_overlay_promote_submit_line(&s).expect_err("slug required");
+        assert!(err.contains("slug"));
+    }
+
+    #[test]
+    fn promote_submit_line_builds_agents_command_with_flags() {
+        let s = LearnOverlayState {
+            tab: LearnOverlayTab::Promote,
+            category_idx: 0,
+            summary: String::new(),
+            review_id: String::new(),
+            promote_id: "01ABC".to_string(),
+            promote_target_idx: 2,
+            promote_slug: String::new(),
+            promote_pack_id: String::new(),
+            promote_force: true,
+            promote_check_run: false,
+            promote_replay_verify: true,
+            promote_replay_verify_strict: true,
+            promote_replay_verify_run_id: "run_123".to_string(),
+            input_focus: LearnOverlayInputFocus::PromoteId,
+            assist_on: false,
+            write_armed: true,
+            logs: vec![],
+            pending_submit_line: None,
+        };
+        let line = super::build_overlay_promote_submit_line(&s).expect("line");
+        assert!(line.contains("/learn promote 01ABC --to agents"));
+        assert!(line.contains("--force"));
+        assert!(line.contains("--replay-verify"));
+        assert!(line.contains("--replay-verify-strict"));
+        assert!(line.contains("--replay-verify-run-id run_123"));
     }
 }
