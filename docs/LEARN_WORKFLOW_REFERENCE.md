@@ -2,17 +2,43 @@
 
 Version context: LocalAgent `v0.3.0` (2026-02-27)
 
-## 1. Mental Model
+## 1. What `/learn` is for
 
-`/learn` is a staged operator workflow for guidance/check curation:
+`/learn` is a **staged memory workflow**. It does not auto-change agent behavior.
 
-- Capture: save a candidate learning entry.
-- Review: inspect/list/archive candidates.
-- Promote: explicitly publish one candidate into a target.
+- `capture`: store a candidate learning entry.
+- `review`: inspect/list/archive entries.
+- `promote`: explicitly publish one entry into a real runtime target.
 
-A learning entry is a candidate until promoted.
+A captured entry is only a draft candidate until promoted.
 
-## 2. Command Surface (TUI + CLI parity)
+## 2. Core mental model
+
+Think of `/learn` as:
+
+1. Capture a candidate.
+2. Review/edit quality.
+3. Promote into a deterministic artifact.
+
+Reliability comes from the promotion target artifact, not from capture alone.
+
+## 3. Candidate categories (plain-language)
+
+- `workflow_hint`
+  - Reusable process pattern for future work.
+  - Example: "Before refactor, locate files with `rg`, then run targeted tests after edits."
+
+- `prompt_guidance`
+  - Guidance for agent interaction style or execution behavior.
+  - Example: "If request is ambiguous, ask one clarifying question before editing."
+
+- `check_candidate`
+  - A candidate validation/check rule.
+  - Example: "Generated check file must end with trailing newline."
+
+Category only labels intent at capture time. Promotion decides where it becomes active.
+
+## 4. Command surface (CLI and TUI parity)
 
 TUI slash commands:
 
@@ -32,49 +58,37 @@ Equivalent CLI:
 - `localagent learn capture ...`
 - `localagent learn promote ...`
 
-## 3. Primary User Flows
+## 5. Typical workflow (recommended)
 
-### 3.1 Capture candidate
-
-Example:
+### Step 1: Capture
 
 ```bash
-localagent learn capture --category prompt-guidance --summary "Prefer deterministic fixtures"
+localagent learn capture --category workflow-hint --summary "Before editing, identify exact files and run targeted tests"
 ```
 
-Assist mode:
+Assisted capture:
 
 - `--assist` = preview only (no write)
 - `--assist --write` = persist assisted draft
 
-### 3.2 Review candidate
+### Step 2: Review
 
 ```bash
 localagent learn list
 localagent learn show <id>
 ```
 
-### 3.3 Promote candidate
+### Step 3: Promote
 
-Check target:
+Pick one target:
 
 ```bash
 localagent learn promote <id> --to check --slug <slug>
-```
-
-Pack target:
-
-```bash
 localagent learn promote <id> --to pack --pack-id <pack_id>
-```
-
-Agents target:
-
-```bash
 localagent learn promote <id> --to agents
 ```
 
-Optional promote chaining/controls:
+Optional promote controls:
 
 - `--force`
 - `--check-run`
@@ -82,50 +96,106 @@ Optional promote chaining/controls:
 - `--replay-verify-run-id <run_id>`
 - `--replay-verify-strict`
 
-### 3.4 Archive candidate
+### Step 4: Archive (optional)
 
 ```bash
 localagent learn archive <id>
 ```
 
-## 4. Candidate Data Structure
+## 6. Promotion targets and what they do
 
-Persisted at:
+- `--to check`
+  - Writes `.localagent/checks/<slug>.md`
+  - Produces deterministic checks-as-code artifact
 
-- `.localagent/learn/entries/<id>.json`
+- `--to pack`
+  - Writes `.localagent/packs/<pack_id>/PACK.md`
+  - Adds guidance to pack-managed content
 
-Schema:
+- `--to agents`
+  - Writes managed section in workspace-root `AGENTS.md`
+  - Adds `LEARN-<id>` block idempotently
 
-- `schema_version` = `openagent.learning_entry.v1`
-- `id` (ULID)
-- `created_at`
-- `source` (`run_id`, `task_summary`, `profile`)
-- `category` (`workflow_hint | prompt_guidance | check_candidate`)
-- `summary`
-- `evidence[]` (`kind`, `value`, optional `hash_hex`, optional `note`)
-- `proposed_memory` (`guidance_text`, `check_text`, `tags[]`)
-- `assist` (optional assisted-capture provenance block)
-- `sensitivity_flags` (`contains_paths`, `contains_secrets_suspected`, `contains_user_data`)
-- `status` (`captured | promoted | archived`)
-- `truncations[]`
-- `entry_hash_hex`
+## 7. Files touched by `/learn`
 
-## 5. Files Touched by /learn
-
-Core files:
+Always possible:
 
 - `.localagent/learn/entries/<id>.json`
 - `.localagent/learn/events.jsonl`
 
 Promotion targets:
 
-- Check: `.localagent/checks/<slug>.md`
-- Pack: `.localagent/packs/<pack_id>/PACK.md`
-- Agents: `AGENTS.md` (workspace root)
+- `.localagent/checks/<slug>.md`
+- `.localagent/packs/<pack_id>/PACK.md`
+- `AGENTS.md`
 
-## 6. Managed AGENTS.md Structure
+## 8. Entry structure (what a candidate contains)
 
-Promote to agents inserts into a managed section:
+Persisted at `.localagent/learn/entries/<id>.json`.
+
+Key fields:
+
+- `schema_version`
+- `id`
+- `created_at`
+- `source` (run/task context)
+- `category`
+- `summary`
+- `evidence[]`
+- `proposed_memory` (`guidance_text`, `check_text`, `tags[]`)
+- `assist` (optional provenance)
+- `sensitivity_flags`
+- `status` (`captured|promoted|archived`)
+- `entry_hash_hex`
+
+## 9. TUI Learn Overlay
+
+Typing `/learn` opens modal overlay with tabs:
+
+- Capture
+- Review
+- Promote
+
+Current key controls:
+
+- `Esc` or `q`: close overlay
+- `Ctrl+1 / Ctrl+2 / Ctrl+3`: switch tabs
+- `Tab` / `Shift+Tab`: move focus between fields
+- `Enter`: preview/run depending on state
+- `Ctrl+W`: toggle write state (`PREVIEW` <-> `ARMED`)
+- Capture: `Ctrl+A` toggle assist
+- Promote:
+  - `Left/Right` target switch (`check|pack|agents`)
+  - `Ctrl+F` force
+  - `Ctrl+K` check-run
+  - `Ctrl+R` replay-verify
+  - `Ctrl+S` replay-verify-strict
+
+Write semantics:
+
+- `PREVIEW`: no writes
+- `ARMED`: executes through existing learn backend path
+
+Busy semantics:
+
+- If run/tool execution is active, learn submit is rejected with:
+  - `System busy. Operation deferred.`
+  - `ERR_TUI_BUSY_TRY_AGAIN`
+
+## 10. Status lifecycle and atomicity
+
+Lifecycle:
+
+- `captured -> promoted` on successful promote
+- `captured|promoted -> archived` via archive
+
+Atomicity guarantee (promote):
+
+- If target write fails: no status update, no promoted event emission
+
+## 11. Managed AGENTS.md behavior
+
+Promote to agents inserts deterministic managed blocks:
 
 ```md
 ## LocalAgent Learned Guidance
@@ -136,24 +206,15 @@ entry_hash_hex: <hash>
 category: <category>
 forced: <true|false>
 
-<guidance_text or deterministic placeholder>
+<guidance text>
 ```
 
 Rules:
 
-- idempotent by `LEARN-<id>` (no duplicates)
-- unmanaged content outside section preserved
+- idempotent by `LEARN-<id>` (no duplicate insertion)
+- unmanaged content outside managed section preserved
 
-## 7. Invariants UX Must Preserve
-
-- promotion is explicit (never automatic)
-- capture writes stay under `.localagent/learn/**`
-- sensitivity gating applies before promotion writes
-- managed insertion is deterministic/idempotent
-- `/learn` output goes to TUI logs pane, not assistant transcript
-- busy TUI rejects with `ERR_TUI_BUSY_TRY_AGAIN`
-
-## 8. Deterministic Error Codes
+## 12. Deterministic error codes (commonly seen)
 
 Promote:
 
@@ -172,71 +233,37 @@ TUI busy:
 
 - `ERR_TUI_BUSY_TRY_AGAIN`
 
-## 9. Status Lifecycle
+## 13. Events and auditability
 
-- `captured` -> `promoted` on successful promote
-- `captured|promoted` -> `archived` via archive
-
-Atomicity:
-
-- failed target write => no promote status update, no promoted event
-
-## 10. Events and Auditability
-
-Events appended to `.localagent/learn/events.jsonl`:
+Events append to `.localagent/learn/events.jsonl`:
 
 - `openagent.learning_captured.v1`
 - `openagent.learning_promoted.v1`
 
-Promotion event includes target metadata including target file hash.
+Promoted events include target metadata (including target file hash) for traceability.
 
-## 11. UX Design Guidance
+## 14. How to write effective candidates (quick rubric)
 
-- model as three-step flow: capture -> review -> promote
-- collect only required fields per action
-- keep advanced flags in advanced disclosure
-- show friendly text plus stable error code token
-- preserve CLI/backend semantics, avoid TUI-only behavior divergence
+To improve promotion quality, use this format while capturing:
 
-## 12. Learn Overlay (TUI)
+- Trigger: when this applies
+- Action: what to do exactly
+- Verification: how success/failure is checked
 
-Typing `/learn` opens the Learn Overlay modal with three tabs:
+If missing one of these three, the candidate is usually too weak.
 
-- `[1] Capture`
-- `[2] Review`
-- `[3] Promote`
+## 15. Troubleshooting
 
-### Key controls
+- "I captured something but behavior did not change"
+  - Capture is draft-only. Run `learn promote ...` to publish.
 
-- `Esc`: close overlay
-- `1/2/3`: switch tabs
-- `Tab` / `Shift+Tab`: cycle focused input field
-- `Enter`: preview/submit current tab action
-- `w`: toggle write state (`PREVIEW` <-> `ARMED`)
-- `a`: capture assist toggle
-- Promote tab:
-  - `t`: cycle target (`check|pack|agents`)
-  - `f`: toggle `--force`
-  - `k`: toggle `--check-run`
-  - `r`: toggle `--replay-verify`
-  - `s`: toggle `--replay-verify-strict`
-  - `i`: focus promote ID input
-  - `g`: focus slug input
-  - `p`: focus pack_id input
-  - `u`: focus replay verify run-id input
+- "Promote failed needing force"
+  - Entry flagged sensitive or target exists. Re-run with `--force` after review.
 
-### Preflight/write semantics
+- "Overlay does not run while model is active"
+  - Expected. Busy state rejects writes with `ERR_TUI_BUSY_TRY_AGAIN`.
 
-- `PREVIEW`:
-  - shows equivalent CLI + planned target metadata
-  - performs no writes
-- `ARMED`:
-  - executes using existing `/learn ...` dispatch paths
-  - preserves backend gating/validation semantics
-
-### Busy behavior
-
-When run/tool execution is active, submit attempts are rejected with:
-
-- `System busy. Operation deferred.`
-- `ERR_TUI_BUSY_TRY_AGAIN`
+- "I’m unsure which category to use"
+  - process pattern -> `workflow_hint`
+  - agent interaction guidance -> `prompt_guidance`
+  - validation rule -> `check_candidate`
