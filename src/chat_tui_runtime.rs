@@ -724,6 +724,7 @@ async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow
 struct TuiSlashCommandDispatchInput<'a> {
     line: &'a str,
     slash_menu_index: usize,
+    run_busy: bool,
     active_run: &'a mut RunArgs,
     paths: &'a store::StatePaths,
     logs: &'a mut Vec<String>,
@@ -1633,6 +1634,7 @@ async fn handle_tui_enter_submit(
         match handle_tui_slash_command(TuiSlashCommandDispatchInput {
             line: &line,
             slash_menu_index: *slash_menu_index,
+            run_busy: status.as_str() == "running",
             active_run,
             paths,
             logs,
@@ -1806,6 +1808,26 @@ async fn handle_tui_slash_command(
     input: TuiSlashCommandDispatchInput<'_>,
 ) -> anyhow::Result<SlashCommandDispatchOutcome> {
     let line = input.line;
+    if line.starts_with("/learn") {
+        if input.run_busy {
+            input.logs.push("ERR_TUI_BUSY_TRY_AGAIN".to_string());
+            *input.show_logs = true;
+            return Ok(SlashCommandDispatchOutcome::Handled);
+        }
+        match crate::tui::learn_adapter::parse_and_dispatch_learn_slash(
+            line,
+            &input.paths.state_dir,
+        ) {
+            Ok(output) => {
+                if !output.is_empty() {
+                    input.logs.push(output);
+                }
+            }
+            Err(e) => input.logs.push(format!("learn command failed: {e}")),
+        }
+        *input.show_logs = true;
+        return Ok(SlashCommandDispatchOutcome::Handled);
+    }
     let resolved = chat_commands::selected_slash_command(line, input.slash_menu_index)
         .or_else(|| chat_commands::resolve_slash_command(line))
         .unwrap_or(line);
@@ -1813,7 +1835,7 @@ async fn handle_tui_slash_command(
         "/exit" => return Ok(SlashCommandDispatchOutcome::ExitRequested),
         "/help" => {
             input.logs.push(
-                "commands: /help /mode <safe|coding|web|custom> /timeout [seconds|+N|-N|off] /params [key value] /project guidance /tool docs <name> /dismiss /clear /exit /hide tools|approvals|logs /show tools|approvals|logs|all ; slash dropdown: type / then Up/Down + Enter ; panes: Ctrl+T/Ctrl+Y/Ctrl+G (Ctrl+1/2/3 aliases, terminal-dependent) ; scroll: PgUp/PgDn, Ctrl+U/Ctrl+D, mouse wheel ; approvals: Ctrl+J/K select, Ctrl+A approve, Ctrl+X deny, Ctrl+R refresh ; history: Up/Down ; Esc quits"
+                "commands: /help /mode <safe|coding|web|custom> /timeout [seconds|+N|-N|off] /params [key value] /project guidance /tool docs <name> /learn help|list|show|archive /dismiss /clear /exit /hide tools|approvals|logs /show tools|approvals|logs|all ; slash dropdown: type / then Up/Down + Enter ; panes: Ctrl+T/Ctrl+Y/Ctrl+G (Ctrl+1/2/3 aliases, terminal-dependent) ; scroll: PgUp/PgDn, Ctrl+U/Ctrl+D, mouse wheel ; approvals: Ctrl+J/K select, Ctrl+A approve, Ctrl+X deny, Ctrl+R refresh ; history: Up/Down ; Esc quits"
                     .to_string(),
             );
             *input.show_logs = true;

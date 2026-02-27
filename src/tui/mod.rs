@@ -1,4 +1,5 @@
 pub mod input;
+pub mod learn_adapter;
 pub mod render;
 pub mod state;
 pub mod tail;
