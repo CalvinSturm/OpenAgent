@@ -1031,32 +1031,32 @@ pub fn parse_assisted_capture_draft(raw: &str) -> AssistedCaptureDraft {
     }
     if trimmed.starts_with('{') {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            let mut out = AssistedCaptureDraft::default();
-            out.category = v
-                .get("category")
-                .and_then(|x| x.as_str())
-                .map(str::trim)
-                .map(str::to_string)
-                .filter(|s| !s.is_empty());
-            out.summary = v
-                .get("summary")
-                .and_then(|x| x.as_str())
-                .map(str::trim)
-                .map(str::to_string)
-                .filter(|s| !s.is_empty());
-            out.guidance_text = v
-                .get("guidance_text")
-                .and_then(|x| x.as_str())
-                .map(str::trim)
-                .map(str::to_string)
-                .filter(|s| !s.is_empty());
-            out.check_text = v
-                .get("check_text")
-                .and_then(|x| x.as_str())
-                .map(str::trim)
-                .map(str::to_string)
-                .filter(|s| !s.is_empty());
-            return out;
+            return AssistedCaptureDraft {
+                category: v
+                    .get("category")
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty()),
+                summary: v
+                    .get("summary")
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty()),
+                guidance_text: v
+                    .get("guidance_text")
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty()),
+                check_text: v
+                    .get("check_text")
+                    .and_then(|x| x.as_str())
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty()),
+            };
         }
     }
     AssistedCaptureDraft {
