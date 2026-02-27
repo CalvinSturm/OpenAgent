@@ -33,6 +33,10 @@ pub(crate) struct LearnOverlayRenderModel {
     pub(crate) promote_replay_verify: bool,
     pub(crate) promote_replay_verify_strict: bool,
     pub(crate) promote_replay_verify_run_id: String,
+    pub(crate) input_focus: String,
+    pub(crate) inline_message: Option<String>,
+    pub(crate) review_rows: Vec<String>,
+    pub(crate) review_selected_idx: usize,
     pub(crate) assist_on: bool,
     pub(crate) write_state: LearnOverlayWriteState,
     pub(crate) equivalent_cli: String,
@@ -491,8 +495,8 @@ fn draw_learn_overlay(f: &mut ratatui::Frame<'_>, overlay: &LearnOverlayRenderMo
     }
 
     let hints = format!(
-        "Assist: {} (a) | Enter: Preview | w: Arm Write | Esc: Close | 1/2/3: Tabs",
-        if overlay.assist_on { "ON" } else { "OFF" }
+        "Assist: {} (a) | Enter: Preview/Run | w: Arm Write | t: Target | f/k/r/s: Flags | Tab: Next Field | Esc: Close | 1/2/3: Tabs",
+        if overlay.assist_on { "ON" } else { "OFF" },
     );
     f.render_widget(
         Paragraph::new(hints).style(Style::default().fg(Color::Gray)),
@@ -583,6 +587,17 @@ fn draw_learn_capture_form(
         Paragraph::new(requirement).style(Style::default().fg(Color::Gray)),
         rows[5],
     );
+    let focus_line = format!("field focus: {}", overlay.input_focus);
+    f.render_widget(
+        Paragraph::new(focus_line).style(Style::default().fg(Color::Gray)),
+        rows[9],
+    );
+    if let Some(msg) = overlay.inline_message.as_deref() {
+        f.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(Color::Red)),
+            rows[9],
+        );
+    }
     f.render_widget(Paragraph::new("▸ Advanced Parameters"), rows[6]);
     f.render_widget(Paragraph::new("▸ Proposed Memory"), rows[7]);
     f.render_widget(Paragraph::new("▸ Evidence Rows"), rows[8]);
@@ -642,14 +657,35 @@ fn draw_learn_review_form(
         .style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let text = format!(
-        "Mode: list/show\n\nSelected ID (optional for list):\n{}\n\nEnter in PREVIEW runs read-only list/show.\nARMED behaves the same for Review.",
-        if overlay.review_id.trim().is_empty() {
-            "<empty>"
-        } else {
-            overlay.review_id.as_str()
-        }
+    let selected = if overlay.review_id.trim().is_empty() {
+        "<empty>".to_string()
+    } else {
+        overlay.review_id.clone()
+    };
+    let rows = if overlay.review_rows.is_empty() {
+        "• (no rows loaded) press Enter to load list".to_string()
+    } else {
+        overlay
+            .review_rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                if i == overlay.review_selected_idx {
+                    format!("> {r}")
+                } else {
+                    format!("  {r}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut text = format!(
+        "Mode: list/show\n\nSelected ID: {selected}\nField focus: {}\n\nRows:\n{rows}\n\nEnter runs read-only list/show.",
+        overlay.input_focus
     );
+    if let Some(msg) = overlay.inline_message.as_deref() {
+        text.push_str(&format!("\n\n{msg}"));
+    }
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
@@ -666,7 +702,7 @@ fn draw_learn_promote_form(
     f.render_widget(block, area);
     let targets = ["check", "pack", "agents"];
     let target = targets[overlay.promote_target_idx.min(2)];
-    let text = format!(
+    let mut text = format!(
         "ID (required): {}\nTarget: {target}\nslug: {}\npack_id: {}\n\nforce:{}  check_run:{}  replay_verify:{}  replay_verify_strict:{}\nreplay_verify_run_id: {}",
         if overlay.promote_id.trim().is_empty() {
             "<required>"
@@ -693,6 +729,13 @@ fn draw_learn_promote_form(
             overlay.promote_replay_verify_run_id.as_str()
         }
     );
+    text.push_str(&format!(
+        "\n\nField focus: {}\nTarget switch: [t]\nEdit fields: [i]=id [g]=slug [p]=pack_id [u]=replay_run_id",
+        overlay.input_focus
+    ));
+    if let Some(msg) = overlay.inline_message.as_deref() {
+        text.push_str(&format!("\n\n{msg}"));
+    }
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 

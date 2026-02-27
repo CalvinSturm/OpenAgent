@@ -97,6 +97,9 @@ struct LearnOverlayState {
     promote_replay_verify_strict: bool,
     promote_replay_verify_run_id: String,
     input_focus: LearnOverlayInputFocus,
+    inline_message: Option<String>,
+    review_rows: Vec<String>,
+    review_selected_idx: usize,
     assist_on: bool,
     write_armed: bool,
     logs: Vec<String>,
@@ -120,6 +123,9 @@ impl Default for LearnOverlayState {
             promote_replay_verify_strict: false,
             promote_replay_verify_run_id: String::new(),
             input_focus: LearnOverlayInputFocus::CaptureSummary,
+            inline_message: None,
+            review_rows: Vec::new(),
+            review_selected_idx: 0,
             assist_on: true,
             write_armed: false,
             logs: vec!["info: Preflight check complete. Waiting for user action.".to_string()],
@@ -1336,6 +1342,10 @@ fn build_learn_overlay_render_model(
         promote_replay_verify: s.promote_replay_verify,
         promote_replay_verify_strict: s.promote_replay_verify_strict,
         promote_replay_verify_run_id: s.promote_replay_verify_run_id.clone(),
+        input_focus: learn_overlay_focus_label(s.input_focus).to_string(),
+        inline_message: s.inline_message.clone(),
+        review_rows: s.review_rows.clone(),
+        review_selected_idx: s.review_selected_idx,
         assist_on: s.assist_on,
         write_state,
         equivalent_cli,
@@ -1349,6 +1359,17 @@ fn build_learn_overlay_render_model(
     }
 }
 
+fn learn_overlay_focus_label(focus: LearnOverlayInputFocus) -> &'static str {
+    match focus {
+        LearnOverlayInputFocus::CaptureSummary => "capture.summary",
+        LearnOverlayInputFocus::ReviewId => "review.id",
+        LearnOverlayInputFocus::PromoteId => "promote.id",
+        LearnOverlayInputFocus::PromoteSlug => "promote.slug",
+        LearnOverlayInputFocus::PromotePackId => "promote.pack_id",
+        LearnOverlayInputFocus::PromoteReplayRunId => "promote.replay_run_id",
+    }
+}
+
 fn build_overlay_promote_submit_line(overlay: &LearnOverlayState) -> Result<String, String> {
     if overlay.promote_id.trim().is_empty() {
         return Err("promote id: <required>".to_string());
@@ -1358,6 +1379,15 @@ fn build_overlay_promote_submit_line(overlay: &LearnOverlayState) -> Result<Stri
         1 => "pack",
         _ => "agents",
     };
+    if overlay.promote_check_run && target != "check" {
+        return Err("check_run is only valid for --to check".to_string());
+    }
+    if (overlay.promote_replay_verify_strict
+        || !overlay.promote_replay_verify_run_id.trim().is_empty())
+        && !overlay.promote_replay_verify
+    {
+        return Err("replay strict/run-id requires --replay-verify".to_string());
+    }
     let mut line = format!("/learn promote {} --to {target}", overlay.promote_id);
     if target == "check" {
         if overlay.promote_slug.trim().is_empty() {
@@ -1404,16 +1434,19 @@ fn handle_tui_outer_key_dispatch(
             KeyCode::Char('1') => {
                 overlay.tab = crate::chat_ui::LearnOverlayTab::Capture;
                 overlay.input_focus = LearnOverlayInputFocus::CaptureSummary;
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('2') => {
                 overlay.tab = crate::chat_ui::LearnOverlayTab::Review;
                 overlay.input_focus = LearnOverlayInputFocus::ReviewId;
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('3') => {
                 overlay.tab = crate::chat_ui::LearnOverlayTab::Promote;
                 overlay.input_focus = LearnOverlayInputFocus::PromoteId;
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Tab => {
@@ -1424,12 +1457,27 @@ fn handle_tui_outer_key_dispatch(
             KeyCode::Up => {
                 if overlay.tab == crate::chat_ui::LearnOverlayTab::Capture {
                     overlay.category_idx = overlay.category_idx.saturating_sub(1);
+                } else if overlay.tab == crate::chat_ui::LearnOverlayTab::Review
+                    && !overlay.review_rows.is_empty()
+                {
+                    overlay.review_selected_idx = overlay.review_selected_idx.saturating_sub(1);
+                    if let Some(row) = overlay.review_rows.get(overlay.review_selected_idx) {
+                        overlay.review_id = row.split(" | ").next().unwrap_or("").to_string();
+                    }
                 }
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Down => {
                 if overlay.tab == crate::chat_ui::LearnOverlayTab::Capture {
                     overlay.category_idx = (overlay.category_idx + 1).min(2);
+                } else if overlay.tab == crate::chat_ui::LearnOverlayTab::Review
+                    && !overlay.review_rows.is_empty()
+                {
+                    overlay.review_selected_idx =
+                        (overlay.review_selected_idx + 1).min(overlay.review_rows.len() - 1);
+                    if let Some(row) = overlay.review_rows.get(overlay.review_selected_idx) {
+                        overlay.review_id = row.split(" | ").next().unwrap_or("").to_string();
+                    }
                 }
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
@@ -1454,12 +1502,14 @@ fn handle_tui_outer_key_dispatch(
                         overlay.promote_replay_verify_run_id.pop();
                     }
                 }
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('a') => {
                 if overlay.tab == crate::chat_ui::LearnOverlayTab::Capture {
                     overlay.assist_on = !overlay.assist_on;
                 }
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('w') => {
@@ -1469,30 +1519,35 @@ fn handle_tui_outer_key_dispatch(
                 } else {
                     "info: Write state returned to preview.".to_string()
                 });
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('f') => {
                 if overlay.tab == crate::chat_ui::LearnOverlayTab::Promote {
                     overlay.promote_force = !overlay.promote_force;
                 }
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('k') => {
                 if overlay.tab == crate::chat_ui::LearnOverlayTab::Promote {
                     overlay.promote_check_run = !overlay.promote_check_run;
                 }
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('r') => {
                 if overlay.tab == crate::chat_ui::LearnOverlayTab::Promote {
                     overlay.promote_replay_verify = !overlay.promote_replay_verify;
                 }
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('s') => {
                 if overlay.tab == crate::chat_ui::LearnOverlayTab::Promote {
                     overlay.promote_replay_verify_strict = !overlay.promote_replay_verify_strict;
                 }
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('t') => {
@@ -1504,6 +1559,7 @@ fn handle_tui_outer_key_dispatch(
                         _ => LearnOverlayInputFocus::PromoteId,
                     };
                 }
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('i') => {
@@ -1538,12 +1594,14 @@ fn handle_tui_outer_key_dispatch(
                         .logs
                         .push("System busy. Operation deferred.".to_string());
                     overlay.logs.push("ERR_TUI_BUSY_TRY_AGAIN".to_string());
+                    overlay.inline_message = Some("System busy. Operation deferred.".to_string());
                     return TuiOuterKeyDispatchOutcome::Handled;
                 }
                 return match overlay.tab {
                     crate::chat_ui::LearnOverlayTab::Capture => {
                         if overlay.summary.trim().is_empty() {
                             overlay.logs.push("summary: <required>".to_string());
+                            overlay.inline_message = Some("summary: <required>".to_string());
                             return TuiOuterKeyDispatchOutcome::Handled;
                         }
                         if overlay.write_armed {
@@ -1563,14 +1621,47 @@ fn handle_tui_outer_key_dispatch(
                         overlay.logs.push(
                             "info: Preflight check complete. Waiting for user action.".to_string(),
                         );
+                        overlay.inline_message =
+                            Some("Preflight check complete. Waiting for user action.".to_string());
                         TuiOuterKeyDispatchOutcome::Handled
                     }
                     crate::chat_ui::LearnOverlayTab::Review => {
                         if overlay.review_id.trim().is_empty() {
+                            let entries =
+                                crate::learning::list_learning_entries(&input.paths.state_dir)
+                                    .unwrap_or_default();
+                            overlay.review_rows = entries
+                                .iter()
+                                .map(|e| {
+                                    format!(
+                                        "{} | {} | {}",
+                                        e.id,
+                                        match e.status {
+                                            crate::learning::LearningStatusV1::Captured => {
+                                                "captured"
+                                            }
+                                            crate::learning::LearningStatusV1::Promoted => {
+                                                "promoted"
+                                            }
+                                            crate::learning::LearningStatusV1::Archived => {
+                                                "archived"
+                                            }
+                                        },
+                                        e.summary
+                                    )
+                                })
+                                .collect();
+                            overlay.review_selected_idx = 0;
+                            if let Some(row) = overlay.review_rows.first() {
+                                overlay.review_id =
+                                    row.split(" | ").next().unwrap_or("").to_string();
+                            }
                             overlay.pending_submit_line = Some("/learn list".to_string());
+                            overlay.inline_message = Some("Loaded list preview.".to_string());
                         } else {
                             overlay.pending_submit_line =
                                 Some(format!("/learn show {}", overlay.review_id));
+                            overlay.inline_message = Some("Prepared show preview.".to_string());
                         }
                         TuiOuterKeyDispatchOutcome::Handled
                     }
@@ -1580,12 +1671,19 @@ fn handle_tui_outer_key_dispatch(
                                 "info: Preflight check complete. Waiting for user action."
                                     .to_string(),
                             );
+                            overlay.inline_message = Some(
+                                "Preflight check complete. Waiting for user action.".to_string(),
+                            );
                             return TuiOuterKeyDispatchOutcome::Handled;
                         }
                         match build_overlay_promote_submit_line(overlay) {
-                            Ok(line) => overlay.pending_submit_line = Some(line),
+                            Ok(line) => {
+                                overlay.pending_submit_line = Some(line);
+                                overlay.inline_message = None;
+                            }
                             Err(msg) => {
-                                overlay.logs.push(msg);
+                                overlay.logs.push(msg.clone());
+                                overlay.inline_message = Some(msg);
                                 return TuiOuterKeyDispatchOutcome::Handled;
                             }
                         }
@@ -1604,6 +1702,7 @@ fn handle_tui_outer_key_dispatch(
                         overlay.promote_replay_verify_run_id.push(c)
                     }
                 }
+                overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             _ => return TuiOuterKeyDispatchOutcome::Handled,
@@ -2866,6 +2965,8 @@ pub(crate) async fn run_chat_tui(
 mod tests {
     use super::{build_learn_overlay_render_model, LearnOverlayInputFocus, LearnOverlayState};
     use crate::chat_ui::{LearnOverlayTab, LearnOverlayWriteState};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tempfile::tempdir;
 
     #[test]
     fn learn_overlay_preview_mode_shows_no_writes() {
@@ -2884,6 +2985,9 @@ mod tests {
             promote_replay_verify_strict: false,
             promote_replay_verify_run_id: String::new(),
             input_focus: LearnOverlayInputFocus::CaptureSummary,
+            inline_message: None,
+            review_rows: Vec::new(),
+            review_selected_idx: 0,
             assist_on: true,
             write_armed: false,
             logs: vec![],
@@ -2913,6 +3017,9 @@ mod tests {
             promote_replay_verify_strict: false,
             promote_replay_verify_run_id: String::new(),
             input_focus: LearnOverlayInputFocus::CaptureSummary,
+            inline_message: None,
+            review_rows: Vec::new(),
+            review_selected_idx: 0,
             assist_on: true,
             write_armed: true,
             logs: vec![],
@@ -2943,6 +3050,9 @@ mod tests {
             promote_replay_verify_strict: false,
             promote_replay_verify_run_id: String::new(),
             input_focus: LearnOverlayInputFocus::PromoteId,
+            inline_message: None,
+            review_rows: Vec::new(),
+            review_selected_idx: 0,
             assist_on: false,
             write_armed: false,
             logs: vec![],
@@ -2974,6 +3084,9 @@ mod tests {
             promote_replay_verify_strict: false,
             promote_replay_verify_run_id: String::new(),
             input_focus: LearnOverlayInputFocus::PromotePackId,
+            inline_message: None,
+            review_rows: Vec::new(),
+            review_selected_idx: 0,
             assist_on: false,
             write_armed: true,
             logs: vec![],
@@ -3005,6 +3118,9 @@ mod tests {
             promote_replay_verify_strict: false,
             promote_replay_verify_run_id: String::new(),
             input_focus: LearnOverlayInputFocus::PromoteSlug,
+            inline_message: None,
+            review_rows: Vec::new(),
+            review_selected_idx: 0,
             assist_on: false,
             write_armed: true,
             logs: vec![],
@@ -3031,6 +3147,9 @@ mod tests {
             promote_replay_verify_strict: true,
             promote_replay_verify_run_id: "run_123".to_string(),
             input_focus: LearnOverlayInputFocus::PromoteId,
+            inline_message: None,
+            review_rows: Vec::new(),
+            review_selected_idx: 0,
             assist_on: false,
             write_armed: true,
             logs: vec![],
@@ -3042,5 +3161,180 @@ mod tests {
         assert!(line.contains("--replay-verify"));
         assert!(line.contains("--replay-verify-strict"));
         assert!(line.contains("--replay-verify-run-id run_123"));
+    }
+
+    #[test]
+    fn learn_overlay_review_preview_shows_no_writes() {
+        let s = LearnOverlayState {
+            tab: LearnOverlayTab::Review,
+            category_idx: 0,
+            summary: String::new(),
+            review_id: String::new(),
+            promote_id: String::new(),
+            promote_target_idx: 0,
+            promote_slug: String::new(),
+            promote_pack_id: String::new(),
+            promote_force: false,
+            promote_check_run: false,
+            promote_replay_verify: false,
+            promote_replay_verify_strict: false,
+            promote_replay_verify_run_id: String::new(),
+            input_focus: LearnOverlayInputFocus::ReviewId,
+            inline_message: None,
+            review_rows: Vec::new(),
+            review_selected_idx: 0,
+            assist_on: false,
+            write_armed: false,
+            logs: vec![],
+            pending_submit_line: None,
+        };
+        let model = build_learn_overlay_render_model(&s);
+        assert_eq!(model.tab, LearnOverlayTab::Review);
+        assert!(!model.will_write);
+        assert!(model.writes_to.is_empty());
+        assert_eq!(model.equivalent_cli, "learn list");
+    }
+
+    #[test]
+    fn focus_cycle_promote_wraps() {
+        let mut s = LearnOverlayState {
+            tab: LearnOverlayTab::Promote,
+            category_idx: 0,
+            summary: String::new(),
+            review_id: String::new(),
+            promote_id: String::new(),
+            promote_target_idx: 0,
+            promote_slug: String::new(),
+            promote_pack_id: String::new(),
+            promote_force: false,
+            promote_check_run: false,
+            promote_replay_verify: false,
+            promote_replay_verify_strict: false,
+            promote_replay_verify_run_id: String::new(),
+            input_focus: LearnOverlayInputFocus::PromoteReplayRunId,
+            inline_message: None,
+            review_rows: Vec::new(),
+            review_selected_idx: 0,
+            assist_on: false,
+            write_armed: false,
+            logs: vec![],
+            pending_submit_line: None,
+        };
+        super::cycle_overlay_focus(&mut s, false);
+        assert_eq!(s.input_focus, LearnOverlayInputFocus::PromoteId);
+    }
+
+    #[test]
+    fn promote_submit_line_replay_strict_requires_replay_verify() {
+        let s = LearnOverlayState {
+            tab: LearnOverlayTab::Promote,
+            category_idx: 0,
+            summary: String::new(),
+            review_id: String::new(),
+            promote_id: "01ABC".to_string(),
+            promote_target_idx: 2,
+            promote_slug: String::new(),
+            promote_pack_id: String::new(),
+            promote_force: false,
+            promote_check_run: false,
+            promote_replay_verify: false,
+            promote_replay_verify_strict: true,
+            promote_replay_verify_run_id: String::new(),
+            input_focus: LearnOverlayInputFocus::PromoteId,
+            inline_message: None,
+            review_rows: Vec::new(),
+            review_selected_idx: 0,
+            assist_on: false,
+            write_armed: true,
+            logs: vec![],
+            pending_submit_line: None,
+        };
+        let err = super::build_overlay_promote_submit_line(&s).expect_err("should fail");
+        assert!(err.contains("replay strict/run-id"));
+    }
+
+    #[test]
+    fn busy_enter_logs_busy_token_for_review() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = crate::store::resolve_state_paths(tmp.path(), None, None, None, None);
+        let mut overlay = Some(LearnOverlayState {
+            tab: LearnOverlayTab::Review,
+            category_idx: 0,
+            summary: String::new(),
+            review_id: String::new(),
+            promote_id: String::new(),
+            promote_target_idx: 0,
+            promote_slug: String::new(),
+            promote_pack_id: String::new(),
+            promote_force: false,
+            promote_check_run: false,
+            promote_replay_verify: false,
+            promote_replay_verify_strict: false,
+            promote_replay_verify_run_id: String::new(),
+            input_focus: LearnOverlayInputFocus::ReviewId,
+            inline_message: None,
+            review_rows: Vec::new(),
+            review_selected_idx: 0,
+            assist_on: false,
+            write_armed: false,
+            logs: vec![],
+            pending_submit_line: None,
+        });
+        let mut input_buf = String::new();
+        let mut prompt_history = Vec::new();
+        let mut history_idx = None;
+        let mut slash_menu_index = 0usize;
+        let mut palette_open = false;
+        let palette_items = ["a"];
+        let mut palette_selected = 0usize;
+        let mut search_mode = false;
+        let mut search_query = String::new();
+        let mut search_line_cursor = 0usize;
+        let mut transcript: Vec<(String, String)> = Vec::new();
+        let mut streaming = String::new();
+        let mut transcript_scroll = 0usize;
+        let mut follow_output = true;
+        let mut ui_state = crate::tui::state::UiState::new(100);
+        let mut show_tools = false;
+        let mut show_approvals = false;
+        let mut show_logs = false;
+        let mut compact_tools = true;
+        let mut tools_selected = 0usize;
+        let mut tools_focus = true;
+        let mut approvals_selected = 0usize;
+        let mut logs = Vec::new();
+        let out = super::handle_tui_outer_key_dispatch(super::TuiOuterKeyDispatchInput {
+            key: KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            learn_overlay: &mut overlay,
+            run_busy: true,
+            input: &mut input_buf,
+            prompt_history: &mut prompt_history,
+            history_idx: &mut history_idx,
+            slash_menu_index: &mut slash_menu_index,
+            palette_open: &mut palette_open,
+            palette_items: &palette_items,
+            palette_selected: &mut palette_selected,
+            search_mode: &mut search_mode,
+            search_query: &mut search_query,
+            search_line_cursor: &mut search_line_cursor,
+            transcript: &mut transcript,
+            streaming_assistant: &mut streaming,
+            transcript_scroll: &mut transcript_scroll,
+            follow_output: &mut follow_output,
+            ui_state: &mut ui_state,
+            visible_tool_count: 0,
+            show_tools: &mut show_tools,
+            show_approvals: &mut show_approvals,
+            show_logs: &mut show_logs,
+            compact_tools: &mut compact_tools,
+            tools_selected: &mut tools_selected,
+            tools_focus: &mut tools_focus,
+            approvals_selected: &mut approvals_selected,
+            paths: &paths,
+            logs: &mut logs,
+        });
+        assert!(matches!(out, super::TuiOuterKeyDispatchOutcome::Handled));
+        let ov = overlay.expect("overlay");
+        assert!(ov.logs.iter().any(|l| l.contains("ERR_TUI_BUSY_TRY_AGAIN")));
     }
 }
