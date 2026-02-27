@@ -41,7 +41,7 @@ Reliability comes from the promotion target artifact, not from capture alone.
 
 Category only labels intent at capture time. Promotion decides where it becomes active.
 
-## 4. Command surface (CLI and TUI parity)
+## 4. Command surface (CLI and TUI slash parity)
 
 TUI slash commands:
 
@@ -60,6 +60,11 @@ Equivalent CLI:
 - `localagent learn archive <id>`
 - `localagent learn capture ...`
 - `localagent learn promote ...`
+
+Note:
+
+- TUI typed slash commands (`/learn ...`) support the same argument surface as CLI.
+- The TUI Learn Overlay UI intentionally exposes only core promote controls for beginner UX; advanced promote flags are available via typed slash/CLI.
 
 ## 5. Typical workflow (recommended)
 
@@ -170,9 +175,10 @@ Current key controls:
 - Promote:
   - `Left/Right` target switch (`check|pack|agents`)
   - `Ctrl+F` force
-  - `Ctrl+K` check-run
-  - `Ctrl+R` replay-verify
-  - `Ctrl+S` replay-verify-strict
+
+Promote advanced flags:
+
+- `--check-run`, `--replay-verify`, `--replay-verify-run-id`, and `--replay-verify-strict` remain available via typed `/learn promote ...` (or `localagent learn promote ...`), not overlay keybind toggles.
 
 Write semantics:
 

@@ -276,6 +276,7 @@ fn render_tui_learn_help() -> String {
         "/learn archive <id>",
         "/learn capture --category <...> --summary <...> [--assist] [--write] ...",
         "/learn promote <id> --to <check|pack|agents> [target flags] [--force] [--check-run] [--replay-verify ...]",
+        "note: overlay Promote tab is simplified (target + force + arm/run). Use typed /learn promote for advanced flags.",
     ]
     .join("\n")
 }
@@ -694,6 +695,60 @@ mod tests {
             .join("checks")
             .join("tui_check.md")
             .exists());
+    }
+
+    #[tokio::test]
+    async fn promote_check_passthrough_emits_expected_telemetry_receipt_shape() {
+        let tmp = tempdir().expect("tempdir");
+        let state_paths = crate::store::resolve_state_paths(tmp.path(), None, None, None, None);
+        let mut e = learning::capture_learning_entry(
+            &state_paths.state_dir,
+            learning::CaptureLearningInput {
+                category: learning::LearningCategoryV1::CheckCandidate,
+                summary: "Ensure telemetry event contract remains stable".to_string(),
+                check_text: Some("Check body".to_string()),
+                ..learning::CaptureLearningInput::default()
+            },
+        )
+        .expect("capture")
+        .entry;
+        e.entry_hash_hex = learning::compute_entry_hash_hex(&e).expect("hash");
+        crate::store::write_json_atomic(
+            &learning::learning_entry_path(&state_paths.state_dir, &e.id),
+            &e,
+        )
+        .expect("rewrite");
+        let run = sample_run_args();
+        let output = parse_and_dispatch_learn_slash(
+            &format!("/learn promote {} --to check --slug tui_receipt", e.id),
+            &run,
+            &state_paths,
+        )
+        .await
+        .expect("promote");
+        assert!(output.contains("Promoted learning"));
+
+        let events_path = learning::learning_events_path(&state_paths.state_dir);
+        let raw = fs::read_to_string(events_path).expect("read events");
+        let last = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .expect("event line");
+        let v: serde_json::Value = serde_json::from_str(last).expect("parse event");
+        assert_eq!(v["kind"], "learning_promoted");
+        assert_eq!(
+            v["data"]["schema"],
+            learning::LEARNING_PROMOTED_SCHEMA_V1
+        );
+        assert_eq!(v["data"]["learning_id"], e.id);
+        assert_eq!(v["data"]["target"], "check");
+        assert_eq!(v["data"]["slug"], "tui_receipt");
+        assert!(v["data"]["target_file_sha256_hex"]
+            .as_str()
+            .unwrap_or("")
+            .len()
+            > 0);
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use clap::Parser;
 
 use tempfile::tempdir;
 
@@ -18,6 +19,7 @@ use crate::types::{GenerateRequest, GenerateResponse, Message, Role};
 use super::{DockerNetwork, ProviderKind};
 
 use crate::{ops_helpers, provider_runtime};
+use crate::{Cli, Commands};
 
 struct CaptureSink {
     events: Arc<Mutex<Vec<crate::events::Event>>>,
@@ -874,4 +876,26 @@ fn default_run_args() -> super::RunArgs {
         resolved_reliability_profile_source: None,
         resolved_reliability_profile_hash_hex: None,
     }
+}
+
+#[test]
+fn cli_parse_version_and_chat_with_windows_style_argv0() {
+    let argv0 = r"C:\Users\Calvin\Software Projects\LocalAgent\target\debug\localagent.exe";
+    let cli_version = Cli::parse_from([argv0, "version"]);
+    assert!(matches!(cli_version.command, Some(Commands::Version(_))));
+
+    let cli_chat = Cli::parse_from([argv0, "chat"]);
+    assert!(matches!(cli_chat.command, Some(Commands::Chat(_))));
+}
+
+#[test]
+fn cli_parse_version_with_os_strings() {
+    let argv = vec![
+        std::ffi::OsString::from(
+            r"C:\Users\Calvin\Software Projects\LocalAgent\target\debug\localagent.exe",
+        ),
+        std::ffi::OsString::from("version"),
+    ];
+    let cli = Cli::parse_from(argv);
+    assert!(matches!(cli.command, Some(Commands::Version(_))));
 }

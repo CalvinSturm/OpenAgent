@@ -33,6 +33,7 @@ Release date: 2026-02-27
 - Added `/learn help`, `/learn list`, `/learn show <id>`, `/learn archive <id>`.
 - Added `/learn capture ...` and `/learn promote ...` passthrough with deterministic quoting/tokenization handling.
 - Added busy-state rejection behavior for slash commands during active run/tool work.
+- Promote overlay UX is intentionally beginner-focused (`target` + `force` + arm/run). Advanced promote flags (`--check-run`, `--replay-verify*`) remain available via typed `/learn promote ...` and CLI.
 
 ### Reliability Fixes
 

@@ -157,10 +157,24 @@ pub(crate) use store::{resolve_state_paths, stable_path_string};
 
 pub(crate) use trust::approvals::ApprovalsStore;
 
-#[tokio::main]
-
-async fn main() -> anyhow::Result<()> {
-    cli_dispatch::run_cli().await
+fn main() -> anyhow::Result<()> {
+    let join = std::thread::Builder::new()
+        .name("localagent-main".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| -> anyhow::Result<()> {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(anyhow::Error::from)?;
+            rt.block_on(cli_dispatch::run_cli())
+        })
+        .map_err(anyhow::Error::from)?;
+    match join.join() {
+        Ok(res) => res,
+        Err(_) => Err(anyhow::anyhow!(
+            "localagent main thread panicked during startup"
+        )),
+    }
 }
 
 #[cfg(test)]

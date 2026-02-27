@@ -103,6 +103,9 @@ struct LearnOverlayState {
     write_armed: bool,
     logs: Vec<String>,
     pending_submit_line: Option<String>,
+    assist_summary: Option<String>,
+    summary_choice: crate::chat_ui::LearnOverlaySummaryChoice,
+    selected_summary: Option<String>,
 }
 
 impl Default for LearnOverlayState {
@@ -129,6 +132,9 @@ impl Default for LearnOverlayState {
             write_armed: false,
             logs: vec!["info: Preflight check complete. Waiting for user action.".to_string()],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         }
     }
 }
@@ -191,6 +197,28 @@ fn set_overlay_next_steps_promote(overlay: &mut LearnOverlayState) {
     overlay.inline_message = Some(format!(
         "Step 1: Confirm target + required fields. {step_2} Step 3: Press Esc to close."
     ));
+}
+
+fn assist_summary_stub(summary: &str) -> String {
+    if summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Refined summary: {}",
+            summary.trim().replace('"', "'").replace("\\", "")
+        )
+    }
+}
+
+fn overlay_effective_summary(overlay: &LearnOverlayState) -> String {
+    match overlay.summary_choice {
+        crate::chat_ui::LearnOverlaySummaryChoice::Assist => overlay
+            .assist_summary
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| overlay.summary.clone()),
+        _ => overlay.summary.clone(),
+    }
 }
 
 type TuiRunFuture =
@@ -1493,6 +1521,9 @@ fn build_learn_overlay_render_model(
         sensitivity_secrets: false,
         sensitivity_userdata: false,
         overlay_logs: s.logs.clone(),
+        assist_summary: s.assist_summary.clone(),
+        summary_choice: s.summary_choice,
+        selected_summary: s.selected_summary.clone(),
     }
 }
 
@@ -1651,6 +1682,34 @@ fn handle_tui_outer_key_dispatch(
                 }
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
+            KeyCode::Char('g') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if overlay.summary.trim().is_empty() {
+                    overlay.inline_message =
+                        Some("Enter a summary first before asking for an assist.".to_string());
+                } else {
+                    overlay.assist_summary = Some(assist_summary_stub(&overlay.summary));
+                    overlay.summary_choice = crate::chat_ui::LearnOverlaySummaryChoice::Assist;
+                    overlay.inline_message =
+                        Some("Assist rewrite ready; use Ctrl+O or Ctrl+R to compare.".to_string());
+                }
+                return TuiOuterKeyDispatchOutcome::Handled;
+            }
+            KeyCode::Char('o') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+                overlay.summary_choice = crate::chat_ui::LearnOverlaySummaryChoice::Original;
+                overlay.inline_message = Some("Original summary selected.".to_string());
+                return TuiOuterKeyDispatchOutcome::Handled;
+            }
+            KeyCode::Char('r') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if overlay.assist_summary.is_some() {
+                    overlay.summary_choice = crate::chat_ui::LearnOverlaySummaryChoice::Assist;
+                    overlay.inline_message = Some("Assist summary selected.".to_string());
+                } else {
+                    overlay.inline_message = Some(
+                        "Generate an assist summary with Ctrl+G before selecting it.".to_string(),
+                    );
+                }
+                return TuiOuterKeyDispatchOutcome::Handled;
+            }
             KeyCode::Char('w') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
                 overlay.write_armed = !overlay.write_armed;
                 if overlay.write_armed {
@@ -1674,54 +1733,6 @@ fn handle_tui_outer_key_dispatch(
                 }
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
-            KeyCode::Char('f') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if overlay.tab == crate::chat_ui::LearnOverlayTab::Promote {
-                    overlay.promote_force = !overlay.promote_force;
-                }
-                overlay.inline_message = None;
-                return TuiOuterKeyDispatchOutcome::Handled;
-            }
-            KeyCode::Char('k') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
-                overlay.inline_message = Some(
-                    "Promote overlay keeps core options only. Use Ctrl+W then Enter to run."
-                        .to_string(),
-                );
-                return TuiOuterKeyDispatchOutcome::Handled;
-            }
-            KeyCode::Char('r') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
-                overlay.inline_message = Some(
-                    "Promote overlay keeps core options only. Use Ctrl+W then Enter to run."
-                        .to_string(),
-                );
-                return TuiOuterKeyDispatchOutcome::Handled;
-            }
-            KeyCode::Char('s') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
-                overlay.inline_message = Some(
-                    "Promote overlay keeps core options only. Use Ctrl+W then Enter to run."
-                        .to_string(),
-                );
-                return TuiOuterKeyDispatchOutcome::Handled;
-            }
-            KeyCode::Left | KeyCode::Right => {
-                if overlay.tab == crate::chat_ui::LearnOverlayTab::Promote {
-                    if matches!(input.key.code, KeyCode::Left) {
-                        overlay.promote_target_idx = if overlay.promote_target_idx == 0 {
-                            2
-                        } else {
-                            overlay.promote_target_idx - 1
-                        };
-                    } else {
-                        overlay.promote_target_idx = (overlay.promote_target_idx + 1) % 3;
-                    }
-                    overlay.input_focus = match overlay.promote_target_idx {
-                        0 => LearnOverlayInputFocus::PromoteSlug,
-                        1 => LearnOverlayInputFocus::PromotePackId,
-                        _ => LearnOverlayInputFocus::PromoteId,
-                    };
-                }
-                overlay.inline_message = None;
-                return TuiOuterKeyDispatchOutcome::Handled;
-            }
             KeyCode::Enter => {
                 if input.run_busy {
                     push_overlay_log_unique(overlay, "System busy. Operation deferred.");
@@ -1736,6 +1747,7 @@ fn handle_tui_outer_key_dispatch(
                             overlay.inline_message = Some("summary: <required>".to_string());
                             return TuiOuterKeyDispatchOutcome::Handled;
                         }
+                        overlay.selected_summary = Some(overlay_effective_summary(overlay));
                         if overlay.write_armed {
                             let category = match overlay.category_idx {
                                 0 => "workflow-hint",
@@ -1830,11 +1842,17 @@ fn handle_tui_outer_key_dispatch(
             }
             KeyCode::Char(c) if chat_runtime::is_text_input_mods(input.key.modifiers) => {
                 match overlay.input_focus {
-                    LearnOverlayInputFocus::CaptureSummary => append_overlay_field_bounded(
-                        &mut overlay.summary,
-                        &c.to_string(),
-                        OVERLAY_CAPTURE_SUMMARY_MAX_CHARS,
-                    ),
+                    LearnOverlayInputFocus::CaptureSummary => {
+                        append_overlay_field_bounded(
+                            &mut overlay.summary,
+                            &c.to_string(),
+                            OVERLAY_CAPTURE_SUMMARY_MAX_CHARS,
+                        );
+                        overlay.assist_summary = None;
+                        overlay.summary_choice =
+                            crate::chat_ui::LearnOverlaySummaryChoice::Original;
+                        overlay.selected_summary = None;
+                    }
                     LearnOverlayInputFocus::ReviewId => {
                         append_overlay_field_bounded(
                             &mut overlay.review_id,
@@ -3159,6 +3177,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         };
         let model = build_learn_overlay_render_model(&s);
         assert_eq!(model.write_state, LearnOverlayWriteState::Preview);
@@ -3191,6 +3212,9 @@ mod tests {
             write_armed: true,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         };
         let model = build_learn_overlay_render_model(&s);
         assert_eq!(model.write_state, LearnOverlayWriteState::Armed);
@@ -3224,6 +3248,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         };
         let model = build_learn_overlay_render_model(&s);
         assert!(!model.will_write);
@@ -3258,6 +3285,9 @@ mod tests {
             write_armed: true,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         };
         let model = build_learn_overlay_render_model(&s);
         assert!(model.will_write);
@@ -3292,6 +3322,9 @@ mod tests {
             write_armed: true,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         };
         let err = super::build_overlay_promote_submit_line(&s).expect_err("slug required");
         assert!(err.contains("slug"));
@@ -3321,6 +3354,9 @@ mod tests {
             write_armed: true,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         };
         let line = super::build_overlay_promote_submit_line(&s).expect("line");
         assert!(line.contains("/learn promote 01ABC --to agents"));
@@ -3354,6 +3390,9 @@ mod tests {
             write_armed: true,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         };
         let err = super::build_overlay_promote_submit_line(&s).expect_err("pack_id required");
         assert!(err.contains("pack_id"));
@@ -3383,6 +3422,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         };
         let model = build_learn_overlay_render_model(&s);
         assert_eq!(model.tab, LearnOverlayTab::Review);
@@ -3415,6 +3457,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         };
         super::cycle_overlay_focus(&mut s, false);
         assert_eq!(s.input_focus, LearnOverlayInputFocus::PromoteId);
@@ -3444,6 +3489,9 @@ mod tests {
             write_armed: true,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         };
         let err = super::build_overlay_promote_submit_line(&s).expect_err("should fail");
         assert!(err.contains("replay strict/run-id"));
@@ -3475,6 +3523,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         });
         let mut input_buf = String::new();
         let mut prompt_history = Vec::new();
@@ -3560,6 +3611,9 @@ mod tests {
             write_armed: true,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         });
         let mut input_buf = String::new();
         let mut prompt_history = Vec::new();
@@ -3645,6 +3699,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         });
         let mut input_buf = String::new();
         let mut prompt_history = Vec::new();
@@ -3737,6 +3794,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         });
         let mut input_buf = String::new();
         let mut prompt_history = Vec::new();
@@ -3828,6 +3888,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         });
         let mut input_buf = String::new();
         let mut prompt_history = Vec::new();
@@ -3912,6 +3975,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         });
         let mut input_buf = String::new();
         let mut prompt_history = Vec::new();
@@ -4037,6 +4103,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         });
         let mut input = String::new();
         let mut history_idx = None;
@@ -4084,6 +4153,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         });
         let mut input_buf = String::new();
         let mut prompt_history = Vec::new();
@@ -4200,6 +4272,9 @@ mod tests {
             write_armed: false,
             logs: vec![],
             pending_submit_line: None,
+            assist_summary: None,
+            summary_choice: crate::chat_ui::LearnOverlaySummaryChoice::Original,
+            selected_summary: None,
         });
         let mut input_buf = String::new();
         let mut prompt_history = Vec::new();

@@ -7,7 +7,9 @@ Older releases may appear in `docs/release-notes/` before they are backfilled he
 
 ## Unreleased
 
-- No unreleased changes yet.
+- Docs alignment:
+  - Clarified that TUI Learn Promote overlay is intentionally beginner-focused (`target` + `force` + arm/run).
+  - Clarified that advanced promote flags remain available via typed `/learn promote ...` and CLI.
 
 ## v0.3.0 - 2026-02-27
 

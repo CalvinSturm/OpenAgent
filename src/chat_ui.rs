@@ -18,6 +18,12 @@ pub(crate) enum LearnOverlayWriteState {
     Armed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LearnOverlaySummaryChoice {
+    Original,
+    Assist,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LearnOverlayRenderModel {
     pub(crate) tab: LearnOverlayTab,
@@ -43,6 +49,9 @@ pub(crate) struct LearnOverlayRenderModel {
     pub(crate) sensitivity_secrets: bool,
     pub(crate) sensitivity_userdata: bool,
     pub(crate) overlay_logs: Vec<String>,
+    pub(crate) assist_summary: Option<String>,
+    pub(crate) summary_choice: LearnOverlaySummaryChoice,
+    pub(crate) selected_summary: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -547,30 +556,30 @@ fn draw_learn_capture_form(
         .style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let rows = Layout::default()
+    let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(2),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
+            Constraint::Length(5), // category panel
+            Constraint::Min(8),    // summary + assist
+            Constraint::Length(5), // receipt
         ])
         .split(inner);
     let step_lines = [
         "Step 1: Enter summary.",
-        "Step 2: Enter = preview only (no write, no token use).",
-        "Step 3: Ctrl+W to arm write; with Assist ON, running write calls the LLM and uses tokens.",
+        "Step 2: Preview only; Ctrl+W arms write.",
+        "Step 3: Assist runs if ON",
     ]
     .join("\n");
+    let category_section = sections[0];
+    let category_inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(3)])
+        .split(category_section);
     f.render_widget(
-        Paragraph::new(step_lines)
+        Paragraph::new(step_lines.clone())
             .style(Style::default().fg(Color::Gray))
             .wrap(Wrap { trim: false }),
-        rows[0],
+        category_inner[0],
     );
     let categories = ["workflow_hint", "prompt_guidance", "check_candidate"];
     let category_tokens = categories
@@ -578,33 +587,40 @@ fn draw_learn_capture_form(
         .enumerate()
         .map(|(idx, c)| {
             if idx == overlay.selected_category_idx {
-                format!("> {c} <")
+                format!("> {c}")
             } else {
                 c.to_string()
             }
         })
         .collect::<Vec<_>>()
         .join("  ");
-    let category_help = match overlay.selected_category_idx {
-        0 => "workflow_hint: reusable process/pattern to follow next time",
-        1 => "prompt_guidance: prompting instruction that improves tool/model behavior",
-        _ => "check_candidate: candidate check to promote into .localagent/checks/",
-    };
-    let cat_text = format!("Category [Up/Down]: {}\n{}", category_tokens, category_help);
     f.render_widget(
-        Paragraph::new(soft_break_long_tokens(
-            &cat_text,
-            rows[1].width.saturating_sub(1) as usize,
-        ))
-        .wrap(Wrap { trim: true })
-        .style(Style::default().fg(Color::Yellow)),
-        rows[1],
+        Paragraph::new(category_tokens)
+            .style(Style::default().fg(Color::Yellow))
+            .wrap(Wrap { trim: true }),
+        category_inner[1],
     );
+    let summary_section = sections[1];
+    let summary_inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(2),
+        ])
+        .split(summary_section);
     let summary_active = overlay.input_focus == "capture.summary";
     let summary_label = if summary_active {
-        "Summary: <required>  [active]"
+        if overlay.summary.trim().is_empty() {
+            "Summary (example: Document dependency upgrades) [active]"
+        } else {
+            "Summary [active]"
+        }
+    } else if overlay.summary.trim().is_empty() {
+        "Summary (example: Document dependency upgrades)"
     } else {
-        "Summary: <required>"
+        "Summary"
     };
     f.render_widget(
         Paragraph::new(summary_label)
@@ -614,15 +630,18 @@ fn draw_learn_capture_form(
                 Color::Gray
             }))
             .wrap(Wrap { trim: false }),
-        rows[2],
+        summary_inner[0],
     );
-    let summary = if overlay.summary.trim().is_empty() {
-        "< Enter concise summary here... >".to_string()
+    let summary_text = if overlay.summary.trim().is_empty() {
+        "< Document the dependency upgrade process to avoid regressions >".to_string()
     } else {
-        right_fit_single_line(&overlay.summary, rows[3].width.saturating_sub(4) as usize)
+        right_fit_single_line(
+            &overlay.summary,
+            summary_inner[1].width.saturating_sub(4) as usize,
+        )
     };
     f.render_widget(
-        Paragraph::new(summary)
+        Paragraph::new(summary_text)
             .style(Style::default().fg(if summary_active {
                 Color::Yellow
             } else {
@@ -634,43 +653,33 @@ fn draw_learn_capture_form(
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::DarkGray)),
             ),
-        rows[3],
+        summary_inner[1],
     );
-    let requirement = if overlay.summary.trim().is_empty() {
-        "summary: <required>"
-    } else {
-        "summary: ok"
-    };
-    let focus_line = format!("{requirement}  |  field focus: {}", overlay.input_focus);
     f.render_widget(
-        Paragraph::new(focus_line)
+        Paragraph::new(
+            "Agent assist comparison: press Ctrl+W to arm, Enter to preview vs agent rewrite",
+        )
+        .style(Style::default().fg(Color::Gray))
+        .wrap(Wrap { trim: false }),
+        summary_inner[2],
+    );
+    f.render_widget(
+        Paragraph::new("Agent rewrite placeholder | Original vs Assist selection will appear here")
             .style(Style::default().fg(Color::Gray))
             .wrap(Wrap { trim: false }),
-        rows[4],
+        summary_inner[3],
     );
-    if let Some(msg) = overlay.inline_message.as_deref() {
-        let msg_wrapped = soft_break_long_tokens(msg, rows[5].width.saturating_sub(1) as usize);
-        let msg_style = if msg.contains("<required>")
-            || msg.contains("ERR_")
-            || msg.to_ascii_lowercase().contains("failed")
-            || msg.to_ascii_lowercase().contains("error")
-        {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default().fg(Color::Yellow)
-        };
-        f.render_widget(
-            Paragraph::new(msg_wrapped)
-                .wrap(Wrap { trim: true })
-                .style(msg_style),
-            rows[5],
-        );
-    }
+    let receipt_section = sections[2];
+    let receipt_text = overlay
+        .selected_summary
+        .as_deref()
+        .map(|s| format!("Receipt: {s}"))
+        .unwrap_or_else(|| "Receipt: Choose summary and press Enter to confirm.".to_string());
     f.render_widget(
-        Paragraph::new("▸ Advanced Parameters  ▸ Proposed Memory  ▸ Evidence Rows")
-            .style(Style::default().fg(Color::Gray))
+        Paragraph::new(receipt_text)
+            .style(Style::default().fg(Color::Yellow))
             .wrap(Wrap { trim: false }),
-        rows[6],
+        receipt_section,
     );
 }
 
