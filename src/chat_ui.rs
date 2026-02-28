@@ -430,16 +430,20 @@ pub(crate) fn draw_chat_frame(
     }
 
     if let Some(overlay) = learn_overlay {
-        draw_learn_overlay(f, overlay);
+        draw_learn_overlay(f, overlay, ui_tick);
     }
 }
 
-fn draw_learn_overlay(f: &mut ratatui::Frame<'_>, overlay: &LearnOverlayRenderModel) {
+fn draw_learn_overlay(
+    f: &mut ratatui::Frame<'_>,
+    overlay: &LearnOverlayRenderModel,
+    ui_tick: u64,
+) {
     let area = centered_rect(92, 86, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
         Block::default()
-            .title(" LEARN OVERLAY ")
+            .title(" Learn Overlay ")
             .borders(Borders::ALL)
             .style(Style::default().fg(Color::Yellow)),
         area,
@@ -494,10 +498,15 @@ fn draw_learn_overlay(f: &mut ratatui::Frame<'_>, overlay: &LearnOverlayRenderMo
     }
 
     let action_hint = match overlay.tab {
-        LearnOverlayTab::Capture => format!(
-            "Capture: Enter Save | Ctrl+A Assist:{} | Ctrl+G Generate | Ctrl+O/R Pick | Tab Field | Esc Close",
-            if overlay.assist_on { "ON" } else { "OFF" },
-        ),
+        LearnOverlayTab::Capture => {
+            if overlay.assist_on {
+                "Capture: Enter Save+Enhance | Ctrl+A Assist:ON | Ctrl+G Generate | Ctrl+O/R Pick | Tab Field | Esc Close"
+                    .to_string()
+            } else {
+                "Capture: Enter Save | Ctrl+A Assist:OFF | Ctrl+G Generate | Ctrl+O/R Pick | Tab Field | Esc Close"
+                    .to_string()
+            }
+        }
         LearnOverlayTab::Review => {
             "Review: Enter List/Show | Up/Down Rows | Tab Field | Esc Close"
                 .to_string()
@@ -512,14 +521,41 @@ fn draw_learn_overlay(f: &mut ratatui::Frame<'_>, overlay: &LearnOverlayRenderMo
         .last()
         .cloned()
         .unwrap_or_else(|| "learn ready".to_string());
-    let status_line = format!("{action_hint}  |  Last: {last_log}");
-    let status_line_wrapped = soft_break_long_tokens(&status_line, outer[3].width as usize);
-    f.render_widget(
-        Paragraph::new(status_line_wrapped)
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(Color::Gray)),
-        outer[3],
-    );
+    if overlay.inline_message.as_deref() == Some("Enhancing summary") {
+        let wave = ["▁", "▂", "▃", "▄", "▅", "▄", "▃", "▂"];
+        let phase = ((ui_tick / 3) % wave.len() as u64) as usize;
+        let dots = ".".repeat(((ui_tick / 6) % 4) as usize);
+        let glow_style = Style::default().fg(match phase {
+            0 | 1 => Color::Blue,
+            2 | 3 => Color::Cyan,
+            4 | 5 => Color::White,
+            _ => Color::Blue,
+        });
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(wave[phase], glow_style),
+                Span::raw(" "),
+                Span::styled(
+                    format!("Enhancing summary{dots}"),
+                    Style::default().fg(Color::Blue),
+                ),
+                Span::raw("  |  "),
+                Span::styled(format!("Last: {last_log}"), Style::default().fg(Color::Gray)),
+            ]))
+            .wrap(Wrap { trim: false }),
+            outer[3],
+        );
+    } else {
+        let primary = overlay.inline_message.as_deref().unwrap_or(&action_hint);
+        let status_line = format!("{primary}  |  Last: {last_log}");
+        let status_line_wrapped = soft_break_long_tokens(&status_line, outer[3].width as usize);
+        f.render_widget(
+            Paragraph::new(status_line_wrapped)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(Color::Gray)),
+            outer[3],
+        );
+    }
 }
 
 fn draw_learn_capture_form(
@@ -550,7 +586,7 @@ fn draw_learn_capture_form(
     let category_section = sections[0];
     let category_inner = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(3)])
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
         .split(category_section);
     f.render_widget(
         Paragraph::new(step_lines.clone())
@@ -563,22 +599,24 @@ fn draw_learn_capture_form(
         ("prompt_guidance", "guidance"),
         ("check_candidate", "check"),
     ];
-    let mut category_spans: Vec<Span<'static>> = Vec::new();
+    let mut category_lines: Vec<Line<'static>> = Vec::new();
     for (idx, (_value, label)) in categories.iter().enumerate() {
         let selected = idx == overlay.selected_category_idx;
-        let token = format!("[ {label} ]");
-        let style = if selected {
-            Style::default().fg(Color::Black).bg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        category_spans.push(Span::styled(token, style));
-        if idx + 1 < categories.len() {
-            category_spans.push(Span::raw("  "));
-        }
+        let prefix = if selected { "> " } else { "  " };
+        category_lines.push(Line::from(vec![
+            Span::raw(prefix),
+            Span::styled(
+                format!("[ {label} ]"),
+                if selected {
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ),
+        ]));
     }
     f.render_widget(
-        Paragraph::new(Line::from(category_spans)).wrap(Wrap { trim: true }),
+        Paragraph::new(category_lines).wrap(Wrap { trim: false }),
         category_inner[1],
     );
     let summary_section = sections[1];

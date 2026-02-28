@@ -197,6 +197,14 @@ fn assist_summary_stub(summary: &str) -> String {
     }
 }
 
+fn overlay_pending_message_for_submit(line: &str) -> Option<&'static str> {
+    if line.starts_with("/learn capture") && line.contains("--assist") {
+        Some("Enhancing summary")
+    } else {
+        None
+    }
+}
+
 fn overlay_effective_summary(overlay: &LearnOverlayState) -> String {
     match overlay.summary_choice {
         crate::chat_ui::LearnOverlaySummaryChoice::Assist => overlay
@@ -3153,21 +3161,111 @@ pub(crate) async fn run_chat_tui(
                     TuiOuterEventDispatchOutcome::BreakLoop => break,
                     TuiOuterEventDispatchOutcome::ContinueLoop => continue,
                     TuiOuterEventDispatchOutcome::HandledKey => {
-                        if let Some(overlay) = learn_overlay.as_mut() {
-                            if let Some(line) = overlay.pending_submit_line.take() {
-                                match crate::chat_tui_learn_adapter::parse_and_dispatch_learn_slash(
+                        let pending_line = learn_overlay
+                            .as_mut()
+                            .and_then(|overlay| overlay.pending_submit_line.take());
+                        if let Some(line) = pending_line {
+                            if let Some(msg) = overlay_pending_message_for_submit(&line) {
+                                if let Some(overlay) = learn_overlay.as_mut() {
+                                    overlay.inline_message = Some(msg.to_string());
+                                }
+                            }
+                            let mut submit_fut = Box::pin(
+                                crate::chat_tui_learn_adapter::parse_and_dispatch_learn_slash(
                                     &line,
                                     &active_run,
                                     paths,
-                                )
-                                .await
-                                {
+                                ),
+                            );
+                            let submit_result = loop {
+                                tokio::select! {
+                                    r = &mut submit_fut => break r,
+                                    _ = tokio::time::sleep(Duration::from_millis(base_run.tui_refresh_ms)) => {
+                                        ui_state.on_tick(Instant::now());
+                                        ui_tick = ui_tick.saturating_add(1);
+                                        let frame = build_tui_render_frame_input(TuiRenderFrameBuildInput {
+                                            active_run: &active_run,
+                                            provider_kind,
+                                            provider_connected,
+                                            model: &model,
+                                            status: &status,
+                                            status_detail: &status_detail,
+                                            transcript: &transcript,
+                                            streaming_assistant: &streaming_assistant,
+                                            ui_state: &ui_state,
+                                            tools_selected: &mut tools_selected,
+                                            tools_focus: &mut tools_focus,
+                                            show_tool_details: &mut show_tool_details,
+                                            approvals_selected: &mut approvals_selected,
+                                            cwd_label: &cwd_label,
+                                            input: &input,
+                                            input_cursor,
+                                            logs: &logs,
+                                            think_tick,
+                                            tui_refresh_ms: base_run.tui_refresh_ms,
+                                            show_tools: &mut show_tools,
+                                            show_approvals: &mut show_approvals,
+                                            show_logs,
+                                            transcript_scroll,
+                                            compact_tools,
+                                            show_banner,
+                                            ui_tick,
+                                            palette_open,
+                                            palette_items: &palette_items,
+                                            palette_selected,
+                                            search_mode,
+                                            search_query: &search_query,
+                                            search_input_cursor,
+                                            slash_menu_index,
+                                            learn_overlay: &learn_overlay,
+                                            learn_overlay_cursor,
+                                        });
+                                        terminal.draw(|f| {
+                                            chat_ui::draw_chat_frame(
+                                                f,
+                                                frame.mode_label,
+                                                frame.provider_label,
+                                                frame.provider_connected,
+                                                frame.model,
+                                                frame.status,
+                                                frame.status_detail,
+                                                frame.transcript,
+                                                frame.streaming_assistant,
+                                                frame.ui_state,
+                                                frame.tools_selected,
+                                                frame.tools_focus,
+                                                frame.show_tool_details,
+                                                frame.approvals_selected,
+                                                frame.cwd_label,
+                                                frame.input,
+                                                frame.input_cursor,
+                                                frame.input_cursor_visible,
+                                                frame.logs,
+                                                frame.think_tick,
+                                                frame.tui_refresh_ms,
+                                                frame.show_tools,
+                                                frame.show_approvals,
+                                                frame.show_logs,
+                                                frame.transcript_scroll,
+                                                frame.compact_tools,
+                                                frame.show_banner,
+                                                frame.ui_tick,
+                                                frame.overlay_text.clone(),
+                                                frame.learn_overlay.as_ref(),
+                                            );
+                                        })?;
+                                    }
+                                }
+                            };
+
+                            if let Some(overlay) = learn_overlay.as_mut() {
+                                match submit_result {
                                     Ok(output) => {
                                         if !output.is_empty() {
                                             push_overlay_log_dedup(overlay, &output);
                                         }
                                         overlay.inline_message = Some(
-                                            "Completed. Step 1: Review logs/output. Step 2: edit fields if needed. Step 3: Press Enter to run again."
+                                            "Enhancement complete. Review output, adjust if needed, then press Enter to run again."
                                                 .to_string(),
                                         );
                                     }
@@ -3177,7 +3275,7 @@ pub(crate) async fn run_chat_tui(
                                             &format!("learn command failed: {e}"),
                                         );
                                         overlay.inline_message = Some(
-                                            "Run failed. Step 1: Review error in logs. Step 2: fix inputs/flags. Step 3: Press Enter to retry."
+                                            "Enhancement failed. Review logs, fix inputs, then press Enter to retry."
                                                 .to_string(),
                                         );
                                     }
