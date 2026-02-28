@@ -267,6 +267,9 @@ struct TuiEnterSubmitInput<'a> {
     search_query: &'a str,
     shared_chat_mcp_registry: &'a mut Option<std::sync::Arc<McpRegistry>>,
     learn_overlay: &'a mut Option<LearnOverlayState>,
+    input_cursor: &'a mut usize,
+    search_input_cursor: &'a mut usize,
+    learn_overlay_cursor: &'a mut usize,
 }
 
 #[derive(Clone)]
@@ -316,6 +319,9 @@ struct TuiActiveTurnLoopInput<'a> {
     search_mode: bool,
     search_query: &'a str,
     slash_menu_index: &'a mut usize,
+    learn_overlay: &'a mut Option<LearnOverlayState>,
+    input_cursor: &'a mut usize,
+    learn_overlay_cursor: &'a mut usize,
 }
 
 async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow::Result<()> {
@@ -358,6 +364,9 @@ async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow
         search_mode,
         search_query,
         slash_menu_index,
+        learn_overlay,
+        input_cursor,
+        learn_overlay_cursor,
     } = input;
 
     let tool_row_count = if compact_tools { 20 } else { 12 };
@@ -461,12 +470,67 @@ async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow
                     }
                 }
                 CEvent::Paste(pasted) => {
-                    input_buf.push_str(&chat_runtime::normalize_pasted_text(&pasted));
+                    insert_text_bounded(
+                        input_buf,
+                        input_cursor,
+                        &chat_runtime::normalize_pasted_text(&pasted),
+                        usize::MAX,
+                    );
                     *slash_menu_index = 0;
                 }
                 CEvent::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
+                    if learn_overlay.is_some()
+                        && !(matches!(key.code, KeyCode::Char('c'))
+                            && key.modifiers.contains(KeyModifiers::CONTROL))
+                    {
+                        let mut prompt_history_dummy = Vec::new();
+                        let mut history_idx_dummy = None;
+                        let mut palette_open_dummy = false;
+                        let palette_items_dummy = ["overlay"];
+                        let mut palette_selected_dummy = 0usize;
+                        let mut search_mode_dummy = false;
+                        let mut search_query_dummy = String::new();
+                        let mut search_line_cursor_dummy = 0usize;
+                        let mut search_input_cursor_dummy = 0usize;
+                        let mut compact_tools_dummy = false;
+                        let visible_tool_count_dummy = ui_state.tool_calls.len().min(tool_row_count);
+                        let _ = handle_tui_outer_key_dispatch(TuiOuterKeyDispatchInput {
+                            key,
+                            learn_overlay,
+                            run_busy: true,
+                            input: input_buf,
+                            input_cursor,
+                            prompt_history: &mut prompt_history_dummy,
+                            history_idx: &mut history_idx_dummy,
+                            slash_menu_index,
+                            palette_open: &mut palette_open_dummy,
+                            palette_items: &palette_items_dummy,
+                            palette_selected: &mut palette_selected_dummy,
+                            search_mode: &mut search_mode_dummy,
+                            search_query: &mut search_query_dummy,
+                            search_line_cursor: &mut search_line_cursor_dummy,
+                            search_input_cursor: &mut search_input_cursor_dummy,
+                            transcript,
+                            streaming_assistant,
+                            transcript_scroll,
+                            follow_output,
+                            ui_state,
+                            visible_tool_count: visible_tool_count_dummy,
+                            show_tools,
+                            show_approvals,
+                            show_logs,
+                            compact_tools: &mut compact_tools_dummy,
+                            tools_selected,
+                            tools_focus,
+                            approvals_selected,
+                            paths,
+                            logs,
+                            learn_overlay_cursor,
+                        });
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Esc => {
                             let partial = agent::sanitize_user_visible_output(streaming_assistant);
@@ -620,11 +684,22 @@ async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow
                             }
                         }
                         KeyCode::Backspace => {
-                            input_buf.pop();
+                            delete_char_before_cursor(input_buf, input_cursor);
                             *slash_menu_index = 0;
                         }
+                        KeyCode::Left => {
+                            *input_cursor = input_cursor.saturating_sub(1);
+                        }
+                        KeyCode::Right => {
+                            *input_cursor = (*input_cursor + 1).min(char_len(input_buf));
+                        }
                         KeyCode::Char(c) if chat_runtime::is_text_input_mods(key.modifiers) => {
-                            input_buf.push(c);
+                            insert_text_bounded(
+                                input_buf,
+                                input_cursor,
+                                &c.to_string(),
+                                usize::MAX,
+                            );
                             *slash_menu_index = 0;
                         }
                         KeyCode::Enter => {
@@ -648,6 +723,7 @@ async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow
                                         ),
                                     }
                                     input_buf.clear();
+                                    *input_cursor = 0;
                                     *slash_menu_index = 0;
                                 }
                             } else if let Some(rest) = line.strip_prefix("/next ") {
@@ -668,6 +744,7 @@ async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow
                                             .push("queue unavailable: run is ending".to_string()),
                                     }
                                     input_buf.clear();
+                                    *input_cursor = 0;
                                     *slash_menu_index = 0;
                                 }
                             } else if line == "/queue" {
@@ -702,18 +779,26 @@ async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow
                                     }
                                 }
                                 input_buf.clear();
+                                *input_cursor = 0;
                                 *slash_menu_index = 0;
                             } else if line == "/help" {
                                 logs.push(
-                                    "active-run commands: /interrupt <message>, /next <message>, /queue ; /learn is blocked while run is active"
+                                    "active-run commands: /interrupt <message>, /next <message>, /queue ; /learn opens overlay but submit stays blocked while run is active"
                                         .to_string(),
                                 );
                                 input_buf.clear();
+                                *input_cursor = 0;
                                 *slash_menu_index = 0;
                             } else if line.starts_with("/learn") {
-                                logs.push("System busy. Operation deferred.".to_string());
-                                logs.push("ERR_TUI_BUSY_TRY_AGAIN".to_string());
+                                if line == "/learn" {
+                                    *learn_overlay = Some(LearnOverlayState::default());
+                                    *learn_overlay_cursor = 0;
+                                } else {
+                                    logs.push("System busy. Operation deferred.".to_string());
+                                    logs.push("ERR_TUI_BUSY_TRY_AGAIN".to_string());
+                                }
                                 input_buf.clear();
+                                *input_cursor = 0;
                                 *slash_menu_index = 0;
                             } else if !line.is_empty() {
                                 logs.push(
@@ -733,6 +818,10 @@ async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow
             break;
         }
 
+        let cursor_visible = (*ui_tick / 6) % 2 == 0;
+        let learn_overlay_model = learn_overlay.as_ref().map(|s| {
+            build_learn_overlay_render_model_with_cursor(s, *learn_overlay_cursor, *ui_tick)
+        });
         terminal.draw(|f| {
             chat_ui::draw_chat_frame(
                 f,
@@ -751,6 +840,8 @@ async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow
                 *approvals_selected,
                 cwd_label,
                 input_buf,
+                *input_cursor,
+                cursor_visible,
                 logs,
                 *think_tick,
                 base_run.tui_refresh_ms,
@@ -761,13 +852,18 @@ async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow
                 compact_tools,
                 show_banner,
                 *ui_tick,
-                if palette_open {
+                if learn_overlay_model.is_some() {
+                    None
+                } else if palette_open {
                     Some(format!(
                         "⌘ {}  (Up/Down, Enter, Esc)",
                         palette_items[palette_selected]
                     ))
                 } else if search_mode {
-                    Some(format!("🔎 {}  (Enter next, Esc close)", search_query))
+                    Some(format!(
+                        "🔎 {}  (Enter next, Esc close)",
+                        render_with_optional_caret(search_query, 0, cursor_visible)
+                    ))
                 } else if input_buf.starts_with('/') {
                     chat_commands::slash_overlay_text(input_buf, *slash_menu_index)
                 } else if input_buf.starts_with('?') {
@@ -775,7 +871,7 @@ async fn drive_tui_active_turn_loop(input: TuiActiveTurnLoopInput<'_>) -> anyhow
                 } else {
                     None
                 },
-                None,
+                learn_overlay_model.as_ref(),
             );
         })?;
 
@@ -910,6 +1006,7 @@ struct TuiSlashCommandDispatchInput<'a> {
     follow_output: &'a mut bool,
     shared_chat_mcp_registry: &'a mut Option<std::sync::Arc<McpRegistry>>,
     learn_overlay: &'a mut Option<LearnOverlayState>,
+    learn_overlay_cursor: &'a mut usize,
 }
 
 struct TuiNormalSubmitPrepInput<'a> {
@@ -930,6 +1027,8 @@ struct TuiOuterKeyPreludeInput<'a> {
     learn_overlay: &'a mut Option<LearnOverlayState>,
     palette_open: &'a mut bool,
     search_mode: &'a mut bool,
+    search_query: &'a String,
+    search_input_cursor: &'a mut usize,
     follow_output: &'a mut bool,
     transcript_scroll: &'a mut usize,
 }
@@ -956,6 +1055,7 @@ fn handle_tui_outer_key_prelude(input: TuiOuterKeyPreludeInput<'_>) -> TuiOuterK
     }
     if input.key.code == KeyCode::Char('f') && input.key.modifiers.contains(KeyModifiers::CONTROL) {
         *input.search_mode = true;
+        *input.search_input_cursor = char_len(input.search_query);
         *input.palette_open = false;
         return TuiOuterKeyPreludeOutcome::ContinueLoop;
     }
@@ -967,6 +1067,7 @@ struct TuiOuterKeyDispatchInput<'a> {
     learn_overlay: &'a mut Option<LearnOverlayState>,
     run_busy: bool,
     input: &'a mut String,
+    input_cursor: &'a mut usize,
     prompt_history: &'a mut Vec<String>,
     history_idx: &'a mut Option<usize>,
     slash_menu_index: &'a mut usize,
@@ -976,6 +1077,7 @@ struct TuiOuterKeyDispatchInput<'a> {
     search_mode: &'a mut bool,
     search_query: &'a mut String,
     search_line_cursor: &'a mut usize,
+    search_input_cursor: &'a mut usize,
     transcript: &'a mut Vec<(String, String)>,
     streaming_assistant: &'a mut String,
     transcript_scroll: &'a mut usize,
@@ -991,6 +1093,7 @@ struct TuiOuterKeyDispatchInput<'a> {
     approvals_selected: &'a mut usize,
     paths: &'a store::StatePaths,
     logs: &'a mut Vec<String>,
+    learn_overlay_cursor: &'a mut usize,
 }
 
 struct TuiOuterMouseInput<'a> {
@@ -1014,13 +1117,57 @@ fn handle_tui_outer_mouse_event(input: TuiOuterMouseInput<'_>) {
 struct TuiOuterPasteInput<'a> {
     pasted: &'a str,
     input: &'a mut String,
+    input_cursor: &'a mut usize,
     history_idx: &'a mut Option<usize>,
     slash_menu_index: &'a mut usize,
     learn_overlay: &'a mut Option<LearnOverlayState>,
+    learn_overlay_cursor: &'a mut usize,
 }
 
 const OVERLAY_CAPTURE_SUMMARY_MAX_CHARS: usize = 360;
 const OVERLAY_ID_MAX_CHARS: usize = 96;
+
+fn char_len(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn byte_index_for_char(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len())
+}
+
+fn clamp_cursor(s: &str, cursor: &mut usize) {
+    *cursor = (*cursor).min(char_len(s));
+}
+
+fn insert_text_bounded(dst: &mut String, cursor: &mut usize, src: &str, max_chars: usize) {
+    if src.is_empty() {
+        return;
+    }
+    let used = char_len(dst);
+    if used >= max_chars {
+        return;
+    }
+    clamp_cursor(dst, cursor);
+    let take_n = max_chars - used;
+    let chunk: String = src.chars().take(take_n).collect();
+    let at = byte_index_for_char(dst, *cursor);
+    dst.insert_str(at, &chunk);
+    *cursor += char_len(&chunk);
+}
+
+fn delete_char_before_cursor(dst: &mut String, cursor: &mut usize) {
+    clamp_cursor(dst, cursor);
+    if *cursor == 0 {
+        return;
+    }
+    let end = byte_index_for_char(dst, *cursor);
+    let start = byte_index_for_char(dst, *cursor - 1);
+    dst.replace_range(start..end, "");
+    *cursor = cursor.saturating_sub(1);
+}
 
 fn normalize_overlay_paste(pasted: &str, single_token: bool) -> String {
     let normalized = chat_runtime::normalize_pasted_text(pasted);
@@ -1045,26 +1192,14 @@ fn normalize_overlay_paste(pasted: &str, single_token: bool) -> String {
     cooked.chars().take(180).collect::<String>()
 }
 
-fn append_overlay_field_bounded(dst: &mut String, src: &str, max_chars: usize) {
-    if src.is_empty() {
-        return;
-    }
-    let used = dst.chars().count();
-    if used >= max_chars {
-        return;
-    }
-    let take_n = max_chars - used;
-    let chunk: String = src.chars().take(take_n).collect();
-    dst.push_str(&chunk);
-}
-
 fn handle_tui_outer_paste_event(input: TuiOuterPasteInput<'_>) {
     if let Some(overlay) = input.learn_overlay.as_mut() {
         match overlay.input_focus {
             LearnOverlayInputFocus::CaptureSummary => {
                 let s = normalize_overlay_paste(input.pasted, false);
-                append_overlay_field_bounded(
+                insert_text_bounded(
                     &mut overlay.summary,
+                    input.learn_overlay_cursor,
                     &s,
                     OVERLAY_CAPTURE_SUMMARY_MAX_CHARS,
                 );
@@ -1072,21 +1207,32 @@ fn handle_tui_outer_paste_event(input: TuiOuterPasteInput<'_>) {
             LearnOverlayInputFocus::ReviewId => {
                 let s = normalize_overlay_paste(input.pasted, true);
                 if !s.is_empty() && !overlay.review_id.ends_with(&s) {
-                    append_overlay_field_bounded(&mut overlay.review_id, &s, OVERLAY_ID_MAX_CHARS);
+                    insert_text_bounded(
+                        &mut overlay.review_id,
+                        input.learn_overlay_cursor,
+                        &s,
+                        OVERLAY_ID_MAX_CHARS,
+                    );
                     overlay.review_selected_idx = usize::MAX;
                 }
             }
             LearnOverlayInputFocus::PromoteId => {
                 let s = normalize_overlay_paste(input.pasted, true);
                 if !s.is_empty() && !overlay.promote_id.ends_with(&s) {
-                    append_overlay_field_bounded(&mut overlay.promote_id, &s, OVERLAY_ID_MAX_CHARS);
+                    insert_text_bounded(
+                        &mut overlay.promote_id,
+                        input.learn_overlay_cursor,
+                        &s,
+                        OVERLAY_ID_MAX_CHARS,
+                    );
                 }
             }
             LearnOverlayInputFocus::PromoteSlug => {
                 let s = normalize_overlay_paste(input.pasted, true);
                 if !s.is_empty() && !overlay.promote_slug.ends_with(&s) {
-                    append_overlay_field_bounded(
+                    insert_text_bounded(
                         &mut overlay.promote_slug,
+                        input.learn_overlay_cursor,
                         &s,
                         OVERLAY_ID_MAX_CHARS,
                     );
@@ -1095,8 +1241,9 @@ fn handle_tui_outer_paste_event(input: TuiOuterPasteInput<'_>) {
             LearnOverlayInputFocus::PromotePackId => {
                 let s = normalize_overlay_paste(input.pasted, true);
                 if !s.is_empty() && !overlay.promote_pack_id.ends_with(&s) {
-                    append_overlay_field_bounded(
+                    insert_text_bounded(
                         &mut overlay.promote_pack_id,
+                        input.learn_overlay_cursor,
                         &s,
                         OVERLAY_ID_MAX_CHARS,
                     );
@@ -1105,9 +1252,8 @@ fn handle_tui_outer_paste_event(input: TuiOuterPasteInput<'_>) {
         }
         return;
     }
-    input
-        .input
-        .push_str(&chat_runtime::normalize_pasted_text(input.pasted));
+    let normalized = chat_runtime::normalize_pasted_text(input.pasted);
+    insert_text_bounded(input.input, input.input_cursor, &normalized, usize::MAX);
     *input.history_idx = None;
     *input.slash_menu_index = 0;
 }
@@ -1121,6 +1267,7 @@ struct TuiOuterEventDispatchInput<'a> {
     transcript_scroll: &'a mut usize,
     follow_output: &'a mut bool,
     input: &'a mut String,
+    input_cursor: &'a mut usize,
     history_idx: &'a mut Option<usize>,
     slash_menu_index: &'a mut usize,
     palette_open: &'a mut bool,
@@ -1129,6 +1276,7 @@ struct TuiOuterEventDispatchInput<'a> {
     search_mode: &'a mut bool,
     search_query: &'a mut String,
     search_line_cursor: &'a mut usize,
+    search_input_cursor: &'a mut usize,
     ui_state: &'a mut UiState,
     visible_tool_count: usize,
     show_tools: &'a mut bool,
@@ -1141,6 +1289,36 @@ struct TuiOuterEventDispatchInput<'a> {
     paths: &'a store::StatePaths,
     logs: &'a mut Vec<String>,
     learn_overlay: &'a mut Option<LearnOverlayState>,
+    learn_overlay_cursor: &'a mut usize,
+}
+
+fn overlay_field_mut_and_max(
+    overlay: &mut LearnOverlayState,
+) -> (&mut String, usize, bool) {
+    match overlay.input_focus {
+        LearnOverlayInputFocus::CaptureSummary => {
+            (&mut overlay.summary, OVERLAY_CAPTURE_SUMMARY_MAX_CHARS, false)
+        }
+        LearnOverlayInputFocus::ReviewId => (&mut overlay.review_id, OVERLAY_ID_MAX_CHARS, true),
+        LearnOverlayInputFocus::PromoteId => (&mut overlay.promote_id, OVERLAY_ID_MAX_CHARS, false),
+        LearnOverlayInputFocus::PromoteSlug => {
+            (&mut overlay.promote_slug, OVERLAY_ID_MAX_CHARS, false)
+        }
+        LearnOverlayInputFocus::PromotePackId => {
+            (&mut overlay.promote_pack_id, OVERLAY_ID_MAX_CHARS, false)
+        }
+    }
+}
+
+fn sync_overlay_cursor_to_focus(overlay: &LearnOverlayState, cursor: &mut usize) {
+    let len = match overlay.input_focus {
+        LearnOverlayInputFocus::CaptureSummary => char_len(&overlay.summary),
+        LearnOverlayInputFocus::ReviewId => char_len(&overlay.review_id),
+        LearnOverlayInputFocus::PromoteId => char_len(&overlay.promote_id),
+        LearnOverlayInputFocus::PromoteSlug => char_len(&overlay.promote_slug),
+        LearnOverlayInputFocus::PromotePackId => char_len(&overlay.promote_pack_id),
+    };
+    *cursor = (*cursor).min(len);
 }
 
 fn handle_tui_outer_event_dispatch(
@@ -1161,9 +1339,11 @@ fn handle_tui_outer_event_dispatch(
             handle_tui_outer_paste_event(TuiOuterPasteInput {
                 pasted: &pasted,
                 input: input.input,
+                input_cursor: input.input_cursor,
                 history_idx: input.history_idx,
                 slash_menu_index: input.slash_menu_index,
                 learn_overlay: input.learn_overlay,
+                learn_overlay_cursor: input.learn_overlay_cursor,
             });
             TuiOuterEventDispatchOutcome::Noop
         }
@@ -1173,6 +1353,8 @@ fn handle_tui_outer_event_dispatch(
                 learn_overlay: input.learn_overlay,
                 palette_open: input.palette_open,
                 search_mode: input.search_mode,
+                search_query: input.search_query,
+                search_input_cursor: input.search_input_cursor,
                 follow_output: input.follow_output,
                 transcript_scroll: input.transcript_scroll,
             }) {
@@ -1189,6 +1371,7 @@ fn handle_tui_outer_event_dispatch(
                 learn_overlay: input.learn_overlay,
                 run_busy: input.status == "running",
                 input: input.input,
+                input_cursor: input.input_cursor,
                 prompt_history: input.prompt_history,
                 history_idx: input.history_idx,
                 slash_menu_index: input.slash_menu_index,
@@ -1198,6 +1381,7 @@ fn handle_tui_outer_event_dispatch(
                 search_mode: input.search_mode,
                 search_query: input.search_query,
                 search_line_cursor: input.search_line_cursor,
+                search_input_cursor: input.search_input_cursor,
                 transcript: input.transcript,
                 streaming_assistant: input.streaming_assistant,
                 transcript_scroll: input.transcript_scroll,
@@ -1213,6 +1397,7 @@ fn handle_tui_outer_event_dispatch(
                 approvals_selected: input.approvals_selected,
                 paths: input.paths,
                 logs: input.logs,
+                learn_overlay_cursor: input.learn_overlay_cursor,
             }) {
                 TuiOuterKeyDispatchOutcome::BreakLoop => TuiOuterEventDispatchOutcome::BreakLoop,
                 TuiOuterKeyDispatchOutcome::ContinueLoop => {
@@ -1244,6 +1429,8 @@ struct TuiRenderFrameInput<'a> {
     approvals_selected: usize,
     cwd_label: &'a str,
     input: &'a str,
+    input_cursor: usize,
+    input_cursor_visible: bool,
     logs: &'a Vec<String>,
     think_tick: u64,
     tui_refresh_ms: u64,
@@ -1274,6 +1461,7 @@ struct TuiRenderFrameBuildInput<'a> {
     approvals_selected: &'a mut usize,
     cwd_label: &'a str,
     input: &'a str,
+    input_cursor: usize,
     logs: &'a Vec<String>,
     think_tick: u64,
     tui_refresh_ms: u64,
@@ -1289,8 +1477,10 @@ struct TuiRenderFrameBuildInput<'a> {
     palette_selected: usize,
     search_mode: bool,
     search_query: &'a str,
+    search_input_cursor: usize,
     slash_menu_index: usize,
     learn_overlay: &'a Option<LearnOverlayState>,
+    learn_overlay_cursor: usize,
 }
 
 fn build_tui_render_frame_input(input: TuiRenderFrameBuildInput<'_>) -> TuiRenderFrameInput<'_> {
@@ -1327,7 +1517,7 @@ fn build_tui_render_frame_input(input: TuiRenderFrameBuildInput<'_>) -> TuiRende
     } else if input.search_mode {
         Some(format!(
             "🔎 {}  (Enter next, Esc close)",
-            input.search_query
+            render_with_optional_caret(input.search_query, input.search_input_cursor, true)
         ))
     } else if input.input.starts_with('/') {
         chat_commands::slash_overlay_text(input.input, input.slash_menu_index)
@@ -1340,7 +1530,13 @@ fn build_tui_render_frame_input(input: TuiRenderFrameBuildInput<'_>) -> TuiRende
     let learn_overlay = input
         .learn_overlay
         .as_ref()
-        .map(build_learn_overlay_render_model);
+        .map(|s| {
+            build_learn_overlay_render_model_with_cursor(
+                s,
+                input.learn_overlay_cursor,
+                input.ui_tick,
+            )
+        });
 
     TuiRenderFrameInput {
         mode_label: chat_runtime::chat_mode_label(input.active_run),
@@ -1358,6 +1554,8 @@ fn build_tui_render_frame_input(input: TuiRenderFrameBuildInput<'_>) -> TuiRende
         approvals_selected: *input.approvals_selected,
         cwd_label: input.cwd_label,
         input: input.input,
+        input_cursor: input.input_cursor,
+        input_cursor_visible: ((input.ui_tick / 6) % 2) == 0,
         logs: input.logs,
         think_tick: input.think_tick,
         tui_refresh_ms: input.tui_refresh_ms,
@@ -1373,8 +1571,15 @@ fn build_tui_render_frame_input(input: TuiRenderFrameBuildInput<'_>) -> TuiRende
     }
 }
 
-fn build_learn_overlay_render_model(
+#[cfg(test)]
+fn build_learn_overlay_render_model(s: &LearnOverlayState) -> crate::chat_ui::LearnOverlayRenderModel {
+    build_learn_overlay_render_model_with_cursor(s, 0, 0)
+}
+
+fn build_learn_overlay_render_model_with_cursor(
     s: &LearnOverlayState,
+    active_input_cursor: usize,
+    ui_tick: u64,
 ) -> crate::chat_ui::LearnOverlayRenderModel {
     let write_state = if s.write_armed {
         crate::chat_ui::LearnOverlayWriteState::Armed
@@ -1501,7 +1706,19 @@ fn build_learn_overlay_render_model(
         assist_summary: s.assist_summary.clone(),
         summary_choice: s.summary_choice,
         selected_summary: s.selected_summary.clone(),
+        active_input_cursor,
+        cursor_visible: ((ui_tick / 6) % 2) == 0,
     }
+}
+
+fn render_with_optional_caret(input: &str, cursor: usize, visible: bool) -> String {
+    if !visible {
+        return input.to_string();
+    }
+    let mut chars: Vec<char> = input.chars().collect();
+    let idx = cursor.min(chars.len());
+    chars.insert(idx, '|');
+    chars.into_iter().collect()
 }
 
 fn learn_overlay_focus_label(focus: LearnOverlayInputFocus) -> &'static str {
@@ -1558,24 +1775,28 @@ fn handle_tui_outer_key_dispatch(
             KeyCode::Char('1') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
                 overlay.tab = crate::chat_ui::LearnOverlayTab::Capture;
                 overlay.input_focus = LearnOverlayInputFocus::CaptureSummary;
+                *input.learn_overlay_cursor = char_len(&overlay.summary);
                 overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('2') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
                 overlay.tab = crate::chat_ui::LearnOverlayTab::Review;
                 overlay.input_focus = LearnOverlayInputFocus::ReviewId;
+                *input.learn_overlay_cursor = char_len(&overlay.review_id);
                 overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Char('3') if input.key.modifiers.contains(KeyModifiers::CONTROL) => {
                 overlay.tab = crate::chat_ui::LearnOverlayTab::Promote;
                 overlay.input_focus = LearnOverlayInputFocus::PromoteId;
+                *input.learn_overlay_cursor = char_len(&overlay.promote_id);
                 overlay.inline_message = None;
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Tab => {
                 let reverse = input.key.modifiers.contains(KeyModifiers::SHIFT);
                 cycle_overlay_focus(overlay, reverse);
+                sync_overlay_cursor_to_focus(overlay, input.learn_overlay_cursor);
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
             KeyCode::Up => {
@@ -1587,6 +1808,7 @@ fn handle_tui_outer_key_dispatch(
                     overlay.review_selected_idx = overlay.review_selected_idx.saturating_sub(1);
                     if let Some(row) = overlay.review_rows.get(overlay.review_selected_idx) {
                         overlay.review_id = row.split(" | ").next().unwrap_or("").to_string();
+                        *input.learn_overlay_cursor = char_len(&overlay.review_id);
                     }
                 }
                 return TuiOuterKeyDispatchOutcome::Handled;
@@ -1601,28 +1823,35 @@ fn handle_tui_outer_key_dispatch(
                         (overlay.review_selected_idx + 1).min(overlay.review_rows.len() - 1);
                     if let Some(row) = overlay.review_rows.get(overlay.review_selected_idx) {
                         overlay.review_id = row.split(" | ").next().unwrap_or("").to_string();
+                        *input.learn_overlay_cursor = char_len(&overlay.review_id);
                     }
                 }
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
+            KeyCode::Left => {
+                *input.learn_overlay_cursor = input.learn_overlay_cursor.saturating_sub(1);
+                return TuiOuterKeyDispatchOutcome::Handled;
+            }
+            KeyCode::Right => {
+                sync_overlay_cursor_to_focus(overlay, input.learn_overlay_cursor);
+                *input.learn_overlay_cursor = input.learn_overlay_cursor.saturating_add(1);
+                sync_overlay_cursor_to_focus(overlay, input.learn_overlay_cursor);
+                return TuiOuterKeyDispatchOutcome::Handled;
+            }
+            KeyCode::Home => {
+                *input.learn_overlay_cursor = 0;
+                return TuiOuterKeyDispatchOutcome::Handled;
+            }
+            KeyCode::End => {
+                *input.learn_overlay_cursor = usize::MAX;
+                sync_overlay_cursor_to_focus(overlay, input.learn_overlay_cursor);
+                return TuiOuterKeyDispatchOutcome::Handled;
+            }
             KeyCode::Backspace => {
-                match overlay.input_focus {
-                    LearnOverlayInputFocus::CaptureSummary => {
-                        overlay.summary.pop();
-                    }
-                    LearnOverlayInputFocus::ReviewId => {
-                        overlay.review_id.pop();
-                        overlay.review_selected_idx = usize::MAX;
-                    }
-                    LearnOverlayInputFocus::PromoteId => {
-                        overlay.promote_id.pop();
-                    }
-                    LearnOverlayInputFocus::PromoteSlug => {
-                        overlay.promote_slug.pop();
-                    }
-                    LearnOverlayInputFocus::PromotePackId => {
-                        overlay.promote_pack_id.pop();
-                    }
+                let (field, _max_chars, reset_review_select) = overlay_field_mut_and_max(overlay);
+                delete_char_before_cursor(field, input.learn_overlay_cursor);
+                if reset_review_select {
+                    overlay.review_selected_idx = usize::MAX;
                 }
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
@@ -1753,6 +1982,7 @@ fn handle_tui_outer_key_dispatch(
                             if let Some(row) = overlay.review_rows.first() {
                                 overlay.review_id =
                                     row.split(" | ").next().unwrap_or("").to_string();
+                                *input.learn_overlay_cursor = char_len(&overlay.review_id);
                             }
                             overlay.pending_submit_line = Some("/learn list".to_string());
                             overlay.inline_message = Some(
@@ -1794,41 +2024,20 @@ fn handle_tui_outer_key_dispatch(
                 };
             }
             KeyCode::Char(c) if chat_runtime::is_text_input_mods(input.key.modifiers) => {
-                match overlay.input_focus {
-                    LearnOverlayInputFocus::CaptureSummary => {
-                        append_overlay_field_bounded(
-                            &mut overlay.summary,
-                            &c.to_string(),
-                            OVERLAY_CAPTURE_SUMMARY_MAX_CHARS,
-                        );
-                        overlay.assist_summary = None;
-                        overlay.summary_choice =
-                            crate::chat_ui::LearnOverlaySummaryChoice::Original;
-                        overlay.selected_summary = None;
-                    }
-                    LearnOverlayInputFocus::ReviewId => {
-                        append_overlay_field_bounded(
-                            &mut overlay.review_id,
-                            &c.to_string(),
-                            OVERLAY_ID_MAX_CHARS,
-                        );
-                        overlay.review_selected_idx = usize::MAX;
-                    }
-                    LearnOverlayInputFocus::PromoteId => append_overlay_field_bounded(
-                        &mut overlay.promote_id,
-                        &c.to_string(),
-                        OVERLAY_ID_MAX_CHARS,
-                    ),
-                    LearnOverlayInputFocus::PromoteSlug => append_overlay_field_bounded(
-                        &mut overlay.promote_slug,
-                        &c.to_string(),
-                        OVERLAY_ID_MAX_CHARS,
-                    ),
-                    LearnOverlayInputFocus::PromotePackId => append_overlay_field_bounded(
-                        &mut overlay.promote_pack_id,
-                        &c.to_string(),
-                        OVERLAY_ID_MAX_CHARS,
-                    ),
+                let (field, max_chars, reset_review_select) = overlay_field_mut_and_max(overlay);
+                insert_text_bounded(
+                    field,
+                    input.learn_overlay_cursor,
+                    &c.to_string(),
+                    max_chars,
+                );
+                if overlay.input_focus == LearnOverlayInputFocus::CaptureSummary {
+                    overlay.assist_summary = None;
+                    overlay.summary_choice = crate::chat_ui::LearnOverlaySummaryChoice::Original;
+                    overlay.selected_summary = None;
+                }
+                if reset_review_select {
+                    overlay.review_selected_idx = usize::MAX;
                 }
                 return TuiOuterKeyDispatchOutcome::Handled;
             }
@@ -1877,16 +2086,28 @@ fn handle_tui_outer_key_dispatch(
         match input.key.code {
             KeyCode::Esc => *input.search_mode = false,
             KeyCode::Backspace => {
-                input.search_query.pop();
+                delete_char_before_cursor(input.search_query, input.search_input_cursor);
                 *input.search_line_cursor = 0;
                 do_search = true;
+            }
+            KeyCode::Left => {
+                *input.search_input_cursor = input.search_input_cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                *input.search_input_cursor =
+                    (*input.search_input_cursor + 1).min(char_len(input.search_query));
             }
             KeyCode::Enter => {
                 do_search = true;
                 *input.search_line_cursor = input.search_line_cursor.saturating_add(1);
             }
             KeyCode::Char(c) if chat_runtime::is_text_input_mods(input.key.modifiers) => {
-                input.search_query.push(c);
+                insert_text_bounded(
+                    input.search_query,
+                    input.search_input_cursor,
+                    &c.to_string(),
+                    usize::MAX,
+                );
                 *input.search_line_cursor = 0;
                 do_search = true;
             }
@@ -1948,6 +2169,7 @@ fn handle_tui_outer_key_dispatch(
                 };
                 *input.history_idx = Some(next);
                 *input.input = input.prompt_history[next].clone();
+                *input.input_cursor = char_len(input.input);
             }
             TuiOuterKeyDispatchOutcome::Handled
         }
@@ -1965,9 +2187,11 @@ fn handle_tui_outer_key_dispatch(
                     if next >= input.prompt_history.len() {
                         *input.history_idx = None;
                         input.input.clear();
+                        *input.input_cursor = 0;
                     } else {
                         *input.history_idx = Some(next);
                         *input.input = input.prompt_history[next].clone();
+                        *input.input_cursor = char_len(input.input);
                     }
                 }
             }
@@ -2107,14 +2331,22 @@ fn handle_tui_outer_key_dispatch(
             TuiOuterKeyDispatchOutcome::Handled
         }
         KeyCode::Enter => TuiOuterKeyDispatchOutcome::EnterInline,
+        KeyCode::Left => {
+            *input.input_cursor = input.input_cursor.saturating_sub(1);
+            TuiOuterKeyDispatchOutcome::Handled
+        }
+        KeyCode::Right => {
+            *input.input_cursor = (*input.input_cursor + 1).min(char_len(input.input));
+            TuiOuterKeyDispatchOutcome::Handled
+        }
         KeyCode::Backspace => {
-            input.input.pop();
+            delete_char_before_cursor(input.input, input.input_cursor);
             *input.slash_menu_index = 0;
             TuiOuterKeyDispatchOutcome::Handled
         }
         KeyCode::Char(c) => {
             if chat_runtime::is_text_input_mods(input.key.modifiers) {
-                input.input.push(c);
+                insert_text_bounded(input.input, input.input_cursor, &c.to_string(), usize::MAX);
                 if c == '/' && input.input.len() == 1 {
                     *input.slash_menu_index = 0;
                 }
@@ -2324,10 +2556,14 @@ async fn handle_tui_enter_submit(
         search_query,
         shared_chat_mcp_registry,
         learn_overlay,
+        input_cursor,
+        search_input_cursor,
+        learn_overlay_cursor,
     } = input;
 
     let line = input_buf.trim().to_string();
     input_buf.clear();
+    *input_cursor = 0;
     *history_idx = None;
     *slash_menu_index = 0;
     if line.is_empty() {
@@ -2390,6 +2626,7 @@ async fn handle_tui_enter_submit(
             follow_output,
             shared_chat_mcp_registry,
             learn_overlay,
+            learn_overlay_cursor,
         })
         .await?
         {
@@ -2444,6 +2681,8 @@ async fn handle_tui_enter_submit(
             *approvals_selected,
             cwd_label,
             input_buf,
+            *input_cursor,
+            true,
             logs,
             *think_tick,
             base_run.tui_refresh_ms,
@@ -2460,7 +2699,10 @@ async fn handle_tui_enter_submit(
                     palette_items[palette_selected]
                 ))
             } else if search_mode {
-                Some(format!("🔎 {}  (Enter next, Esc close)", search_query))
+                Some(format!(
+                    "🔎 {}  (Enter next, Esc close)",
+                    render_with_optional_caret(search_query, *search_input_cursor, true)
+                ))
             } else if input_buf.starts_with('/') {
                 chat_commands::slash_overlay_text(input_buf, *slash_menu_index)
             } else if input_buf.starts_with('?') {
@@ -2535,6 +2777,9 @@ async fn handle_tui_enter_submit(
         search_mode,
         search_query,
         slash_menu_index,
+        learn_overlay,
+        input_cursor,
+        learn_overlay_cursor,
     })
     .await?;
     if logs.len() > max_logs {
@@ -2551,6 +2796,7 @@ async fn handle_tui_slash_command(
     let line = input.line;
     if line.trim() == "/learn" {
         *input.learn_overlay = Some(LearnOverlayState::default());
+        *input.learn_overlay_cursor = 0;
         *input.show_logs = false;
         return Ok(SlashCommandDispatchOutcome::Handled);
     }
@@ -2855,8 +3101,10 @@ pub(crate) async fn run_chat_tui(
     let mut search_mode = false;
     let mut search_query = String::new();
     let mut search_line_cursor = 0usize;
+    let mut search_input_cursor = 0usize;
     let mut slash_menu_index: usize = 0;
     let mut learn_overlay: Option<LearnOverlayState> = None;
+    let mut learn_overlay_cursor = 0usize;
     let mut shared_chat_mcp_registry: Option<std::sync::Arc<McpRegistry>> = None;
     let mut pending_timeout_input = false;
     let mut pending_params_input = false;
@@ -2867,6 +3115,7 @@ pub(crate) async fn run_chat_tui(
     ui_state.caps_source = format!("{:?}", base_run.caps).to_lowercase();
     ui_state.policy_hash = "-".to_string();
     let mut streaming_assistant = String::new();
+    let mut input_cursor = char_len(&input);
 
     let run_result: anyhow::Result<()> = async {
         loop {
@@ -2887,6 +3136,7 @@ pub(crate) async fn run_chat_tui(
                 approvals_selected: &mut approvals_selected,
                 cwd_label: &cwd_label,
                 input: &input,
+                input_cursor,
                 logs: &logs,
                 think_tick,
                 tui_refresh_ms: base_run.tui_refresh_ms,
@@ -2902,8 +3152,10 @@ pub(crate) async fn run_chat_tui(
                 palette_selected,
                 search_mode,
                 search_query: &search_query,
+                search_input_cursor,
                 slash_menu_index,
                 learn_overlay: &learn_overlay,
+                learn_overlay_cursor,
             });
             let visible_tool_count =
                 frame
@@ -2930,6 +3182,8 @@ pub(crate) async fn run_chat_tui(
                     frame.approvals_selected,
                     frame.cwd_label,
                     frame.input,
+                    frame.input_cursor,
+                    frame.input_cursor_visible,
                     frame.logs,
                     frame.think_tick,
                     frame.tui_refresh_ms,
@@ -2955,6 +3209,7 @@ pub(crate) async fn run_chat_tui(
                     transcript_scroll: &mut transcript_scroll,
                     follow_output: &mut follow_output,
                     input: &mut input,
+                    input_cursor: &mut input_cursor,
                     history_idx: &mut history_idx,
                     slash_menu_index: &mut slash_menu_index,
                     palette_open: &mut palette_open,
@@ -2963,6 +3218,7 @@ pub(crate) async fn run_chat_tui(
                     search_mode: &mut search_mode,
                     search_query: &mut search_query,
                     search_line_cursor: &mut search_line_cursor,
+                    search_input_cursor: &mut search_input_cursor,
                     ui_state: &mut ui_state,
                     visible_tool_count,
                     show_tools: &mut show_tools,
@@ -2975,6 +3231,7 @@ pub(crate) async fn run_chat_tui(
                     paths,
                     logs: &mut logs,
                     learn_overlay: &mut learn_overlay,
+                    learn_overlay_cursor: &mut learn_overlay_cursor,
                 }) {
                     TuiOuterEventDispatchOutcome::BreakLoop => break,
                     TuiOuterEventDispatchOutcome::ContinueLoop => continue,
@@ -3065,6 +3322,9 @@ pub(crate) async fn run_chat_tui(
                             search_query: &search_query,
                             shared_chat_mcp_registry: &mut shared_chat_mcp_registry,
                             learn_overlay: &mut learn_overlay,
+                            input_cursor: &mut input_cursor,
+                            search_input_cursor: &mut search_input_cursor,
+                            learn_overlay_cursor: &mut learn_overlay_cursor,
                         })
                         .await?
                         {
@@ -3405,6 +3665,7 @@ mod tests {
             selected_summary: None,
         });
         let mut input_buf = String::new();
+        let mut input_cursor = 0usize;
         let mut prompt_history = Vec::new();
         let mut history_idx = None;
         let mut slash_menu_index = 0usize;
@@ -3414,6 +3675,8 @@ mod tests {
         let mut search_mode = false;
         let mut search_query = String::new();
         let mut search_line_cursor = 0usize;
+        let mut search_input_cursor = 0usize;
+        let mut learn_overlay_cursor = 3usize;
         let mut transcript: Vec<(String, String)> = Vec::new();
         let mut streaming = String::new();
         let mut transcript_scroll = 0usize;
@@ -3432,6 +3695,7 @@ mod tests {
             learn_overlay: &mut overlay,
             run_busy: true,
             input: &mut input_buf,
+            input_cursor: &mut input_cursor,
             prompt_history: &mut prompt_history,
             history_idx: &mut history_idx,
             slash_menu_index: &mut slash_menu_index,
@@ -3441,6 +3705,7 @@ mod tests {
             search_mode: &mut search_mode,
             search_query: &mut search_query,
             search_line_cursor: &mut search_line_cursor,
+            search_input_cursor: &mut search_input_cursor,
             transcript: &mut transcript,
             streaming_assistant: &mut streaming,
             transcript_scroll: &mut transcript_scroll,
@@ -3456,6 +3721,7 @@ mod tests {
             approvals_selected: &mut approvals_selected,
             paths: &paths,
             logs: &mut logs,
+            learn_overlay_cursor: &mut learn_overlay_cursor,
         });
         assert!(matches!(out, super::TuiOuterKeyDispatchOutcome::Handled));
         let ov = overlay.expect("overlay");
@@ -3489,6 +3755,7 @@ mod tests {
             selected_summary: None,
         });
         let mut input_buf = String::new();
+        let mut input_cursor = 0usize;
         let mut prompt_history = Vec::new();
         let mut history_idx = None;
         let mut slash_menu_index = 0usize;
@@ -3498,6 +3765,8 @@ mod tests {
         let mut search_mode = false;
         let mut search_query = String::new();
         let mut search_line_cursor = 0usize;
+        let mut search_input_cursor = 0usize;
+        let mut learn_overlay_cursor = 0usize;
         let mut transcript: Vec<(String, String)> = Vec::new();
         let mut streaming = String::new();
         let mut transcript_scroll = 0usize;
@@ -3516,6 +3785,7 @@ mod tests {
             learn_overlay: &mut overlay,
             run_busy: true,
             input: &mut input_buf,
+            input_cursor: &mut input_cursor,
             prompt_history: &mut prompt_history,
             history_idx: &mut history_idx,
             slash_menu_index: &mut slash_menu_index,
@@ -3525,6 +3795,7 @@ mod tests {
             search_mode: &mut search_mode,
             search_query: &mut search_query,
             search_line_cursor: &mut search_line_cursor,
+            search_input_cursor: &mut search_input_cursor,
             transcript: &mut transcript,
             streaming_assistant: &mut streaming,
             transcript_scroll: &mut transcript_scroll,
@@ -3540,6 +3811,7 @@ mod tests {
             approvals_selected: &mut approvals_selected,
             paths: &paths,
             logs: &mut logs,
+            learn_overlay_cursor: &mut learn_overlay_cursor,
         });
         assert!(matches!(out, super::TuiOuterKeyDispatchOutcome::Handled));
         let ov = overlay.expect("overlay");
@@ -3573,6 +3845,7 @@ mod tests {
             selected_summary: None,
         });
         let mut input_buf = String::new();
+        let mut input_cursor = 0usize;
         let mut prompt_history = Vec::new();
         let mut history_idx = None;
         let mut slash_menu_index = 0usize;
@@ -3582,6 +3855,8 @@ mod tests {
         let mut search_mode = false;
         let mut search_query = String::new();
         let mut search_line_cursor = 0usize;
+        let mut search_input_cursor = 0usize;
+        let mut learn_overlay_cursor = 0usize;
         let mut transcript: Vec<(String, String)> = vec![("user".to_string(), "hi".to_string())];
         let before = transcript.clone();
         let mut streaming = String::new();
@@ -3601,6 +3876,7 @@ mod tests {
             learn_overlay: &mut overlay,
             run_busy: false,
             input: &mut input_buf,
+            input_cursor: &mut input_cursor,
             prompt_history: &mut prompt_history,
             history_idx: &mut history_idx,
             slash_menu_index: &mut slash_menu_index,
@@ -3610,6 +3886,7 @@ mod tests {
             search_mode: &mut search_mode,
             search_query: &mut search_query,
             search_line_cursor: &mut search_line_cursor,
+            search_input_cursor: &mut search_input_cursor,
             transcript: &mut transcript,
             streaming_assistant: &mut streaming,
             transcript_scroll: &mut transcript_scroll,
@@ -3625,6 +3902,7 @@ mod tests {
             approvals_selected: &mut approvals_selected,
             paths: &paths,
             logs: &mut logs,
+            learn_overlay_cursor: &mut learn_overlay_cursor,
         });
         assert!(matches!(out, super::TuiOuterKeyDispatchOutcome::Handled));
         let ov = overlay.expect("overlay");
@@ -3664,6 +3942,7 @@ mod tests {
             selected_summary: None,
         });
         let mut input_buf = String::new();
+        let mut input_cursor = 0usize;
         let mut prompt_history = Vec::new();
         let mut history_idx = None;
         let mut slash_menu_index = 0usize;
@@ -3673,6 +3952,8 @@ mod tests {
         let mut search_mode = false;
         let mut search_query = String::new();
         let mut search_line_cursor = 0usize;
+        let mut search_input_cursor = 0usize;
+        let mut learn_overlay_cursor = 0usize;
         let mut transcript: Vec<(String, String)> = vec![("user".to_string(), "hi".to_string())];
         let mut streaming = String::new();
         let mut transcript_scroll = 0usize;
@@ -3693,6 +3974,7 @@ mod tests {
                 learn_overlay: &mut overlay,
                 run_busy: false,
                 input: &mut input_buf,
+            input_cursor: &mut input_cursor,
                 prompt_history: &mut prompt_history,
                 history_idx: &mut history_idx,
                 slash_menu_index: &mut slash_menu_index,
@@ -3702,6 +3984,7 @@ mod tests {
                 search_mode: &mut search_mode,
                 search_query: &mut search_query,
                 search_line_cursor: &mut search_line_cursor,
+            search_input_cursor: &mut search_input_cursor,
                 transcript: &mut transcript,
                 streaming_assistant: &mut streaming,
                 transcript_scroll: &mut transcript_scroll,
@@ -3716,7 +3999,8 @@ mod tests {
                 tools_focus: &mut tools_focus,
                 approvals_selected: &mut approvals_selected,
                 paths: &paths,
-                logs: &mut logs,
+            logs: &mut logs,
+            learn_overlay_cursor: &mut learn_overlay_cursor,
             });
             assert!(matches!(out, super::TuiOuterKeyDispatchOutcome::Handled));
         }
@@ -3754,6 +4038,7 @@ mod tests {
             selected_summary: None,
         });
         let mut input_buf = String::new();
+        let mut input_cursor = 0usize;
         let mut prompt_history = Vec::new();
         let mut history_idx = None;
         let mut slash_menu_index = 0usize;
@@ -3763,6 +4048,8 @@ mod tests {
         let mut search_mode = false;
         let mut search_query = String::new();
         let mut search_line_cursor = 0usize;
+        let mut search_input_cursor = 0usize;
+        let mut learn_overlay_cursor = 0usize;
         let mut transcript: Vec<(String, String)> = vec![];
         let mut streaming = String::new();
         let mut transcript_scroll = 0usize;
@@ -3781,6 +4068,7 @@ mod tests {
             learn_overlay: &mut overlay,
             run_busy: true,
             input: &mut input_buf,
+            input_cursor: &mut input_cursor,
             prompt_history: &mut prompt_history,
             history_idx: &mut history_idx,
             slash_menu_index: &mut slash_menu_index,
@@ -3790,6 +4078,7 @@ mod tests {
             search_mode: &mut search_mode,
             search_query: &mut search_query,
             search_line_cursor: &mut search_line_cursor,
+            search_input_cursor: &mut search_input_cursor,
             transcript: &mut transcript,
             streaming_assistant: &mut streaming,
             transcript_scroll: &mut transcript_scroll,
@@ -3805,6 +4094,7 @@ mod tests {
             approvals_selected: &mut approvals_selected,
             paths: &paths,
             logs: &mut logs,
+            learn_overlay_cursor: &mut learn_overlay_cursor,
         });
         assert!(matches!(out, super::TuiOuterKeyDispatchOutcome::Handled));
         assert!(overlay.is_none());
@@ -3837,6 +4127,7 @@ mod tests {
             selected_summary: None,
         });
         let mut input_buf = String::new();
+        let mut input_cursor = 0usize;
         let mut prompt_history = Vec::new();
         let mut history_idx = None;
         let mut slash_menu_index = 0usize;
@@ -3846,6 +4137,8 @@ mod tests {
         let mut search_mode = false;
         let mut search_query = String::new();
         let mut search_line_cursor = 0usize;
+        let mut search_input_cursor = 0usize;
+        let mut learn_overlay_cursor = 3usize;
         let mut transcript: Vec<(String, String)> = vec![];
         let mut streaming = String::new();
         let mut transcript_scroll = 0usize;
@@ -3865,6 +4158,7 @@ mod tests {
             learn_overlay: &mut overlay,
             run_busy: false,
             input: &mut input_buf,
+            input_cursor: &mut input_cursor,
             prompt_history: &mut prompt_history,
             history_idx: &mut history_idx,
             slash_menu_index: &mut slash_menu_index,
@@ -3874,6 +4168,7 @@ mod tests {
             search_mode: &mut search_mode,
             search_query: &mut search_query,
             search_line_cursor: &mut search_line_cursor,
+            search_input_cursor: &mut search_input_cursor,
             transcript: &mut transcript,
             streaming_assistant: &mut streaming,
             transcript_scroll: &mut transcript_scroll,
@@ -3889,6 +4184,7 @@ mod tests {
             approvals_selected: &mut approvals_selected,
             paths: &paths,
             logs: &mut logs,
+            learn_overlay_cursor: &mut learn_overlay_cursor,
         });
         assert!(matches!(
             out_plain,
@@ -3903,6 +4199,7 @@ mod tests {
             learn_overlay: &mut overlay,
             run_busy: false,
             input: &mut input_buf,
+            input_cursor: &mut input_cursor,
             prompt_history: &mut prompt_history,
             history_idx: &mut history_idx,
             slash_menu_index: &mut slash_menu_index,
@@ -3912,6 +4209,7 @@ mod tests {
             search_mode: &mut search_mode,
             search_query: &mut search_query,
             search_line_cursor: &mut search_line_cursor,
+            search_input_cursor: &mut search_input_cursor,
             transcript: &mut transcript,
             streaming_assistant: &mut streaming,
             transcript_scroll: &mut transcript_scroll,
@@ -3927,6 +4225,7 @@ mod tests {
             approvals_selected: &mut approvals_selected,
             paths: &paths,
             logs: &mut logs,
+            learn_overlay_cursor: &mut learn_overlay_cursor,
         });
         assert!(matches!(
             out_ctrl,
@@ -3961,6 +4260,8 @@ mod tests {
             selected_summary: None,
         });
         let mut input = String::new();
+        let mut input_cursor = 0usize;
+        let mut learn_overlay_cursor = 0usize;
         let mut history_idx = None;
         let mut slash_menu_index = 0usize;
         let spam = "'FastVideoProcessor' object has no attribute '_artifact_manager'";
@@ -3969,9 +4270,11 @@ mod tests {
             super::handle_tui_outer_paste_event(super::TuiOuterPasteInput {
                 pasted: spam,
                 input: &mut input,
+                input_cursor: &mut input_cursor,
                 history_idx: &mut history_idx,
                 slash_menu_index: &mut slash_menu_index,
                 learn_overlay: &mut overlay,
+                learn_overlay_cursor: &mut learn_overlay_cursor,
             });
         }
 
@@ -4007,6 +4310,7 @@ mod tests {
             selected_summary: None,
         });
         let mut input_buf = String::new();
+        let mut input_cursor = 0usize;
         let mut prompt_history = Vec::new();
         let mut history_idx = None;
         let mut slash_menu_index = 0usize;
@@ -4016,6 +4320,8 @@ mod tests {
         let mut search_mode = false;
         let mut search_query = String::new();
         let mut search_line_cursor = 0usize;
+        let mut search_input_cursor = 0usize;
+        let mut learn_overlay_cursor = 0usize;
         let mut transcript: Vec<(String, String)> = vec![];
         let mut streaming = String::new();
         let mut transcript_scroll = 0usize;
@@ -4035,6 +4341,7 @@ mod tests {
             learn_overlay: &mut overlay,
             run_busy: false,
             input: &mut input_buf,
+            input_cursor: &mut input_cursor,
             prompt_history: &mut prompt_history,
             history_idx: &mut history_idx,
             slash_menu_index: &mut slash_menu_index,
@@ -4044,6 +4351,7 @@ mod tests {
             search_mode: &mut search_mode,
             search_query: &mut search_query,
             search_line_cursor: &mut search_line_cursor,
+            search_input_cursor: &mut search_input_cursor,
             transcript: &mut transcript,
             streaming_assistant: &mut streaming,
             transcript_scroll: &mut transcript_scroll,
@@ -4059,12 +4367,14 @@ mod tests {
             approvals_selected: &mut approvals_selected,
             paths: &paths,
             logs: &mut logs,
+            learn_overlay_cursor: &mut learn_overlay_cursor,
         });
         let _ = super::handle_tui_outer_key_dispatch(super::TuiOuterKeyDispatchInput {
             key: KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
             learn_overlay: &mut overlay,
             run_busy: false,
             input: &mut input_buf,
+            input_cursor: &mut input_cursor,
             prompt_history: &mut prompt_history,
             history_idx: &mut history_idx,
             slash_menu_index: &mut slash_menu_index,
@@ -4074,6 +4384,7 @@ mod tests {
             search_mode: &mut search_mode,
             search_query: &mut search_query,
             search_line_cursor: &mut search_line_cursor,
+            search_input_cursor: &mut search_input_cursor,
             transcript: &mut transcript,
             streaming_assistant: &mut streaming,
             transcript_scroll: &mut transcript_scroll,
@@ -4089,6 +4400,7 @@ mod tests {
             approvals_selected: &mut approvals_selected,
             paths: &paths,
             logs: &mut logs,
+            learn_overlay_cursor: &mut learn_overlay_cursor,
         });
 
         let ov = overlay.expect("overlay");
@@ -4122,6 +4434,7 @@ mod tests {
             selected_summary: None,
         });
         let mut input_buf = String::new();
+        let mut input_cursor = 0usize;
         let mut prompt_history = Vec::new();
         let mut history_idx = None;
         let mut slash_menu_index = 0usize;
@@ -4131,6 +4444,8 @@ mod tests {
         let mut search_mode = false;
         let mut search_query = String::new();
         let mut search_line_cursor = 0usize;
+        let mut search_input_cursor = 0usize;
+        let mut learn_overlay_cursor = 0usize;
         let mut transcript: Vec<(String, String)> = vec![];
         let mut streaming = String::new();
         let mut transcript_scroll = 0usize;
@@ -4150,6 +4465,7 @@ mod tests {
             learn_overlay: &mut overlay,
             run_busy: false,
             input: &mut input_buf,
+            input_cursor: &mut input_cursor,
             prompt_history: &mut prompt_history,
             history_idx: &mut history_idx,
             slash_menu_index: &mut slash_menu_index,
@@ -4159,6 +4475,7 @@ mod tests {
             search_mode: &mut search_mode,
             search_query: &mut search_query,
             search_line_cursor: &mut search_line_cursor,
+            search_input_cursor: &mut search_input_cursor,
             transcript: &mut transcript,
             streaming_assistant: &mut streaming,
             transcript_scroll: &mut transcript_scroll,
@@ -4174,9 +4491,14 @@ mod tests {
             approvals_selected: &mut approvals_selected,
             paths: &paths,
             logs: &mut logs,
+            learn_overlay_cursor: &mut learn_overlay_cursor,
         });
 
         let ov = overlay.expect("overlay still open");
         assert_eq!(ov.summary, "q");
     }
 }
+
+
+
+

@@ -52,6 +52,8 @@ pub(crate) struct LearnOverlayRenderModel {
     pub(crate) assist_summary: Option<String>,
     pub(crate) summary_choice: LearnOverlaySummaryChoice,
     pub(crate) selected_summary: Option<String>,
+    pub(crate) active_input_cursor: usize,
+    pub(crate) cursor_visible: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -72,6 +74,8 @@ pub(crate) fn draw_chat_frame(
     approvals_selected: usize,
     cwd_label: &str,
     input: &str,
+    input_cursor: usize,
+    input_cursor_visible: bool,
     logs: &[String],
     think_tick: u64,
     tui_refresh_ms: u64,
@@ -85,7 +89,10 @@ pub(crate) fn draw_chat_frame(
     overlay_hint: Option<String>,
     learn_overlay: Option<&LearnOverlayRenderModel>,
 ) {
-    let input_display = format!("> {input}");
+    let input_display = format!(
+        "> {}",
+        render_with_caret(input, input_cursor, input_cursor_visible)
+    );
     let input_width = f.area().width.saturating_sub(2).max(1) as usize;
     let input_total_lines = crate::chat_view_utils::wrapped_line_count(&input_display, input_width);
     let max_input_lines = usize::from(f.area().height.saturating_sub(12)).clamp(1, 8);
@@ -635,8 +642,17 @@ fn draw_learn_capture_form(
     let summary_text = if overlay.summary.trim().is_empty() {
         "< Document the dependency upgrade process to avoid regressions >".to_string()
     } else {
+        let summary_with_caret = if summary_active {
+            render_with_caret(
+                &overlay.summary,
+                overlay.active_input_cursor,
+                overlay.cursor_visible,
+            )
+        } else {
+            overlay.summary.clone()
+        };
         right_fit_single_line(
-            &overlay.summary,
+            &summary_with_caret,
             summary_inner[1].width.saturating_sub(4) as usize,
         )
     };
@@ -779,6 +795,17 @@ fn draw_learn_review_form(
         "Mode: list/show\n\n{id_label}: {selected}\nField focus: {}\n\nRows:\n{rows}\n\nEnter runs read-only list/show.",
         overlay.input_focus
     );
+    if overlay.input_focus == "review.id" && !overlay.review_id.trim().is_empty() {
+        text = format!(
+            "Mode: list/show\n\n{id_label}: {}\nField focus: {}\n\nRows:\n{rows}\n\nEnter runs read-only list/show.",
+            render_with_caret(
+                &overlay.review_id,
+                overlay.active_input_cursor,
+                overlay.cursor_visible
+            ),
+            overlay.input_focus
+        );
+    }
     if let Some(msg) = overlay.inline_message.as_deref() {
         text.push_str(&format!("\n\n{msg}"));
     }
@@ -814,23 +841,44 @@ fn draw_learn_promote_form(
     } else {
         "pack_id"
     };
+    let promote_id_display = if overlay.promote_id.trim().is_empty() {
+        "<required>".to_string()
+    } else if overlay.input_focus == "promote.id" {
+        render_with_caret(
+            &overlay.promote_id,
+            overlay.active_input_cursor,
+            overlay.cursor_visible,
+        )
+    } else {
+        overlay.promote_id.clone()
+    };
+    let promote_slug_display = if overlay.promote_slug.trim().is_empty() {
+        "<empty>".to_string()
+    } else if overlay.input_focus == "promote.slug" {
+        render_with_caret(
+            &overlay.promote_slug,
+            overlay.active_input_cursor,
+            overlay.cursor_visible,
+        )
+    } else {
+        overlay.promote_slug.clone()
+    };
+    let promote_pack_display = if overlay.promote_pack_id.trim().is_empty() {
+        "<empty>".to_string()
+    } else if overlay.input_focus == "promote.pack_id" {
+        render_with_caret(
+            &overlay.promote_pack_id,
+            overlay.active_input_cursor,
+            overlay.cursor_visible,
+        )
+    } else {
+        overlay.promote_pack_id.clone()
+    };
     let mut text = format!(
         "{id_label}: {}\nTarget: {target}\n{slug_label}: {}\n{pack_label}: {}\n\nforce:{}",
-        if overlay.promote_id.trim().is_empty() {
-            "<required>"
-        } else {
-            overlay.promote_id.as_str()
-        },
-        if overlay.promote_slug.trim().is_empty() {
-            "<empty>"
-        } else {
-            overlay.promote_slug.as_str()
-        },
-        if overlay.promote_pack_id.trim().is_empty() {
-            "<empty>"
-        } else {
-            overlay.promote_pack_id.as_str()
-        },
+        promote_id_display,
+        promote_slug_display,
+        promote_pack_display,
         if overlay.promote_force { "ON" } else { "off" }
     );
     text.push_str(&format!(
@@ -873,6 +921,15 @@ fn right_fit_single_line(input: &str, width: usize) -> String {
     let keep = maxw.saturating_sub(1);
     let tail: String = chars[chars.len().saturating_sub(keep)..].iter().collect();
     format!("…{tail}")
+}
+
+fn render_with_caret(input: &str, cursor: usize, visible: bool) -> String {
+    let mut chars: Vec<char> = input.chars().collect();
+    let idx = cursor.min(chars.len());
+    if visible {
+        chars.insert(idx, '|');
+    }
+    chars.into_iter().collect()
 }
 
 fn tab_label(num: u8, tab: LearnOverlayTab, _active: LearnOverlayTab) -> String {
