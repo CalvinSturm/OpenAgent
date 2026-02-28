@@ -672,15 +672,24 @@ fn draw_learn_capture_form(
         summary_inner[1],
     );
     f.render_widget(
-        Paragraph::new(
-            "Agent assist comparison: press Ctrl+W to arm, Enter to preview vs agent rewrite",
-        )
+        Paragraph::new(format!(
+            "Agent assist comparison: selected={} | Ctrl+G generate | Ctrl+O original | Ctrl+R assist",
+            match overlay.summary_choice {
+                LearnOverlaySummaryChoice::Original => "original",
+                LearnOverlaySummaryChoice::Assist => "assist",
+            }
+        ))
         .style(Style::default().fg(Color::Gray))
         .wrap(Wrap { trim: false }),
         summary_inner[2],
     );
+    let assist_preview = overlay
+        .assist_summary
+        .as_deref()
+        .map(|s| right_fit_single_line(s, summary_inner[3].width.saturating_sub(2) as usize))
+        .unwrap_or_else(|| "<assist not generated>".to_string());
     f.render_widget(
-        Paragraph::new("Agent rewrite placeholder | Original vs Assist selection will appear here")
+        Paragraph::new(format!("Assist preview: {assist_preview}"))
             .style(Style::default().fg(Color::Gray))
             .wrap(Wrap { trim: false }),
         summary_inner[3],
