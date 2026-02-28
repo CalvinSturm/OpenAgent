@@ -434,11 +434,7 @@ pub(crate) fn draw_chat_frame(
     }
 }
 
-fn draw_learn_overlay(
-    f: &mut ratatui::Frame<'_>,
-    overlay: &LearnOverlayRenderModel,
-    ui_tick: u64,
-) {
+fn draw_learn_overlay(f: &mut ratatui::Frame<'_>, overlay: &LearnOverlayRenderModel, ui_tick: u64) {
     let area = centered_rect(92, 86, f.area());
     f.render_widget(Clear, area);
     f.render_widget(
@@ -508,8 +504,7 @@ fn draw_learn_overlay(
             }
         }
         LearnOverlayTab::Review => {
-            "Review: Enter List/Show | Up/Down Rows | Tab Field | Esc Close"
-                .to_string()
+            "Review: Enter List/Show | Up/Down Rows | Tab Field | Esc Close".to_string()
         }
         LearnOverlayTab::Promote => {
             "Promote: Up/Down Target | Enter Publish | Ctrl+F Force | Tab Field | Esc Close"
@@ -540,7 +535,10 @@ fn draw_learn_overlay(
                     Style::default().fg(Color::Blue),
                 ),
                 Span::raw("  |  "),
-                Span::styled(format!("Last: {last_log}"), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("Last: {last_log}"),
+                    Style::default().fg(Color::Gray),
+                ),
             ]))
             .wrap(Wrap { trim: false }),
             outer[3],
